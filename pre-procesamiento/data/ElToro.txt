@@ -1,0 +1,119 @@
+Function Filt_ELTORO(Cota As Variant)
+    Dim a0, a1, a2, a3, a4
+    a0 = -133471.205667
+    a1 = 251.668765787
+    a2 = -0.112314280288
+    a3 = -0.000031180464
+    a4 = 0.000000022628942
+    Filt_ELTORO = a0 + (a1 * Cota) + (a2 * Cota ^ 2) + (a3 * Cota ^ 3) + (a4 * Cota ^ 4)
+End Function
+
+
+Function Cot_ELTORO(Volumen As Variant)
+    Dim x, i, dc As Variant
+    
+    Datos(1) = 0#
+    Datos(2) = 48.28954
+    Datos(3) = 97.47766
+    Datos(4) = 147.26746
+    Datos(5) = 197.35679
+    Datos(6) = 248.04517
+    Datos(7) = 299.43508
+    Datos(8) = 351.82341
+    Datos(9) = 405.0131
+    Datos(10) = 459.20122
+    Datos(11) = 514.48761
+    Datos(12) = 570.97736
+    Datos(13) = 628.56274
+    Datos(14) = 687.35149
+    Datos(15) = 747.53804
+    Datos(16) = 808.92531
+    Datos(17) = 871.61054
+    Datos(18) = 935.59635
+    Datos(19) = 1000.88273
+    Datos(20) = 1067.4697
+    Datos(21) = 1135.25477
+    Datos(22) = 1204.23795
+    Datos(23) = 1274.32464
+    Datos(24) = 1345.60945
+    Datos(25) = 1417.89268
+    Datos(26) = 1491.07712
+    Datos(27) = 1565.25999
+    Datos(28) = 1640.4439
+    Datos(29) = 1716.42655
+    Datos(30) = 1793.41026
+    Datos(31) = 1871.19533
+    Datos(32) = 1949.97619
+    Datos(33) = 2029.56105
+    Datos(34) = 2110.14171
+    Datos(35) = 2191.52373
+    Datos(36) = 2273.9068
+    Datos(37) = 2357.18845
+    Datos(38) = 2441.47116
+    Datos(39) = 2526.65244
+    Datos(40) = 2612.83215
+    Datos(41) = 2700.01554
+    Datos(42) = 2788.19472
+    Datos(43) = 2877.37496
+    Datos(44) = 2967.75593
+    Datos(45) = 3059.03548
+    Datos(46) = 3151.31608
+    Datos(47) = 3244.69758
+    Datos(48) = 3339.17471
+    Datos(49) = 3434.65552
+    Datos(50) = 3531.13476
+    Datos(51) = 3628.71226
+    Datos(52) = 3727.4905
+    Datos(53) = 3827.36962
+    Datos(54) = 3928.44686
+    Datos(55) = 4030.62499
+    Datos(56) = 4133.90402
+    Datos(57) = 4238.58084
+    Datos(58) = 4344.35855
+    Datos(59) = 4451.33437
+    Datos(60) = 4559.61076
+    Datos(61) = 4668.98805
+    Datos(62) = 4779.66329
+    Datos(63) = 4891.53927
+    Datos(64) = 5004.41367
+    Datos(65) = 5118.38896
+    Datos(66) = 5233.46515
+    Datos(67) = 5349.83928
+    Datos(68) = 5467.31431
+    Datos(69) = 5585.88761
+    Datos(70) = 5705.66164
+    Datos(71) = 5826.53656
+    
+    Call punteroA(71, Volumen, i, dc)
+    Cot_ELTORO = 1300# + i - 2 + dc
+    
+    If (Cot_ELTORO < 1300#) Then
+        Cot_ELTORO = 1300#
+    ElseIf (Cot_ELTORO > 1370#) Then
+        Cot_ELTORO = 1370#
+    End If
+
+End Function
+Sub punteroA(m As Integer, x As Variant, i, dc As Variant)
+    Dim j As Integer, k As Integer
+    Dim d1 As Variant, d2 As Variant
+
+    j = 1
+    k = m
+10  If ((k - j) <= 1#) Then
+        i = k
+    Else
+        i = Application.WorksheetFunction.RoundDown((k + j) / 2, 0)
+        If (x <= Datos(i)) Then
+            k = i
+        Else
+            j = i
+        End If
+        GoTo 10
+    End If
+
+    d1 = x - Datos(i - 1)
+    d2 = Datos(i) - Datos(i - 1)
+    dc = d1 / d2
+
+End Sub

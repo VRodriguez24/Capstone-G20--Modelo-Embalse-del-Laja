@@ -6,6 +6,8 @@ from gurobipy import GRB
 from embalse import T, NODES, ARCS, A_inyeccion, A_generacion, IN, OUT
 # --- Datos (CSV) ---
 from data_loader import load_caudalmax, load_injections_for_year
+# --- Filtraciones y cotas ---
+from filt_cota import filtraciones_from_volumen, get_pwl_segments
 
 # =============================
 # CONFIGURACIÓN (parámetros)
@@ -27,44 +29,26 @@ M = 4000                        # Big-M (ajusta si hace falta)
 EPS = 1e-3                      # epsilon para desambiguar límites
 Conv = (86400 * 30) / 1e6       # m^3/s x mes -> Hm3
 
-# Volúmenes embalse (Hm3)
-V_0 = 1400.0
-V_min = 1200.0
-V_max = 3628.0
+# Volúmenes embalse (Hm3) - Basado en ANEXO N°1
+V_0 = 2500.0  # Volumen inicial por defecto (colchón "Superior")
+V_min = 1200.0  # Volumen mínimo operativo (cota 1.300 msnm)
+V_max = 3628.0  # Volumen máximo (cota de vertimiento 1.368 msnm)
 
-# --- Colchones (selección por V0 con Big-M y presupuestos anuales) ---
-# Fuente de verdad única por colchón (rangos + shares=(riego,generación,lago))
+# --- Colchones según ANEXO N°1 (rangos + shares=(riego,generación,lago)) ---
+# Nota: Inferior representa volumen mínimo operativo, no volumen muerto
 COLCHONES = {
-    "Inferior":   {"lo": 0.0,    "hi": 1200.0, "shares": (0.50, 0.05, 0.00)},
-    "Transicion": {"lo": 1200.0, "hi": 1370.0, "shares": (0.40, 0.05, 0.55)},
-    "Intermedio": {"lo": 1370.0, "hi": 1900.0, "shares": (0.40, 0.40, 0.20)},
+    "Inferior":   {"lo": 1200.0, "hi": 1370.0, "shares": (0.50, 0.05, 0.00)},
+    "Transicion": {"lo": 1370.0, "hi": 1730.0, "shares": (0.40, 0.05, 0.55)},
+    "Intermedio": {"lo": 1730.0, "hi": 1900.0, "shares": (0.40, 0.40, 0.20)},
     "Superior":   {"lo": 1900.0, "hi": V_max,  "shares": (0.25, 0.65, 0.10)},
 }
 C_LABELS = list(COLCHONES.keys())
 
-# PWL de filtraciones: Filtr = a_k + b_k * Vprev, V ∈ [V_Lk, V_Uk]
+# Configuración de filtraciones del embalse El Toro
 FILTR_ARC: Tuple[str, str] = ("Embalse", "control_FiltracionesLaja")
-a_k = {1: -477.789, 2: -483.720, 3: -707.724, 4: -1159.45}
-b_k = {1: 0.378375, 2: 0.382877, 3: 0.550670, 4: 0.884665}
-V_Lk = {1: 1300.0, 2: 1317.5, 3: 1335.0, 4: 1352.5}
-V_Uk = {1: 1317.5, 2: 1335.0, 3: 1352.5, 4: 1370.0}
 
-
-# Construimos nuestra función lineal por tramos
-def _pwl_points_from_segments(V_Lk, V_Uk, a_k, b_k):
-    ks = sorted(V_Lk.keys())     # [1, 2, 3, 4]
-    xpts, ypts = [], []
-    for k in ks:
-        L, U = V_Lk[k], V_Uk[k]  # límites inferior/superior del tramo k
-        tramo = [L, U] if k == ks[0] else [U]  # agrega L solo del primer tramo
-        for V in tramo:
-            y = a_k[k] + b_k[k]*V
-            if xpts and abs(V - xpts[-1]) < 1e-9:
-                ypts[-1] = y
-            else:
-                xpts.append(V)
-                ypts.append(y)
-    return xpts, ypts
+# Importar segmentos PWL desde módulo especializado
+PWL_SEGMENTS = get_pwl_segments()
 
 
 # =============================
@@ -90,6 +74,12 @@ def build_model_for_one_year(
              + gp.quicksum(
                  x[n, j, t] for j in OUT[n] if (n, j) in A_generacion
              )
+    A_ext = {(n, t): 0.0 for n in NODES for t in T}
+    for (i, j) in A_inyeccion:
+        for t in T:
+            A_ext[(i, t)] = (
+                I_arc[(i, j, t)]
+            )  # fuente externa en el nodo i = afluente_*
 
     # Aportes naturales para déficit (labels de inyección)
     inj_label = {
@@ -167,12 +157,13 @@ def build_model_for_one_year(
             )
 
     # (R2) Conservación de flujo en nodos (excepto sumideros/almacenamiento)
+    SKIP_BALANCE = {"Embalse", "NodoMar", "SaltosLaja"}
     for n in NODES:
-        if n in {"Embalse", "NodoMar", "SaltosLaja"}:
+        if n in SKIP_BALANCE:
             continue
         for t in T:
             m.addConstr(
-                sum_in(n, t) == sum_out(n, t),
+                sum_in(n, t) + A_ext[(n, t)] == sum_out(n, t),
                 name=f"R2_bal_nodo_{n}_{t}"
             )
 
@@ -184,70 +175,77 @@ def build_model_for_one_year(
             if cap is not None:
                 m.addConstr(x[i, j, t] <= cap, name=f"R3_cap_{i}_{j}_{t}")
 
-    # (R4) Energía mensual: G_t = Σ eta_e * x_e,t
+    # (R4) Energía mensual: G_t = sum{ eta_e * x_e,t }
     for t in T:
         m.addConstr(G[t] == gp.quicksum(eta.get((i, j), 0.0) * x[i, j, t]
                                         for (i, j) in A_generacion),
                     name=f"R4_energy_{t}")
 
-    # (R5) Filtraciones: igualar arco y PWL(Vprev)
+    # (R5) Filtraciones: PWL manual con variables binarias (MILP puro)
     f_i, f_j = FILTR_ARC
-    for t in T:
-        m.addConstr(y[f_i, f_j, t] == Filtr[t], name=f"R5_filtr_arc_{t}")
 
-    xpts, ypts = _pwl_points_from_segments(V_Lk, V_Uk, a_k, b_k)
-
-    # Asegúrate de que las Vars están integradas antes de gen-constr:
-    # m.update()
+    # PWL simplificado: usar aproximación lineal directa por segmentos
+    seg_labels = list(PWL_SEGMENTS.keys())
+    delta = m.addVars(seg_labels, T, vtype=GRB.BINARY, name="delta_pwl")
 
     for t in T:
-        xv = V[t-1] if t != T[0] else Vinit   # <-- Var en ambos casos
-        m.addGenConstrPWL(xv, Filtr[t], xpts, ypts, name=f"R5b_filtr_pwl_{t}")
+        # Igualar arco de filtración con variable
+        m.addConstr(y[f_i, f_j, t] == Filtr[t], name=f"R5a_filtr_arc_{t}")
 
-    # (R6) Mínimos de entrada en Abanico (47) y Tucapel (90)
-    for t in T:
-        m.addConstr(
-            (
-                gp.quicksum(y[i, "Abanico", t] for i in IN["Abanico"])
-                >= ABANICO_MIN
-            ),
-            name=f"R6a_abanico_min_{t}"
+        # Exactamente un segmento debe estar activo
+        m.addConstr(gp.quicksum(delta[k, t] for k in seg_labels) == 1,
+                    name=f"R5b_one_segment_{t}")
+
+        # Volumen anterior (para t=1 es Vinit, para t>1 es V[t-1])
+        V_prev = Vinit if t == T[0] else V[t-1]
+
+        # Restricciones de volumen por segmento activo
+        for k in seg_labels:
+            seg = PWL_SEGMENTS[k]
+            # Si segmento k activo, volumen debe estar en su rango
+            m.addConstr(V_prev >= seg["v_min"] * delta[k, t],
+                        name=f"R5c_vol_min_{k}_{t}")
+            m.addConstr(V_prev <= seg["v_max"] * delta[k, t] +
+                        3628 * (1 - delta[k, t]),
+                        name=f"R5d_vol_max_{k}_{t}")
+
+        # PWL función: usar funciones originales evaluadas en puntos medios
+        filtr_values = {}
+        for k in seg_labels:
+            seg = PWL_SEGMENTS[k]
+            v_mid = (seg["v_min"] + seg["v_max"]) / 2
+            filtr_values[k] = filtraciones_from_volumen(v_mid)
+
+        # Función PWL: Filtr = suma de valores por segmento activo
+        filtr_expr = gp.quicksum(
+            filtr_values[k] * delta[k, t]
+            for k in seg_labels
         )
-        m.addConstr(
-            (
-                gp.quicksum(y[i, "Tucapel", t] for i in IN["Tucapel"])
-                >= TUCAPEL_MIN
-            ),
-            name=f"R6b_tucapel_min_{t}"
-        )
+        m.addConstr(Filtr[t] == filtr_expr, name=f"R5e_pwl_function_{t}")
 
-    # (R7) Déficits (MILP) y cobertura por El Toro
+    # (R6) Déficits (MILP) linealizadas y cobertura por El Toro
     for t in T:
         # Abanico: DefAb_t = max{0, 47 - Filtr_t - A_ab_t}
         expr_ab = ABANICO_MIN - Filtr[t] - A_ab_t(t)
         m.addConstr(DefAb[t] >= expr_ab, name=f"DAb_lb_{t}")
         m.addConstr(
-            DefAb[t] <= expr_ab + M * (1 - dAb[t]),
-            name=f"DAb_ub1_{t}"
-        )
+            DefAb[t] <= expr_ab + M * (1 - dAb[t]), name=f"DAb_ub1_{t}"
+            )
         m.addConstr(DefAb[t] <= M * dAb[t], name=f"DAb_ub2_{t}")
 
         # Tucapel: DefTu_t = max{0, 90 - Filtr_t - A_nat_tu_t}
         expr_tu = TUCAPEL_MIN - Filtr[t] - A_nat_tu_t(t)
         m.addConstr(DefTu[t] >= expr_tu, name=f"DTu_lb_{t}")
         m.addConstr(
-            DefTu[t] <= expr_tu + M * (1 - dTu[t]),
-            name=f"DTu_ub1_{t}"
-        )
+            DefTu[t] <= expr_tu + M * (1 - dTu[t]), name=f"DTu_ub1_{t}"
+            )
         m.addConstr(DefTu[t] <= M * dTu[t], name=f"DTu_ub2_{t}")
 
-        # “El Toro” debe cubrir al menos el déficit de Tucapel
-        m.addConstr(
-            x["Embalse", "ElToro", t] >= DefTu[t],
-            name=f"DTu_cover_by_ElToro_{t}"
-        )
+        # Cobertura desde Embalse via El Toro (suma de déficits)
+        m.addConstr(x["Embalse", "ElToro", t] >= DefAb[t] + DefTu[t],
+                    name=f"D_cover_by_ElToro_{t}")
 
-    # (R8) Presupuestos anuales por colchón (Hm3) desde Embalse
+    # (R7) Presupuestos anuales por colchón (Hm3) desde Embalse
     # (excluye filtración del riego)
     sum_riego_Hm3 = gp.quicksum(
         gp.quicksum(
@@ -265,13 +263,32 @@ def build_model_for_one_year(
         ) * Conv
         for t in T
     )
-    share_r = gp.quicksum(COLCHONES[c]["shares"][0] * z[c] for c in C_LABELS)
-    share_g = gp.quicksum(COLCHONES[c]["shares"][1] * z[c] for c in C_LABELS)
+    # Variables auxiliares: vinit_share[c] = z[c] * Vinit
+    vinit_share = m.addVars(C_LABELS, lb=0.0, ub=V_max, name="vinit_share")
 
-    m.addConstr(sum_riego_Hm3 <= share_r * Vinit, name="R8_riego_budget")
-    m.addConstr(sum_gen_Hm3 <= share_g * Vinit, name="R8_gen_budget")
+    # Linearización McCormick: vinit_share[c] = z[c] * Vinit
+    for c in C_LABELS:
+        # Cuando z[c] = 0: vinit_share[c] = 0
+        # Cuando z[c] = 1: vinit_share[c] = Vinit
+        m.addConstr(vinit_share[c] <= V_max * z[c],
+                    name=f"McCormick_vinit1_{c}")
+        m.addConstr(vinit_share[c] >= 0 * z[c],
+                    name=f"McCormick_vinit2_{c}")
+        m.addConstr(vinit_share[c] <= Vinit - 0 * (1 - z[c]),
+                    name=f"McCormick_vinit3_{c}")
+        m.addConstr(vinit_share[c] >= Vinit - V_max * (1 - z[c]),
+                    name=f"McCormick_vinit4_{c}")
 
-    # (R9) Mínimo ecológico en Saltos del Laja
+    # Presupuestos lineales: multiplicar por constantes después
+    budget_r = gp.quicksum(COLCHONES[c]["shares"][0] * vinit_share[c]
+                           for c in C_LABELS)
+    budget_g = gp.quicksum(COLCHONES[c]["shares"][1] * vinit_share[c]
+                           for c in C_LABELS)
+
+    m.addConstr(sum_riego_Hm3 <= budget_r, name="R8_riego_budget")
+    m.addConstr(sum_gen_Hm3 <= budget_g, name="R8_gen_budget")
+
+    # (R8) Mínimo ecológico en Saltos del Laja
     for t in T:
         m.addConstr(
             gp.quicksum(y[i, "SaltosLaja", t] for i in IN["SaltosLaja"])
@@ -338,5 +355,5 @@ def run_years(years_horizon: List[int], V0: Optional[float] = None):
 # =============================
 if __name__ == "__main__":
     print("🔥 Iniciando optimización del Embalse del Laja...")
-    results = run_years(YEARS_HORIZON, V0=1400.0)
+    results = run_years(YEARS_HORIZON, V0=3000.0)
     print("🏁 Optimización completada.")
