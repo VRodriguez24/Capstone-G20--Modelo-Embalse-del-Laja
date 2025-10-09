@@ -16,7 +16,7 @@ CAUDALMAX_CSV = "data/CaudalMax_filtrado.csv"
 INJ_CSV = "data/Caudales_historicos_filtrado.csv"
 
 # Rango de años a correr (el script usará min/max e iterará entre ambos)
-YEARS_HORIZON = [1960, 1961]
+YEARS_HORIZON = [1960, 2023]
 
 # Reglas de riego / ecológico (constantes, mismos valores para todo t)
 TUCAPEL_MIN = 90.0     # m3/s
