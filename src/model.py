@@ -194,16 +194,16 @@ def build_model_for_one_year(
     f_i, f_j = FILTR_ARC
     for t in T:
         m.addConstr(y[f_i, f_j, t] == Filtr[t], name=f"R5_filtr_arc_{t}")
+
     xpts, ypts = _pwl_points_from_segments(V_Lk, V_Uk, a_k, b_k)
+
+    # Asegúrate de que las Vars están integradas antes de gen-constr:
+    # m.update()
+
     for t in T:
-        Vprev = V[t-1] if t != T[0] else gp.LinExpr(Vinit)
-        m.addGenConstrPWL(
-            Vprev,
-            Filtr[t],
-            xpts,
-            ypts,
-            name=f"R5b_filtr_pwl_{t}"
-        )
+        xv = V[t-1] if t != T[0] else Vinit   # <-- Var en ambos casos
+        m.addGenConstrPWL(xv, Filtr[t], xpts, ypts, name=f"R5b_filtr_pwl_{t}")
+
 
     # (R6) Mínimos de entrada en Abanico (47) y Tucapel (90)
     for t in T:
