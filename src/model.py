@@ -28,7 +28,7 @@ EPS = 1e-3                      # epsilon para desambiguar límites
 Conv = (86400 * 30) / 1e6       # m^3/s x mes -> Hm3
 
 # Volúmenes embalse (Hm3)
-V_0 = 0.0
+V_0 = 1400.0
 V_min = 1200.0
 V_max = 3628.0
 
@@ -204,7 +204,6 @@ def build_model_for_one_year(
         xv = V[t-1] if t != T[0] else Vinit   # <-- Var en ambos casos
         m.addGenConstrPWL(xv, Filtr[t], xpts, ypts, name=f"R5b_filtr_pwl_{t}")
 
-
     # (R6) Mínimos de entrada en Abanico (47) y Tucapel (90)
     for t in T:
         m.addConstr(
@@ -286,22 +285,58 @@ def build_model_for_one_year(
 
 
 # =============================
-# Runner por rango [min,max]
+# 🚀 Runner por rango [min,max]
 # =============================
 def run_years(years_horizon: List[int], V0: Optional[float] = None):
     y_min, y_max = min(years_horizon), max(years_horizon)
+    total_years = y_max - y_min + 1
+
+    print("\n🌊 === MODELO EMBALSE DEL LAJA ===")
+    print(f"📅 Optimizando años: {y_min}-{y_max} ({total_years} años)")
+    print(f"💧 Volumen inicial: {V0 if V0 else 'Automático'}\n")
+
     results = {}
-    for y in range(y_min, y_max + 1):
+    optimal_count = 0
+
+    for i, y in enumerate(range(y_min, y_max + 1), 1):
+        print(f"⚙️  Construyendo modelo año {y} ({i}/{total_years})...")
         m = build_model_for_one_year(y, V0=V0)
+
+        print(f"🔍 Optimizando año {y}...")
         m.optimize()
+
+        if m.Status == GRB.INFEASIBLE:
+            print(f"❌ Año {y}: INFACTIBLE - generando diagnóstico")
+            m.computeIIS()
+            m.write(f"infeasible_{y}.ilp")
+        elif m.Status == GRB.OPTIMAL:
+            optimal_count += 1
+            print(f"✅ Año {y}: ÓPTIMO - {m.ObjVal:.1f} MWh")
+        else:
+            print(f"⚠️  Año {y}: Status {m.Status}")
+
         obj_mwh = m.ObjVal if m.Status == GRB.OPTIMAL else None
         results[y] = {"status": m.Status, "obj_MWh": obj_mwh}
-        print(f"[{y}] status={m.Status}  obj_MWh={results[y]['obj_MWh']}")
+
+    # Resumen final
+    print()
+    print("🎯 === RESUMEN OPTIMIZACIÓN ===")
+    print(f"✅ Soluciones óptimas: {optimal_count}/{total_years}")
+    if optimal_count > 0:
+        total_energy = sum(r["obj_MWh"] for r in results.values()
+                           if r["obj_MWh"] is not None)
+        avg_energy = total_energy / optimal_count
+        print(f"⚡ Energía total: {total_energy:,.0f} MWh")
+        print(f"📊 Promedio anual: {avg_energy:,.0f} MWh")
+    print()
+
     return results
 
 
 # =============================
-# Main
+# 🎬 Main
 # =============================
 if __name__ == "__main__":
-    _ = run_years(YEARS_HORIZON, V0=None)
+    print("🔥 Iniciando optimización del Embalse del Laja...")
+    results = run_years(YEARS_HORIZON, V0=1400.0)
+    print("🏁 Optimización completada.")
