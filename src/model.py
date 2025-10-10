@@ -1,4 +1,4 @@
-from typing import Tuple, Optional, List
+from typing import Tuple, Optional
 import gurobipy as gp
 from gurobipy import GRB
 
@@ -8,11 +8,6 @@ from embalse import T, NODES, ARCS, A_inyeccion, A_generacion, IN, OUT
 from data_loader import load_caudalmax, load_injections_for_year
 # --- Filtraciones y cotas ---
 from filt_cota import filtraciones_from_volumen, get_pwl_segments
-# Para exportar resultados y graficar
-from filt_cota import cota_from_volumen
-import os
-import csv
-import matplotlib.pyplot as plt
 
 # =============================
 # CONFIGURACIÓN (parámetros)
@@ -29,13 +24,30 @@ ABANICO_MIN = 47.0     # m3/s
 SALTOS_MIN = 7.0       # m3/s
 SALTOS_MIN_T = {t: SALTOS_MIN for t in T}  # comodidad para indexar por t
 
+# Curvas estacionales para 1° y 2° regantes (factor por mes 1..12).
+# Tomadas de la Tabla N°2 (imagen). Valores entre 0 y 1.
+# Columnas usadas: 1° Regantes y 2° Regantes
+FIRST_REGANTES_FACTOR = {
+    1: 1.00, 2: 1.00, 3: 1.00, 4: 1.00,
+    5: 0.00, 6: 0.00, 7: 0.00, 8: 0.00,
+    9: 1.00, 10: 1.00, 11: 1.00, 12: 1.00
+}
+# Para segundos regantes la columna "2° Regantes" de la tabla
+SECOND_REGANTES_FACTOR = {
+    1: 1.00, 2: 1.00, 3: 0.80, 4: 0.50,
+    5: 0.00, 6: 0.00, 7: 0.00, 8: 0.00,
+    9: 0.30, 10: 0.65, 11: 0.85, 12: 1.00
+}
+# Base para cálculo de déficit de 2dos regantes (según enunciado: 53 m3/s)
+SECOND_REGANTES_BASE = 53.0
+
 # Big-M y conversión
 M = 4000                        # Big-M (ajusta si hace falta)
 EPS = 1e-3                      # epsilon para desambiguar límites
 Conv = (86400 * 30) / 1e6       # m^3/s x mes -> Hm3
 
 # Volúmenes embalse (Hm3) - Basado en ANEXO N°1
-V_0 = 1400.0  # Volumen inicial por defecto (colchón "Superior")
+V_0 = 1400.0  # Volumen inicial por defecto
 V_min = 1200.0  # Volumen mínimo operativo (cota 1.300 msnm)
 V_max = 3628.0  # Volumen máximo (cota de vertimiento 1.368 msnm)
 
@@ -64,6 +76,17 @@ def build_model_for_one_year(
     V0: Optional[float] = None,
     I_arc_override: Optional[dict] = None,
 ) -> gp.Model:
+    """
+    Construye el modelo de optimización para el Embalse del Laja para un año específico.
+    
+    Args:
+        target_year: Año objetivo para la optimización
+        V0: Volumen inicial opcional (Hm3). Si None, usa V_0 por defecto
+        I_arc_override: Diccionario opcional para sobreescribir inyecciones (útil para Monte Carlo)
+
+    Returns:
+        gp.Model: Modelo de Gurobi configurado y listo para optimizar
+    """
 
     # 1) Datos iniciales
     eta, cap_max, _ = load_caudalmax(CAUDALMAX_CSV)
@@ -106,7 +129,7 @@ def build_model_for_one_year(
         return 0.0
 
     def A_nat_tu_t(t: int) -> float:
-        # suma de afluentes “naturales” salvo {laja_i, abanico, eltoro}
+        # suma de afluentes "naturales" salvo {laja_i, abanico, eltoro}
         return sum(I_arc[(i, j, t)] for (i, j) in A_inyeccion
                    if inj_label[(i, j)] not in excluir_lbls_tucapel)
 
@@ -120,13 +143,23 @@ def build_model_for_one_year(
     Filtr = m.addVars(T, lb=0.0, name="Filtr")
     G = m.addVars(T, lb=0.0, name="G")
 
-    # Déficits y binarias
+    # Déficits y binarias (primeros regantes)
     DefAb = m.addVars(T, lb=0.0, name="DeficitAbanico")
     DefTu = m.addVars(T, lb=0.0, name="DeficitTucapel")
     dAb = m.addVars(T, vtype=GRB.BINARY, name="deltaAb")
     dTu = m.addVars(T, vtype=GRB.BINARY, name="deltaTu")
 
-    # “Pseudo-variable” para V0 y selección de colchón z[c]
+    # Excedente de primeros regantes y su binaria
+    # Exc1_t = max{0, (Filtr_t + A_naturales_t) - 90*factor1_t}
+    Exc1 = m.addVars(T, lb=0.0, name="ExcedentePrimeros")
+    dExc1 = m.addVars(T, vtype=GRB.BINARY, name="deltaExc1")
+
+    # Déficit y binaria para los segundos regantes
+    # Def2_t = max{0, SECOND_REGANTES_BASE*factor2_t - Excedente_1os}
+    Def2 = m.addVars(T, lb=0.0, name="Deficit2dosRegantes")
+    d2 = m.addVars(T, vtype=GRB.BINARY, name="delta2")
+
+    # "Pseudo-variable" para V0 y selección de colchón z[c]
     Vinit = m.addVar(lb=0.0, name="Vinit")
     m.addConstr(Vinit == V0_eff, name="link_Vinit")
 
@@ -234,26 +267,62 @@ def build_model_for_one_year(
         m.addConstr(Filtr[t] == filtr_expr, name=f"R5e_pwl_function_{t}")
 
     # (R6) Déficits (MILP) linealizadas y cobertura por El Toro
+    # Se calculan dos tipos de déficits independientes:
+    # 1) Déficits de primeros regantes (90 m³/s en Tucapel, 47 m³/s en Abanico)
+    # 2) Déficits de segundos regantes (53 m³/s, basado en excedente de 1os)
     for t in T:
-        # Abanico: DefAb_t = max{0, 47 - Filtr_t - A_ab_t}
-        expr_ab = ABANICO_MIN - Filtr[t] - A_ab_t(t)
-        m.addConstr(DefAb[t] >= expr_ab, name=f"DAb_lb_{t}")
+        # Factores estacionales para el mes t
+        first_factor = FIRST_REGANTES_FACTOR.get(t, 1.0)
+        second_factor = SECOND_REGANTES_FACTOR.get(t, 1.0)
+
+        # PRIMEROS REGANTES
+        # Abanico: DefAb_t = max{0, 47*factor1_t - Filtr_t - A_abanico_t}
+        demanda_abanico = ABANICO_MIN * first_factor
+        expr_ab = demanda_abanico - Filtr[t] - A_ab_t(t)
+        m.addConstr(DefAb[t] >= expr_ab - M * (1 - dAb[t]), name=f"DAb_lb_{t}")
         m.addConstr(
             DefAb[t] <= expr_ab + M * (1 - dAb[t]), name=f"DAb_ub1_{t}"
             )
         m.addConstr(DefAb[t] <= M * dAb[t], name=f"DAb_ub2_{t}")
 
-        # Tucapel: DefTu_t = max{0, 90 - Filtr_t - A_nat_tu_t}
-        expr_tu = TUCAPEL_MIN - Filtr[t] - A_nat_tu_t(t)
-        m.addConstr(DefTu[t] >= expr_tu, name=f"DTu_lb_{t}")
+        # Tucapel: DefTu_t = max{0, 90*factor1_t - Filtr_t - A_naturales_t}
+        demanda_tucapel = TUCAPEL_MIN * first_factor
+        expr_tu = demanda_tucapel - Filtr[t] - A_nat_tu_t(t)
+        m.addConstr(DefTu[t] >= expr_tu - M * (1 - dTu[t]), name=f"DTu_lb_{t}")
         m.addConstr(
             DefTu[t] <= expr_tu + M * (1 - dTu[t]), name=f"DTu_ub1_{t}"
             )
         m.addConstr(DefTu[t] <= M * dTu[t], name=f"DTu_ub2_{t}")
 
+        # SEGUNDOS REGANTES (medido en Tucapel):
+        # Paso 1: Calcular excedente de primeros regantes
+        # Exc1_t = max{0, (Filtr_t + A_naturales_t) - 90*factor1_t}
+        caudal_disponible_1os = Filtr[t] + A_nat_tu_t(t)
+        expr_exc1 = caudal_disponible_1os - demanda_tucapel
+
+        # Linearización del excedente con variable binaria dExc1[t]
+        m.addConstr(Exc1[t] >= expr_exc1 - M * (1 - dExc1[t]),
+                    name=f"Exc1_lb_{t}")
+        m.addConstr(Exc1[t] <= expr_exc1 + M * (1 - dExc1[t]),
+                    name=f"Exc1_ub1_{t}")
+        m.addConstr(Exc1[t] <= M * dExc1[t], name=f"Exc1_ub2_{t}")
+
+        # Paso 2: Calcular déficit de segundos regantes
+        # Def2_t = max{0, 53*factor2_t - Exc1_t}
+        demanda_2dos = SECOND_REGANTES_BASE * second_factor
+        expr_2 = demanda_2dos - Exc1[t]
+
+        # Linearización del déficit de segundos regantes
+        m.addConstr(Def2[t] >= expr_2 - M * (1 - d2[t]), name=f"D2_lb_{t}")
+        m.addConstr(Def2[t] <= expr_2 + M * (1 - d2[t]), name=f"D2_ub1_{t}")
+        m.addConstr(Def2[t] <= M * d2[t], name=f"D2_ub2_{t}")
+
         # Cobertura desde Embalse via El Toro (suma de déficits)
-        m.addConstr(x["Embalse", "ElToro", t] >= DefAb[t] + DefTu[t],
-                    name=f"D_cover_by_ElToro_{t}")
+        # Q_extraccion_El_Toro >= Q_deficit_1os + Q_deficit_2os
+        m.addConstr(
+            x["Embalse", "ElToro", t] >= DefAb[t] + DefTu[t] + Def2[t],
+            name=f"D_cover_by_ElToro_{t}"
+        )
 
     # (R7) Presupuestos anuales por colchón (Hm3) desde Embalse
     # (excluye filtración del riego)
@@ -308,292 +377,18 @@ def build_model_for_one_year(
 
     # 5) FO: Max energía total
     m.setObjective(gp.quicksum(G[t] for t in T), GRB.MAXIMIZE)
+    
     # Adjuntar variables y metadatos al modelo para postprocesamiento
     m._y = y
     m._x = x
     m._V = V
     m._Filtr = Filtr
     m._G = G
-    m._meta = {"eta": eta, "Conv": Conv, "A_generacion": A_generacion, "ARCS": ARCS}
+    m._meta = {
+        "eta": eta,
+        "Conv": Conv,
+        "A_generacion": A_generacion,
+        "ARCS": ARCS
+    }
 
     return m
-
-
-# =============================
-# 🚀 Runner por rango [min,max]
-# =============================
-def run_years(years_horizon: List[int], V0: Optional[float] = None):
-    y_min, y_max = min(years_horizon), max(years_horizon)
-    total_years = y_max - y_min + 1
-
-    print("\n🌊 === MODELO EMBALSE DEL LAJA ===")
-    print(f"📅 Optimizando años: {y_min}-{y_max} ({total_years} años)")
-    print(f"💧 Volumen inicial: {V0 if V0 else 'Automático'}\n")
-
-    results = {}
-    optimal_count = 0
-
-    for i, y in enumerate(range(y_min, y_max + 1), 1):
-        print(f"⚙️  Construyendo modelo año {y} ({i}/{total_years})...")
-        m = build_model_for_one_year(y, V0=V0)
-
-        print(f"🔍 Optimizando año {y}...")
-        m.optimize()
-
-        if m.Status == GRB.INFEASIBLE:
-            print(f"❌ Año {y}: INFACTIBLE - generando diagnóstico")
-            m.computeIIS()
-            m.write(f"infeasible_{y}.ilp")
-        elif m.Status == GRB.OPTIMAL:
-            optimal_count += 1
-            print(f"✅ Año {y}: ÓPTIMO - {m.ObjVal:.1f} MWh")
-        else:
-            print(f"⚠️  Año {y}: Status {m.Status}")
-
-        obj_mwh = m.ObjVal if m.Status == GRB.OPTIMAL else None
-        results[y] = {"status": m.Status, "obj_MWh": obj_mwh}
-        # Si es óptimo, extraer V[t] y guardar cota mensual (csv + png)
-        if m.Status == GRB.OPTIMAL:
-            try:
-                os.makedirs("results", exist_ok=True)
-                # extraer V[t]
-                V_vars = [m.getVarByName(f"V[{t}]") for t in T]
-                vols = [v.x for v in V_vars]
-                cotas = [cota_from_volumen(v) for v in vols]
-
-                csv_path = os.path.join("results", f"cota_{y}.csv")
-                with open(csv_path, "w", newline="") as f:
-                    writer = csv.writer(f)
-                    writer.writerow(["mes"] + [f"mes{t}" for t in T])
-                    writer.writerow(["cota_m"] + [f"{c:.3f}" for c in cotas])
-
-                # plot simple cota vs mes
-                png_path = os.path.join("results", f"cota_{y}.png")
-                plt.figure(figsize=(10, 4))
-                plt.plot(T, cotas, marker="o")
-                plt.xticks(T)
-                plt.xlabel("Mes (1..12)")
-                plt.ylabel("Cota (m)")
-                plt.title(f"Cota mensual - año {y}")
-                plt.grid(True)
-                plt.tight_layout()
-                plt.savefig(png_path, dpi=150)
-                plt.close()
-                print(f"📈 Guardado cota mensual en: {csv_path}, {png_path}")
-            except Exception as e:
-                print(f"⚠️ Error guardando cota para {y}: {e}")
-            # Exportar flujos por arco y resumen por central
-            try:
-                flows_path = os.path.join("results", f"flows_{y}.csv")
-                summary_path = os.path.join("results", f"summary_central_{y}.csv")
-
-                y_vars = m._y
-                x_vars = m._x
-                eta = m._meta["eta"]
-                Conv = m._meta["Conv"]
-                A_gen = set(m._meta["A_generacion"])
-
-                # Escribir flows_{year}.csv: arco, mes, caudal_m3s, volumen_Hm3, energia_MWh
-                with open(flows_path, "w", newline="") as f:
-                    writer = csv.writer(f)
-                    writer.writerow(["i", "j", "mes", "caudal_m3s", "vol_Hm3", "energia_MWh"])
-                    for (i, j) in ARCS:
-                        for t in T:
-                            # preferir x si es arco de generacion, si existe en x_vars
-                            caudal = None
-                            if (i, j) in A_gen:
-                                var = x_vars.get((i, j, t))
-                                if var is not None:
-                                    caudal = var.x
-                            # si no hay x o no es arco de generacion, intentar y
-                            if caudal is None:
-                                var2 = y_vars.get((i, j, t))
-                                caudal = var2.x if var2 is not None else 0.0
-
-                            vol_hm3 = caudal * Conv
-                            energy = 0.0
-                            if (i, j) in A_gen:
-                                energy = eta.get((i, j), 0.0) * caudal
-                            writer.writerow([i, j, t, f"{caudal:.6f}", f"{vol_hm3:.6f}", f"{energy:.6f}"])
-
-                # Resumen por central: agrupar salidas desde Embalse hacia controles/generacion
-                # Columns: central, mes1..mes12 vol_Hm3_mesX, mes1..mes12 energy_MWh_mesX, total_vol_Hm3, total_energy_MWh
-                # Determinar arcos salientes desde Embalse
-                embalse_out = [j for (i, j) in ARCS if i == "Embalse"]
-                centers = embalse_out
-
-                with open(summary_path, "w", newline="") as f:
-                    writer = csv.writer(f)
-                    header = ["central"] + [f"vol_mes{t}_Hm3" for t in T] + [f"eng_mes{t}_MWh" for t in T] + ["total_vol_Hm3", "total_eng_MWh"]
-                    writer.writerow(header)
-                    for j in centers:
-                        vols_mes = []
-                        eng_mes = []
-                        total_vol = 0.0
-                        total_eng = 0.0
-                        for t in T:
-                            # buscar caudal desde Embalse->j
-                            caud = 0.0
-                            if ("Embalse", j, t) in x_vars:
-                                caud_var = x_vars[("Embalse", j, t)]
-                                caud = caud_var.x
-                            elif ("Embalse", j, t) in y_vars:
-                                caud_var = y_vars[("Embalse", j, t)]
-                                caud = caud_var.x
-                            vol = caud * Conv
-                            eng = eta.get(("Embalse", j), 0.0) * caud
-                            vols_mes.append(f"{vol:.6f}")
-                            eng_mes.append(f"{eng:.6f}")
-                            total_vol += vol
-                            total_eng += eng
-
-                        row = [j] + vols_mes + eng_mes + [f"{total_vol:.6f}", f"{total_eng:.6f}"]
-                        writer.writerow(row)
-
-                print(f"💾 Guardados flows & summary en: {flows_path}, {summary_path}")
-            except Exception as e:
-                print(f"⚠️ Error guardando flows/summary para {y}: {e}")
-
-    # Resumen final
-    print()
-    print("🎯 === RESUMEN OPTIMIZACIÓN ===")
-    print(f"✅ Soluciones óptimas: {optimal_count}/{total_years}")
-    if optimal_count > 0:
-        total_energy = sum(r["obj_MWh"] for r in results.values()
-                           if r["obj_MWh"] is not None)
-        avg_energy = total_energy / optimal_count
-        print(f"⚡ Energía total: {total_energy:,.0f} MWh")
-        print(f"📊 Promedio anual: {avg_energy:,.0f} MWh")
-    print()
-
-    return results
-
-
-# -----------------------------
-# Monte Carlo (bootstrap mensual)
-# -----------------------------
-def run_montecarlo(n_sims: int = 100, target_year: Optional[int] = None, seed: int = 0, V0: Optional[float] = None):
-    """
-    Ejecuta Monte Carlo por bootstrap mensual.
-    Retorna lista de tuplas (sim_id, status, obj_val)
-    """
-    import pandas as pd
-    import numpy as np
-
-    rng = np.random.default_rng(seed)
-    if target_year is None:
-        target_year = min(YEARS_HORIZON)
-
-    # Cargar histórico
-    df = pd.read_csv(INJ_CSV)
-    df = df.rename(columns={
-        "central": "central",
-        "fecha (mm-aaaa)": "fecha",
-        "caudal (m^3/s)": "caudal_m3s"
-    })
-
-    # importar utilidades del data_loader
-    from data_loader import _norm_central_for_inj, _parse_mm_yyyy, CENTRAL_TO_INJ_ARC
-
-    # Construir pools mensuales
-    months_pool = {}
-    for row in df.itertuples(index=False):
-        cent_key = _norm_central_for_inj(row.central)
-        try:
-            month, year = _parse_mm_yyyy(row.fecha)
-        except Exception:
-            continue
-        if year != target_year:
-            continue
-        if cent_key not in CENTRAL_TO_INJ_ARC:
-            continue
-        i, j = CENTRAL_TO_INJ_ARC[cent_key]
-        months_pool.setdefault((i, j, month), []).append(float(row.caudal_m3s))
-
-    # asegurar pools mínimos
-    for (i, j) in A_inyeccion:
-        for t in T:
-            months_pool.setdefault((i, j, t), [0.0])
-
-    results = []
-    for s in range(n_sims):
-        I_arc_sim = {}
-        for (i, j) in A_inyeccion:
-            for t in T:
-                pool = months_pool.get((i, j, t), [0.0])
-                I_arc_sim[(i, j, t)] = float(rng.choice(pool))
-
-        m = build_model_for_one_year(target_year, V0=V0, I_arc_override=I_arc_sim)
-        m.optimize()
-        obj = m.ObjVal if m.Status == GRB.OPTIMAL else None
-        results.append((s, int(m.Status), obj))
-
-    return results
-
-
-def pick_best_year(years: List[int], V0: Optional[float] = None, time_limit: Optional[float] = None, only_optimal: bool = True):
-    """
-    Evalúa una lista de años construyendo y optimizando el modelo para cada año.
-
-    Args:
-        years: lista de años a evaluar (por ejemplo [1960,1961,...])
-        V0: volumen inicial (Hm3) opcional
-        time_limit: si se provee, se lo pasa a Gurobi como TimeLimit (segundos)
-        only_optimal: si True, sólo considera soluciones con status OPTIMAL al seleccionar el mejor año;
-                      si False, usa el mejor incumbent (si existe) incluso si el status no es OPTIMAL.
-
-    Returns:
-        (best_year, details) donde details es un dict year -> {{'status': int, 'obj_MWh': float or None}}
-    """
-    details = {}
-    best_year = None
-    best_obj = None
-
-    for y in years:
-        print(f"🔎 Probando año {y}...")
-        m = build_model_for_one_year(y, V0=V0)
-        if time_limit is not None:
-            try:
-                m.Params.TimeLimit = float(time_limit)
-            except Exception:
-                pass
-        m.optimize()
-
-        status = m.Status
-        # Preferir ObjVal si existe (Gurobi puede dar ObjVal aún sin optimal)
-        obj_val = None
-        try:
-            obj_val = m.ObjVal
-        except Exception:
-            obj_val = None
-
-        # Normalizar None cuando ObjVal no está disponible
-        if obj_val is None:
-            obj = None
-        else:
-            obj = float(obj_val)
-
-        details[y] = {"status": status, "obj_MWh": obj}
-
-        consider = False
-        if only_optimal:
-            consider = (status == GRB.OPTIMAL and obj is not None)
-        else:
-            consider = (obj is not None)
-
-        if consider:
-            if best_obj is None or obj > best_obj:
-                best_obj = obj
-                best_year = y
-
-    print(f"🔚 Mejor año: {best_year} (obj={best_obj})")
-    return best_year, details
-
-
-# =============================
-# 🎬 Main
-# =============================
-if __name__ == "__main__":
-    print("🔥 Iniciando optimización del Embalse del Laja...")
-    results = run_years(YEARS_HORIZON, V0=3000.0)
-    print("🏁 Optimización completada.")
