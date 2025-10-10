@@ -1,0 +1,130 @@
+\ Model embalse_laja_1972_copy
+\ LP format - for model browsing. Use MPS format to capture full model detail.
+Maximize
+ 
+Subject To
+ link_Vinit: Vinit = 1397
+ R0_inj_afluente_AltoPolc_AltoPolc_1: y[afluente_AltoPolc,AltoPolc,1]
+   = 14.31
+ R0_inj_afluente_AltoPolc_AltoPolc_2: y[afluente_AltoPolc,AltoPolc,2]
+   = 7.83
+ R0_inj_afluente_AltoPolc_AltoPolc_3: y[afluente_AltoPolc,AltoPolc,3]
+   = 5.67
+ R0_inj_afluente_AltoPolc_AltoPolc_4: y[afluente_AltoPolc,AltoPolc,4]
+   = 3.51
+ R0_inj_afluente_AltoPolc_AltoPolc_5: y[afluente_AltoPolc,AltoPolc,5]
+   = 32.04
+ R1_bal_emb_1: 2.592 y[Embalse,ElToro,1] - 2.592 y[AltoPolc,Embalse,1]
+   + 2.592 y[Embalse,control_FiltracionesLaja,1]
+   + 2.592 x[Embalse,ElToro,1] + V[1] - Vinit = 0
+ R1_bal_emb_2: 2.592 y[Embalse,ElToro,2] - 2.592 y[AltoPolc,Embalse,2]
+   + 2.592 y[Embalse,control_FiltracionesLaja,2]
+   + 2.592 x[Embalse,ElToro,2] - V[1] + V[2] = 0
+ R1_bal_emb_3: 2.592 y[Embalse,ElToro,3] - 2.592 y[AltoPolc,Embalse,3]
+   + 2.592 y[Embalse,control_FiltracionesLaja,3]
+   + 2.592 x[Embalse,ElToro,3] - V[2] + V[3] = 0
+ R1_bal_emb_4: 2.592 y[Embalse,ElToro,4] - 2.592 y[AltoPolc,Embalse,4]
+   + 2.592 y[Embalse,control_FiltracionesLaja,4]
+   + 2.592 x[Embalse,ElToro,4] - V[3] + V[4] = 0
+ R1_bal_emb_5: 2.592 y[Embalse,ElToro,5] - 2.592 y[AltoPolc,Embalse,5]
+   + 2.592 y[Embalse,control_FiltracionesLaja,5]
+   + 2.592 x[Embalse,ElToro,5] - V[4] + V[5] = 0
+ R2_bal_nodo_AltoPolc_1: y[afluente_AltoPolc,AltoPolc,1]
+   - y[AltoPolc,Embalse,1] = 0
+ R2_bal_nodo_AltoPolc_2: y[afluente_AltoPolc,AltoPolc,2]
+   - y[AltoPolc,Embalse,2] = 0
+ R2_bal_nodo_AltoPolc_3: y[afluente_AltoPolc,AltoPolc,3]
+   - y[AltoPolc,Embalse,3] = 0
+ R2_bal_nodo_AltoPolc_4: y[afluente_AltoPolc,AltoPolc,4]
+   - y[AltoPolc,Embalse,4] = 0
+ R2_bal_nodo_AltoPolc_5: y[afluente_AltoPolc,AltoPolc,5]
+   - y[AltoPolc,Embalse,5] = 0
+ R3_y0_gen_Embalse_ElToro_1: y[Embalse,ElToro,1] = 0
+ R3_y0_gen_Embalse_ElToro_2: y[Embalse,ElToro,2] = 0
+ R3_y0_gen_Embalse_ElToro_3: y[Embalse,ElToro,3] = 0
+ R3_y0_gen_Embalse_ElToro_4: y[Embalse,ElToro,4] = 0
+ R3_y0_gen_Embalse_ElToro_5: y[Embalse,ElToro,5] = 0
+ R5a_filtr_arc_1: y[Embalse,control_FiltracionesLaja,1] - Filtr[1] = 0
+ R5a_filtr_arc_2: y[Embalse,control_FiltracionesLaja,2] - Filtr[2] = 0
+ R5e_pwl_function_2: Filtr[2] - 22.37546420798753 delta_pwl[1,2]
+   - 23.71160444567795 delta_pwl[2,2] - 25.04593628057046 delta_pwl[3,2]
+   - 30.10904955543811 delta_pwl[4,2] = 0
+ R5a_filtr_arc_3: y[Embalse,control_FiltracionesLaja,3] - Filtr[3] = 0
+ R5b_one_segment_3: delta_pwl[1,3] + delta_pwl[2,3] + delta_pwl[3,3]
+   + delta_pwl[4,3] = 1
+ R5e_pwl_function_3: Filtr[3] - 22.37546420798753 delta_pwl[1,3]
+   - 23.71160444567795 delta_pwl[2,3] - 25.04593628057046 delta_pwl[3,3]
+   - 30.10904955543811 delta_pwl[4,3] = 0
+ R5a_filtr_arc_4: y[Embalse,control_FiltracionesLaja,4] - Filtr[4] = 0
+ R5e_pwl_function_4: Filtr[4] - 22.37546420798753 delta_pwl[1,4]
+   - 23.71160444567795 delta_pwl[2,4] - 25.04593628057046 delta_pwl[3,4]
+   - 30.10904955543811 delta_pwl[4,4] = 0
+ R5a_filtr_arc_5: y[Embalse,control_FiltracionesLaja,5] - Filtr[5] = 0
+ DAb_lb_1: Filtr[1] + DeficitAbanico[1] >= 43
+ D_cover_by_ElToro_1: x[Embalse,ElToro,1] - DeficitAbanico[1]
+   - DeficitTucapel[1] >= 0
+ DAb_lb_2: Filtr[2] + DeficitAbanico[2] >= 43.9
+ DTu_lb_2: Filtr[2] + DeficitTucapel[2] >= 39.98
+ D_cover_by_ElToro_2: x[Embalse,ElToro,2] - DeficitAbanico[2]
+   - DeficitTucapel[2] >= 0
+ DAb_lb_3: Filtr[3] + DeficitAbanico[3] >= 44
+ DTu_lb_3: Filtr[3] + DeficitTucapel[3] >= 63.29
+ D_cover_by_ElToro_3: x[Embalse,ElToro,3] - DeficitAbanico[3]
+   - DeficitTucapel[3] >= 0
+ DAb_lb_4: Filtr[4] + DeficitAbanico[4] >= 43.7
+ DTu_lb_4: Filtr[4] + DeficitTucapel[4] >= 56.93906344871911
+ D_cover_by_ElToro_4: x[Embalse,ElToro,4] - DeficitAbanico[4]
+   - DeficitTucapel[4] >= 0
+ DAb_lb_5: Filtr[5] + DeficitAbanico[5] >= 40.9
+ D_cover_by_ElToro_5: x[Embalse,ElToro,5] - DeficitAbanico[5]
+   - DeficitTucapel[5] >= 0
+Bounds
+ y[afluente_AltoPolc,AltoPolc,1] free
+ y[afluente_AltoPolc,AltoPolc,2] free
+ y[afluente_AltoPolc,AltoPolc,3] free
+ y[afluente_AltoPolc,AltoPolc,4] free
+ y[afluente_AltoPolc,AltoPolc,5] free
+ y[Embalse,ElToro,1] free
+ y[Embalse,ElToro,2] free
+ y[Embalse,ElToro,3] free
+ y[Embalse,ElToro,4] free
+ y[Embalse,ElToro,5] free
+ y[AltoPolc,Embalse,1] free
+ y[AltoPolc,Embalse,2] free
+ y[AltoPolc,Embalse,3] free
+ y[AltoPolc,Embalse,4] free
+ y[AltoPolc,Embalse,5] free
+ y[Embalse,control_FiltracionesLaja,1] free
+ y[Embalse,control_FiltracionesLaja,2] free
+ y[Embalse,control_FiltracionesLaja,3] free
+ y[Embalse,control_FiltracionesLaja,4] free
+ y[Embalse,control_FiltracionesLaja,5] free
+ x[Embalse,ElToro,1] free
+ x[Embalse,ElToro,2] free
+ x[Embalse,ElToro,3] free
+ x[Embalse,ElToro,4] free
+ x[Embalse,ElToro,5] free
+ V[1] free
+ V[2] free
+ V[3] free
+ V[4] free
+ V[5] >= 1200
+ Filtr[1] free
+ Filtr[2] free
+ Filtr[3] free
+ Filtr[4] free
+ Filtr[5] free
+ DeficitAbanico[1] free
+ DeficitAbanico[2] free
+ DeficitAbanico[3] free
+ DeficitAbanico[4] free
+ DeficitAbanico[5] free
+ DeficitTucapel[2] free
+ DeficitTucapel[3] free
+ DeficitTucapel[4] free
+ Vinit free
+Binaries
+ delta_pwl[1,2] delta_pwl[1,3] delta_pwl[1,4] delta_pwl[2,2] delta_pwl[2,3]
+ delta_pwl[2,4] delta_pwl[3,2] delta_pwl[3,3] delta_pwl[3,4] delta_pwl[4,2]
+ delta_pwl[4,3] delta_pwl[4,4]
+End
