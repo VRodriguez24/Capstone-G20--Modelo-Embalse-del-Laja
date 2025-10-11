@@ -377,7 +377,7 @@ def build_model_for_one_year(
 
     # 5) FO: Max energía total
     m.setObjective(gp.quicksum(G[t] for t in T), GRB.MAXIMIZE)
-    
+
     # Adjuntar variables y metadatos al modelo para postprocesamiento
     m._y = y
     m._x = x

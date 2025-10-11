@@ -1,477 +1,652 @@
-from typing import List, Optional, Dict, Any
+# src/main.py
+from __future__ import annotations
 import argparse
 import sys
 import os
-import csv
-import matplotlib.pyplot as plt
+from typing import List, Optional
 from gurobipy import GRB
+from embalse import T
+from model import build_model_for_one_year, YEARS_HORIZON
+from montecarlo import BlockBootstrapSampler
+from sensitivity import sweep_V0, extract_kpis
 
-# Importar módulos del proyecto
-try:
-    # Imports relativos (cuando se ejecuta como módulo: python -m src.main)
-    from .model import build_model_for_one_year
-    from .data_loader import T
-    from .filt_cota import cota_from_volumen
-    from .sensitivity_analysis import (
-        run_sensitivity_analysis,
-        analyze_sensitivity_results,
-        calculate_yearly_kpis
-    )
-    from .montecarlo_simulation import (
-        run_single_year_montecarlo,
-        run_multi_year_montecarlo
-    )
-    from .utils import print_summary_from_kpis
-    from .config import YEARS_HORIZON, DEFAULT_V0, DEFAULT_N_SIMS, DEFAULT_SEED
-except ImportError:
-    # Imports absolutos (cuando se ejecuta directamente: python src/main.py)
-    from model import build_model_for_one_year
-    from data_loader import T
-    from filt_cota import cota_from_volumen
-    from sensitivity_analysis import (
-        run_sensitivity_analysis,
-        analyze_sensitivity_results,
-        calculate_yearly_kpis
-    )
-    from montecarlo_simulation import (
-        run_single_year_montecarlo,
-        run_multi_year_montecarlo
-    )
-    from utils import print_summary_from_kpis
-    from config import YEARS_HORIZON, DEFAULT_V0, DEFAULT_N_SIMS, DEFAULT_SEED
+INJ_CSV = "data/Caudales_historicos_filtrado.csv"
 
-"""
-Entry point CLI modularizado para el modelo Embalse del Laja.
-Control principal que coordina todos los módulos especializados.
-
-Usage examples:
-  python src/main.py --years 1960 1961 1962 --v0 1200
-  python -m src.main --montecarlo --year 1960 --n-sims 100
-  python src/main.py --best-year --years 1960 1961 1962 --v0 2500  
-  python src/main.py --sensitivity --param V0 --values 800,900,1000
-"""
-
-# Configurar path para imports - agregar directorio src
-_current_dir = os.path.dirname(os.path.abspath(__file__))
-if _current_dir not in sys.path:
-    sys.path.insert(0, _current_dir)
-
-
-# =============================
-# 🚀 FUNCIONES DE EJECUCIÓN PRINCIPAL
-# =============================
-
-def run_years(years_horizon: List[int],
-              V0: Optional[float] = None,
-              time_limit: Optional[float] = None) -> Dict[int, Dict[str, Any]]:
+def run_deterministic(years: List[int], V0: float, robust: bool = False):
     """
-    Ejecuta optimización determinística para un rango de años.
+    Ejecuta optimización determinística con opción de recuperación robusta.
     
     Args:
-        years_horizon: Lista de años a optimizar
-        V0: Volumen inicial opcional
-        time_limit: Límite de tiempo por optimización
-    
-    Returns:
-        Dict con resultados por año
+        years: Lista de años a procesar
+        V0: Volumen inicial en Hm³
+        robust: Si True, aplica estrategia de recuperación ante infactibilidades
     """
-    y_min, y_max = min(years_horizon), max(years_horizon)
-    total_years = y_max - y_min + 1
-
-    print("\n🌊 === MODELO EMBALSE DEL LAJA ===")
-    print(f"📅 Optimizando años: {y_min}-{y_max} ({total_years} años)")
-    print(f"💧 Volumen inicial: {V0 if V0 else 'Automático'}")
-    if time_limit:
-        print(f"⏱️  Límite tiempo: {time_limit}s por año")
-    print()
-
-    results = {}
-    optimal_count = 0
-
-    for i, y in enumerate(range(y_min, y_max + 1), 1):
-        print(f"⚙️  Construyendo modelo año {y} ({i}/{total_years})...")
-        m = build_model_for_one_year(y, V0=V0)
-
-        if time_limit:
-            m.Params.TimeLimit = float(time_limit)
-
-        print(f"🔍 Optimizando año {y}...")
+    strategy_text = "🛡️  ROBUSTO" if robust else "📊 ESTÁNDAR"
+    print(f"▶ Determinístico {strategy_text} | años={years} | V0={V0}")
+    print("=" * 80)
+    
+    results = []
+    total_energy = 0
+    current_V0 = V0
+    safe_volume = 1400.0  # Volumen seguro confirmado por análisis
+    recoveries = 0
+    
+    for i, y in enumerate(years):
+        print(f"\n🗓️  PROCESANDO AÑO {y} ({i+1}/{len(years)})")
+        print(f"💧 V0: {current_V0:,.1f} Hm³")
+        print("-" * 50)
+        
+        m = build_model_for_one_year(target_year=y, V0=current_V0)
         m.optimize()
-
-        if m.Status == GRB.INFEASIBLE:
-            print(f"❌ Año {y}: INFACTIBLE - generando diagnóstico")
-            m.computeIIS()
-            m.write(f"infeasible_{y}.ilp")
-        elif m.Status == GRB.OPTIMAL:
-            optimal_count += 1
-            print(f"✅ Año {y}: ÓPTIMO - {m.ObjVal:.1f} MWh")
-        else:
-            print(f"⚠️  Año {y}: Status {m.Status}")
-
-        obj_mwh = m.ObjVal if m.Status == GRB.OPTIMAL else None
-        gap = m.MIPGap if hasattr(m, 'MIPGap') else None
+        k = extract_kpis(m)
         
-        results[y] = {
-            "status": m.Status,
-            "obj_MWh": obj_mwh,
-            "gap": gap,
-            "model": m  # Guardamos el modelo para análisis posterior
-        }
+        # Interpretación del status
+        status_msg = {
+            2: "✅ ÓPTIMO",
+            3: "❌ INFACTIBLE", 
+            4: "❌ INFACTIBLE O NO ACOTADO",
+            5: "⏱️  LÍMITE DE TIEMPO",
+            9: "⚠️  INTERRUMPIDO"
+        }.get(k['status'], f"❓ STATUS {k['status']}")
         
-        # Exportar resultados si es óptimo
-        if m.Status == GRB.OPTIMAL:
-            export_results(m, y)
-
-    # Calcular y mostrar KPIs usando módulo especializado
-    kpis = calculate_yearly_kpis(results)
-    print_summary_from_kpis(kpis)
-    
-    return results
-
-
-def export_results(model, year: int):
-    """Exporta resultados de un modelo óptimo a archivos CSV y PNG."""
-    try:
-        os.makedirs("results", exist_ok=True)
-        
-        # Extraer volúmenes y cotas
-        V_vars = [model.getVarByName(f"V[{t}]") for t in T]
-        vols = [v.x for v in V_vars]
-        cotas = [cota_from_volumen(v) for v in vols]
-
-        # Guardar cotas mensuales
-        csv_path = os.path.join("results", f"cota_{year}.csv")
-        with open(csv_path, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["mes"] + [f"mes{t}" for t in T])
-            writer.writerow(["cota_m"] + [f"{c:.3f}" for c in cotas])
-
-        # Gráfico de cotas
-        png_path = os.path.join("results", f"cota_{year}.png")
-        plt.figure(figsize=(10, 4))
-        plt.plot(T, cotas, marker="o")
-        plt.xticks(T)
-        plt.xlabel("Mes (1..12)")
-        plt.ylabel("Cota (m)")
-        plt.title(f"Cota mensual - año {year}")
-        plt.grid(True)
-        plt.tight_layout()
-        plt.savefig(png_path, dpi=150)
-        plt.close()
-        
-        print(f"📈 Guardado cota mensual en: {csv_path}, {png_path}")
-        
-        # Exportar flujos detallados
-        export_flows(model, year)
-        
-    except Exception as e:
-        print(f"⚠️ Error guardando resultados para {year}: {e}")
-
-
-def export_flows(model, year: int):
-    """Exporta flujos por arco y resumen por central."""
-    try:
-        flows_path = os.path.join("results", f"flows_{year}.csv")
-        summary_path = os.path.join("results", f"summary_central_{year}.csv")
-
-        y_vars = model._y
-        x_vars = model._x
-        eta = model._meta["eta"]
-        Conv = model._meta["Conv"]
-        A_gen = set(model._meta["A_generacion"])
-        ARCS = model._meta["ARCS"]
-
-        # Flujos detallados por arco
-        with open(flows_path, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["i", "j", "mes", "caudal_m3s", "vol_Hm3", "energia_MWh"])
+        if k['status'] == 2:  # Óptimo
+            energy = k.get('obj_MWh', 0)
+            v_final = k.get('V_end', 0)
+            def_ab = k.get('DefAb_sum', 0)
+            def_tu = k.get('DefTu_sum', 0)
             
-            for (i, j) in ARCS:
-                for t in T:
-                    caudal = 0.0
-                    if (i, j) in A_gen and (i, j, t) in x_vars:
-                        caudal = x_vars[(i, j, t)].x
-                    elif (i, j, t) in y_vars:
-                        caudal = y_vars[(i, j, t)].x
-
-                    vol_hm3 = caudal * Conv
-                    energy = eta.get((i, j), 0.0) * caudal if (i, j) in A_gen else 0.0
-                    
-                    writer.writerow([i, j, t, f"{caudal:.6f}", f"{vol_hm3:.6f}", f"{energy:.6f}"])
-
-        # Resumen por central desde Embalse
-        embalse_out = [j for (i, j) in ARCS if i == "Embalse"]
-        
-        with open(summary_path, "w", newline="") as f:
-            writer = csv.writer(f)
-            header = (["central"] + [f"vol_mes{t}_Hm3" for t in T] + 
-                     [f"eng_mes{t}_MWh" for t in T] + ["total_vol_Hm3", "total_eng_MWh"])
-            writer.writerow(header)
+            print(f"📊 RESULTADO: {status_msg}")
+            print(f"⚡ Energía generada: {energy:,.1f} MWh")
+            print(f"💧 Volumen inicial: {current_V0:,.1f} Hm³")
+            print(f"💧 Volumen final: {v_final:,.1f} Hm³")
+            print(f"📉 Déficit Abanico: {def_ab:,.2f} Hm³")
+            print(f"📉 Déficit Tucapel: {def_tu:,.2f} Hm³")
             
-            for j in embalse_out:
-                vols_mes = []
-                eng_mes = []
-                total_vol = 0.0
-                total_eng = 0.0
+            total_energy += energy
+            results.append({
+                'year': y,
+                'status': 'ÓPTIMO',
+                'energy': energy,
+                'v_initial': current_V0,
+                'v_final': v_final,
+                'deficit_ab': def_ab,
+                'deficit_tu': def_tu,
+                'recovery_used': False
+            })
+            
+            # Actualizar V0 para el siguiente año si hay múltiples años
+            if len(years) > 1:
+                current_V0 = v_final
+                print(f"🔄 V0 para próximo año: {current_V0:,.1f} Hm³")
                 
-                for t in T:
-                    caud = 0.0
-                    if ("Embalse", j, t) in x_vars:
-                        caud = x_vars[("Embalse", j, t)].x
-                    elif ("Embalse", j, t) in y_vars:
-                        caud = y_vars[("Embalse", j, t)].x
-                    
-                    vol = caud * Conv
-                    eng = eta.get(("Embalse", j), 0.0) * caud
-
-                    vols_mes.append(f"{vol:.6f}")
-                    eng_mes.append(f"{eng:.6f}")
-                    total_vol += vol
-                    total_eng += eng
-
-                row = ([j] + vols_mes + eng_mes + 
-                      [f"{total_vol:.6f}", f"{total_eng:.6f}"])
-                writer.writerow(row)
-
-        print(f"💾 Guardados flows & summary en: {flows_path}, {summary_path}")
-
-    except Exception as e:
-        print(f"⚠️ Error guardando flows/summary para {year}: {e}")
-
-
-def print_summary(results: Dict[int, Dict], optimal_count: int, total_years: int):
-    """Imprime resumen final de la optimización."""
-    print()
-    print("🎯 === RESUMEN OPTIMIZACIÓN ===")
-    print(f"✅ Soluciones óptimas: {optimal_count}/{total_years}")
-
-    if optimal_count > 0:
-        total_energy = sum(r["obj_MWh"] for r in results.values() 
-                          if r["obj_MWh"] is not None)
-        avg_energy = total_energy / optimal_count
-        print(f"⚡ Energía total: {total_energy:,.0f} MWh")
-        print(f"📊 Promedio anual: {avg_energy:,.0f} MWh")
-
-        # Estadísticas de gap
-        gaps = [r["gap"] for r in results.values() if r["gap"] is not None]
-        if gaps:
-            import statistics
-            print(f"🎯 Gap promedio: {statistics.mean(gaps)*100:.2f}%")
-    print()
-
-
-# =============================
-# 🎲 MONTE CARLO - USANDO MÓDULO ESPECIALIZADO
-# =============================
-# Las funciones de Monte Carlo ahora están en montecarlo_simulation.py
-
-# =============================
-# 🔍 ANÁLISIS DE SENSIBILIDAD - USANDO MÓDULO ESPECIALIZADO
-# =============================
-# Las funciones de análisis de sensibilidad ahora están en sensitivity_analysis.py
-# =============================
-# 🏆 SELECCIÓN MEJOR AÑO - USANDO FUNCIONES AUXILIARES
-# =============================
-
-def pick_best_year(years: List[int], V0: Optional[float] = None, 
-                   time_limit: Optional[float] = None) -> Optional[int]:
-    """
-    Evalúa múltiples años y selecciona el mejor usando run_years existente.
-
-    Args:
-        years: Lista de años a evaluar
-        V0: Volumen inicial
-        time_limit: Límite de tiempo por optimización
-
-    Returns:
-        Mejor año encontrado o None
-    """
-    print(f"🏆 Buscando mejor año entre: {years}")
-    
-    # Usar función existente para optimizar todos los años
-    results = run_years(years, V0=V0, time_limit=time_limit)
-    
-    # Encontrar el año con mayor generación
-    best_year = None
-    best_obj = None
-    
-    for year, result in results.items():
-        if result.get("status") == GRB.OPTIMAL:
-            obj = result.get("obj_MWh")
-            if obj and (best_obj is None or obj > best_obj):
-                best_obj = obj
-                best_year = year
-    
-    if best_year:
-        print(f"\n🏆 Mejor año: {best_year} ({best_obj:.1f} MWh)")
-    else:
-        print("\n❌ No se encontró año óptimo")
-    
-    return best_year
-
-
-# =============================
-# 🖥️  CLI
-# =============================
-
-def parse_args():
-    """Configuración de argumentos CLI usando módulos especializados."""
-    p = argparse.ArgumentParser(
-        description="CLI para modelo de optimización Embalse del Laja",
-        formatter_class=argparse.RawDescriptionHelpFormatter,
-        epilog="""
-Ejemplos de uso:
-  # Optimización determinística básica
-  python main.py --years 2010 2011 2012 --v0 1200
-
-  # Monte Carlo un año
-  python main.py --montecarlo --year 2015 --n-sims 100 --seed 42
-
-  # Monte Carlo multi-año
-  python main.py --montecarlo --year 2015 --multi-year --n-years 5 --n-sims 50
-
-  # Análisis de sensibilidad
-  python main.py --sensitivity --param V0 --values 800 900 1000 1100 1200
-
-  # Encontrar mejor año
-  python main.py --best-year --years 2010 2015 2020
-        """
-    )
-
-    # Argumentos generales
-    p.add_argument('--v0', type=float, default=DEFAULT_V0, 
-                   help=f'Volumen inicial V0 en Hm³ (default: {DEFAULT_V0})')
-    p.add_argument('--time-limit', type=float, default=None, 
-                   help='Límite tiempo por optimización en segundos')
-
-    # Modos de ejecución (mutuamente excluyentes)
-    modes = p.add_mutually_exclusive_group()
-    modes.add_argument('--montecarlo', action='store_true', 
-                       help='Ejecutar simulación Monte Carlo')
-    modes.add_argument('--best-year', action='store_true', 
-                       help='Encontrar mejor año entre opciones')
-    modes.add_argument('--sensitivity', action='store_true', 
-                       help='Ejecutar análisis de sensibilidad')
-
-    # Parámetros Monte Carlo
-    mc_group = p.add_argument_group('Monte Carlo', 'Parámetros para simulación estocástica')
-    mc_group.add_argument('--n-sims', type=int, default=DEFAULT_N_SIMS, 
-                          help=f'Número de simulaciones (default: {DEFAULT_N_SIMS})')
-    mc_group.add_argument('--year', type=int, default=None, 
-                          help='Año base para Monte Carlo (default: primer año disponible)')
-    mc_group.add_argument('--seed', type=int, default=DEFAULT_SEED, 
-                          help=f'Semilla para reproducibilidad (default: {DEFAULT_SEED})')
-    mc_group.add_argument('--multi-year', action='store_true',
-                          help='Simulación multi-año con volúmenes recursivos')
-    mc_group.add_argument('--n-years', type=int, default=5,
-                          help='Número de años para simulación multi-año (default: 5)')
-
-    # Parámetros selección de años
-    years_group = p.add_argument_group('Años', 'Selección de años para optimizar')
-    years_group.add_argument('--years', type=int, nargs='+', default=None, 
-                             help='Lista de años específicos (ej: --years 2010 2015 2020)')
-
-    # Parámetros análisis de sensibilidad
-    sens_group = p.add_argument_group('Sensibilidad', 'Parámetros para análisis de sensibilidad')
-    sens_group.add_argument('--param', type=str, default='V0', 
-                            choices=['V0', 'factor_segundos', 'factor_primeros'],
-                            help='Parámetro a analizar (default: V0)')
-    sens_group.add_argument('--values', type=str, default=None,
-                            help='Valores separados por comas (ej: --values 800,900,1000)')
-
-    # Opciones avanzadas
-    adv_group = p.add_argument_group('Avanzado', 'Opciones de configuración avanzada')
-    adv_group.add_argument('--stress-test', action='store_true',
-                           help='Activar modo de prueba de estrés con parámetros extremos')
-    adv_group.add_argument('--export-detailed', action='store_true',
-                           help='Exportar resultados detallados adicionales')
-
-    # Procesar argumentos
-    args = p.parse_args()
-    
-    # Post-procesamiento de argumentos
-    if args.values and isinstance(args.values, str):
-        # Convertir string separado por comas a lista de floats
-        args.values = [float(x.strip()) for x in args.values.split(',')]
-    
-    if not args.year:
-        args.year = min(YEARS_HORIZON)
-    
-    return args
-
-
-def main():
-    """Función principal que coordina la ejecución según argumentos CLI."""
-    args = parse_args()
-
-    if args.montecarlo:
-        print(f"🎲 Ejecutando Monte Carlo usando módulo especializado...")
-        print(f"   Simulaciones: {args.n_sims}")
-        print(f"   Año base: {args.year}")
-        print(f"   Semilla: {args.seed}")
-        print(f"   V0: {args.v0}")
-        
-        # Usar módulo Monte Carlo especializado
-        if hasattr(args, 'multi_year') and args.multi_year:
-            # Simulación multi-año
-            results = run_multi_year_montecarlo(
-                start_year=args.year,
-                n_years=getattr(args, 'n_years', 5),
-                n_iterations=args.n_sims,
-                V0=args.v0,
-                seed=args.seed
-            )
         else:
-            # Simulación un año
-            results = run_single_year_montecarlo(
-                target_year=args.year,
-                n_iterations=args.n_sims,
-                V0=args.v0,
-                seed=args.seed
-            )
-        
-        print("✅ Simulación Monte Carlo completada")
-
-    elif args.best_year:
-        years = args.years if args.years else YEARS_HORIZON[:5]
-        print(f"🏆 Buscando mejor año entre: {years}")
-        best_year = pick_best_year(years, V0=args.v0, time_limit=args.time_limit)
-        
-        if best_year:
-            print(f"🎯 Año recomendado: {best_year}")
-        else:
-            print("❌ No se pudo determinar el mejor año")
-
-    elif args.sensitivity:
-        if not hasattr(args, 'param') or not hasattr(args, 'values'):
-            print("❌ Se requieren --param y --values para análisis de sensibilidad")
-            print("   Ejemplo: --param V0 --values 800,900,1000,1100,1200")
-            return
+            print(f"📊 RESULTADO: {status_msg}")
             
-        print(f"🔍 Ejecutando análisis de sensibilidad usando módulo especializado...")
+            # Aplicar estrategia de recuperación si está habilitada
+            if robust and len(years) > 1:
+                print(f"🛡️  APLICANDO RECUPERACIÓN: V0 → {safe_volume:.1f} Hm³")
+                print("🔄 Re-intentando optimización...")
+                
+                # Limpiar modelo anterior
+                m.dispose()
+                
+                # Re-intentar con volumen seguro
+                m_recovery = build_model_for_one_year(target_year=y, V0=safe_volume)
+                m_recovery.optimize()
+                k_recovery = extract_kpis(m_recovery)
+                
+                if k_recovery['status'] == 2:  # Recuperación exitosa
+                    energy = k_recovery.get('obj_MWh', 0)
+                    v_final = k_recovery.get('V_end', safe_volume)
+                    def_ab = k_recovery.get('DefAb_sum', 0)
+                    def_tu = k_recovery.get('DefTu_sum', 0)
+                    
+                    print(f"✅ RECUPERACIÓN EXITOSA!")
+                    print(f"⚡ Energía generada: {energy:,.1f} MWh")
+                    print(f"💧 Volumen inicial: {safe_volume:,.1f} Hm³")
+                    print(f"💧 Volumen final: {v_final:,.1f} Hm³")
+                    print(f"📉 Déficit Abanico: {def_ab:,.2f} Hm³")
+                    print(f"📉 Déficit Tucapel: {def_tu:,.2f} Hm³")
+                    
+                    total_energy += energy
+                    recoveries += 1
+                    results.append({
+                        'year': y,
+                        'status': 'ÓPTIMO (RECUPERADO)',
+                        'energy': energy,
+                        'v_initial': safe_volume,
+                        'v_final': v_final,
+                        'deficit_ab': def_ab,
+                        'deficit_tu': def_tu,
+                        'recovery_used': True
+                    })
+                    
+                    current_V0 = v_final
+                    print(f"🔄 V0 para próximo año: {current_V0:,.1f} Hm³")
+                    
+                else:
+                    print(f"❌ Recuperación falló: {status_msg}")
+                    results.append({
+                        'year': y,
+                        'status': f'{status_msg} (IRRECUPERABLE)',
+                        'energy': 0,
+                        'v_initial': current_V0,
+                        'v_final': None,
+                        'recovery_used': False
+                    })
+                
+                m_recovery.dispose()
+            else:
+                print("❌ No se pudo obtener solución factible")
+                results.append({
+                    'year': y,
+                    'status': status_msg,
+                    'energy': 0,
+                    'v_initial': current_V0,
+                    'v_final': None,
+                    'recovery_used': False
+                })
         
-        # Usar módulo de análisis de sensibilidad
-        results = run_sensitivity_analysis(
-            parameter=args.param,
-            param_values=args.values,
-            base_year=args.year or min(YEARS_HORIZON),
-            V0=args.v0 if args.param != 'V0' else None
-        )
-        
-        # Analizar resultados
-        analyze_sensitivity_results(results, args.param)
-        print("✅ Análisis de sensibilidad completado")
+        m.dispose()
+    
+    # Resumen final
+    print("\n" + "=" * 80)
+    header = "ROBUSTO" if robust else "DETERMINÍSTICO"
+    print(f"📋 RESUMEN {header}")
+    print("=" * 80)
+    
+    # Contar estados y recuperaciones
+    optimal_results = [r for r in results if r['status'].startswith('ÓPTIMO')]
+    recovered_results = [r for r in results if r.get('recovery_used', False)]
+    
+    print(f"🎯 Años procesados: {len(results)}")
+    print(f"✅ Años óptimos: {len(optimal_results)}")
+    if robust and recoveries > 0:
+        print(f"🛡️  Recuperaciones exitosas: {recoveries}")
+        recovered_energy = sum(r['energy'] for r in recovered_results)
+        print(f"🔧 Energía por recuperación: {recovered_energy:,.1f} MWh")
+    print(f"⚡ Energía total: {total_energy:,.1f} MWh")
+    print(f"📊 Tasa de éxito: {len(optimal_results)/len(results)*100:.1f}%")
+    
+    if optimal_results:
+        avg_energy = total_energy / len(optimal_results)
+        print(f"📊 Energía promedio: {avg_energy:,.1f} MWh/año")
+    
+    print("\n📊 DETALLE POR AÑO:")
+    header_detail = "Año    Estado                    Energía      V_final    Déficits      Recup."
+    print(header_detail)
+    print("-" * len(header_detail))
+    
+    for r in results:
+        recovery_icon = "🛡️ " if r.get('recovery_used', False) else "   "
+        if r['status'].startswith('ÓPTIMO'):
+            print(f"{r['year']}   {r['status']:<20} {r['energy']:>8,.1f} MWh  "
+                  f"{r['v_final']:>6,.1f}  Ab={r['deficit_ab']:.1f}/Tu={r['deficit_tu']:.1f}  {recovery_icon}")
+        else:
+            print(f"{r['year']}   {r['status']:<20} {'---':>8} MWh  {'---':>6}  {'---':>15}  {recovery_icon}")
+    
+    print("=" * 80)
 
+def run_montecarlo(n_scenarios: int, years: List[int], V0: float, seed: int, 
+                  block_len: int, noise_sigma: float = 0.0):
+    print(f"▶ Monte Carlo | N={n_scenarios} | V0={V0} | seed={seed}")
+    print(f"📦 Bootstrap: bloques={block_len} | ruido={noise_sigma}")
+    print("=" * 80)
+    
+    sampler = BlockBootstrapSampler(INJ_CSV, random_state=seed)
+    all_results = []
+    optimal_count = 0
+    energies = []
+    
+    for s in range(1, n_scenarios + 1):
+        print(f"\n🎲 ESCENARIO {s}/{n_scenarios}")
+        print("-" * 40)
+        
+        # Generar escenario de afluentes
+        if noise_sigma == 0.0:
+            I_arc = sampler.sample_year(block_len=block_len)
+        else:
+            I_arc = sampler.sample_year_with_noise(block_len=block_len, 
+                                                  sigma=noise_sigma)
+        
+        scenario_results = []
+        scenario_energy = 0
+        current_V0 = V0
+        
+        for y in years:
+            m = build_model_for_one_year(target_year=y, V0=current_V0, 
+                                       I_arc_override=I_arc)
+            m.optimize()
+            k = extract_kpis(m)
+            
+            status_icon = "✅" if k['status'] == 2 else "❌"
+            energy = k.get('obj_MWh', 0) if k['status'] == 2 else 0
+            v_final = k.get('V_end', current_V0) if k['status'] == 2 else current_V0
+            
+            print(f"  {status_icon} {y}: {energy:>6,.1f} MWh | "
+                  f"V_end: {v_final:>6,.1f} Hm³")
+            
+            scenario_results.append({
+                'year': y,
+                'status': k['status'],
+                'energy': energy,
+                'v_final': v_final
+            })
+            
+            scenario_energy += energy
+            current_V0 = v_final  # Para siguiente año
+            m.dispose()
+        
+        all_results.append({
+            'scenario': s,
+            'total_energy': scenario_energy,
+            'years': scenario_results
+        })
+        
+        if scenario_energy > 0:
+            optimal_count += 1
+            energies.append(scenario_energy)
+            
+        print(f"📊 Total escenario: {scenario_energy:,.1f} MWh")
+    
+    # Análisis estadístico final
+    print("\n" + "=" * 80)
+    print("📈 ANÁLISIS MONTE CARLO")
+    print("=" * 80)
+    
+    print(f"🎯 Escenarios simulados: {n_scenarios}")
+    print(f"✅ Escenarios factibles: {optimal_count}")
+    print(f"📊 Tasa de factibilidad: {optimal_count/n_scenarios*100:.1f}%")
+    
+    if energies:
+        import numpy as np
+        mean_energy = np.mean(energies)
+        std_energy = np.std(energies)
+        min_energy = np.min(energies)
+        max_energy = np.max(energies)
+        
+        print(f"\n⚡ ESTADÍSTICAS DE ENERGÍA:")
+        print(f"  📊 Promedio: {mean_energy:,.1f} MWh")
+        print(f"  📏 Desv. estándar: {std_energy:,.1f} MWh")
+        print(f"  📉 Mínimo: {min_energy:,.1f} MWh")
+        print(f"  📈 Máximo: {max_energy:,.1f} MWh")
+        print(f"  🎯 CV: {std_energy/mean_energy*100:.1f}%")
+        
+        # Percentiles
+        p10 = np.percentile(energies, 10)
+        p50 = np.percentile(energies, 50)
+        p90 = np.percentile(energies, 90)
+        
+        print(f"\n📊 PERCENTILES:")
+        print(f"  P10: {p10:,.1f} MWh")
+        print(f"  P50: {p50:,.1f} MWh") 
+        print(f"  P90: {p90:,.1f} MWh")
+    
+    print("=" * 80)
+
+
+def run_sensitivity(years: List[int], v0_min: float, v0_max: float, 
+                   v0_step: float, seed: int, block_len: int, noise_sigma: float):
+    print(f"▶ Sensibilidad V0 | años={years}")
+    print(f"📊 Rango: [{v0_min}, {v0_max}] step={v0_step} | seed={seed}")
+    print("=" * 80)
+    
+    sampler = BlockBootstrapSampler(INJ_CSV, random_state=seed)
+    
+    # Generar escenario de afluentes
+    if noise_sigma == 0.0:
+        I_arc = sampler.sample_year(block_len=block_len)
+        print("🌊 Usando datos históricos (sin ruido)")
     else:
-        # Ejecución estándar determinística
-        years = args.years if args.years else YEARS_HORIZON[:10]  # Limitar por defecto
-        print(f"🚀 Ejecutando optimización determinística estándar")
-        print(f"   Años: {len(years)} ({min(years)}-{max(years)})")
-        print(f"   V0: {args.v0 or DEFAULT_V0} Hm³")
+        I_arc = sampler.sample_year_with_noise(block_len=block_len, 
+                                              sigma=noise_sigma)
+        print(f"🎲 Usando datos con ruido lognormal (σ={noise_sigma})")
+
+    # Construir grid de V0
+    v0_grid = []
+    v = v0_min
+    while v <= v0_max + 1e-9:
+        v0_grid.append(round(v, 6))
+        v += v0_step
+
+    print(f"📊 Evaluando {len(v0_grid)} valores de V0...")
+    print("-" * 80)
+
+    res = sweep_V0(years=years, v0_grid=v0_grid, I_arc_override=I_arc)
+    
+    # Análisis de resultados
+    feasible_points = []
+    optimal_energies = []
+    
+    print("\n📋 RESULTADOS DETALLADOS:")
+    print("-" * 80)
+    
+    for V0 in v0_grid:
+        print(f"\n💧 V0 = {V0:,.1f} Hm³")
         
-        results = run_years(years, V0=args.v0, time_limit=args.time_limit)
-        print("✅ Optimización determinística completada")
+        total_energy = 0
+        all_optimal = True
+        year_details = []
+        
+        for y in years:
+            k = res[(V0, y)]
+            status = k['status']
+            energy = k.get('obj_MWh', 0) if status == 2 else 0
+            v_end = k.get('V_end', 0) if status == 2 else 0
+            def_ab = k.get('DefAb_sum', 0)
+            def_tu = k.get('DefTu_sum', 0)
+            
+            status_icon = "✅" if status == 2 else "❌"
+            
+            print(f"  {status_icon} {y}: {energy:>8,.1f} MWh | "
+                  f"V_final: {v_end:>6,.1f} | "
+                  f"Déficits: Ab={def_ab:.1f}, Tu={def_tu:.1f}")
+            
+            total_energy += energy
+            if status != 2:
+                all_optimal = False
+            
+            year_details.append({
+                'year': y,
+                'energy': energy,
+                'v_final': v_end,
+                'optimal': status == 2
+            })
+        
+        if all_optimal:
+            feasible_points.append({
+                'V0': V0,
+                'total_energy': total_energy,
+                'years': year_details
+            })
+            optimal_energies.append(total_energy)
+            
+        print(f"  📊 TOTAL: {total_energy:,.1f} MWh ({'✅ Factible' if all_optimal else '❌ Infactible'})")
+
+    # Resumen final
+    print("\n" + "=" * 80)
+    print("📈 ANÁLISIS DE SENSIBILIDAD")
+    print("=" * 80)
+    
+    print(f"🎯 Puntos evaluados: {len(v0_grid)}")
+    print(f"✅ Puntos factibles: {len(feasible_points)}")
+    print(f"📊 Tasa factibilidad: {len(feasible_points)/len(v0_grid)*100:.1f}%")
+    
+    if optimal_energies:
+        import numpy as np
+        best_idx = np.argmax(optimal_energies)
+        best_point = feasible_points[best_idx]
+        
+        print(f"\n🏆 MEJOR RESULTADO:")
+        print(f"  💧 V0 óptimo: {best_point['V0']:,.1f} Hm³")
+        print(f"  ⚡ Energía máxima: {best_point['total_energy']:,.1f} MWh")
+        
+        print(f"\n📊 ESTADÍSTICAS ENERGÍA:")
+        print(f"  📈 Máximo: {np.max(optimal_energies):,.1f} MWh")
+        print(f"  📉 Mínimo: {np.min(optimal_energies):,.1f} MWh")
+        print(f"  📊 Promedio: {np.mean(optimal_energies):,.1f} MWh")
+        print(f"  📏 Rango: {np.max(optimal_energies) - np.min(optimal_energies):,.1f} MWh")
+        
+        # Tabla resumen compacta
+        print(f"\n📋 RESUMEN COMPACTO:")
+        print("V0 (Hm³)     Energía (MWh)    Estado")
+        print("-" * 40)
+        for fp in feasible_points[:10]:  # Mostrar solo primeros 10
+            print(f"{fp['V0']:>8.1f}     {fp['total_energy']:>10,.1f}     ✅")
+        if len(feasible_points) > 10:
+            print(f"... y {len(feasible_points)-10} puntos más")
+    
+    print("=" * 80)
+
+def parse_years(s: str) -> List[int]:
+    # ejemplo: "1960-1963" -> [1960, 1961, 1962, 1963]; "1960,1962" -> [1960,1062]
+    if "-" in s:
+        a, b = s.split("-")
+        a, b = int(a), int(b)
+        return list(range(min(a, b), max(a, b) + 1))
+    return [int(x) for x in s.split(",")]
 
 
-if __name__ == '__main__':
-    main()
+def print_banner():
+    """Muestra el banner de bienvenida del sistema."""
+    print("=" * 70)
+    print("🌊 EMBALSE DEL LAJA - Sistema de Optimización Modular 🌊")
+    print("=" * 70)
+    print("📊 Modos disponibles:")
+    print("  1️⃣  Determinístico - Optimización con datos históricos")
+    print("  2️⃣  Monte Carlo - Simulación estocástica con bootstrap")
+    print("  3️⃣  Sensibilidad - Análisis paramétrico de V0")
+    print("  4️⃣  Modo CLI - Usar argumentos de línea de comandos")
+    print("  0️⃣  Salir")
+    print("=" * 70)
+
+
+def get_user_input(prompt: str, default=None, input_type=str):
+    """Solicita input del usuario con validación y valor por defecto."""
+    while True:
+        try:
+            if default is not None:
+                user_input = input(f"{prompt} [{default}]: ").strip()
+                if not user_input:
+                    return default
+            else:
+                user_input = input(f"{prompt}: ").strip()
+                if not user_input:
+                    print("❌ Este campo es obligatorio. Intenta nuevamente.")
+                    continue
+            
+            if input_type == int:
+                return int(user_input)
+            elif input_type == float:
+                return float(user_input)
+            else:
+                return user_input
+                
+        except ValueError:
+            print(f"❌ Entrada inválida. Ingresa un {input_type.__name__} válido.")
+
+
+def get_years_interactive() -> List[int]:
+    """Permite al usuario seleccionar años de manera interactiva."""
+    print("\n📅 Selección de años:")
+    print("  Ejemplos: '1985' (un año), '1980-1985' (rango), '1980,1985,1990' (específicos)")
+    
+    # Crear rango completo de años disponibles
+    min_year, max_year = min(YEARS_HORIZON), max(YEARS_HORIZON)
+    available_years = list(range(min_year, max_year + 1))
+    
+    while True:
+        try:
+            years_str = get_user_input(f"Años a simular (disponibles: {min_year}-{max_year})",
+                                     default="1985")
+            years = parse_years(years_str)
+            
+            # Validar que los años estén en el rango disponible
+            invalid_years = [y for y in years if y not in available_years]
+            if invalid_years:
+                print(f"❌ Años fuera del rango disponible: {invalid_years}")
+                continue
+                
+            return years
+            
+        except Exception as e:
+            print(f"❌ Error procesando años: {e}")
+def run_interactive_deterministic():
+    """Ejecuta modo determinístico de forma interactiva."""
+    print("\n🎯 MODO DETERMINÍSTICO")
+    print("Optimización con datos históricos reales.")
+    
+    years = get_years_interactive()
+    V0 = get_user_input("💧 Volumen inicial V0 (Hm³)", default=1400.0, input_type=float)
+    
+    # Pregunta si usar modo robusto para secuencias largas
+    robust = False
+    if len(years) > 3:
+        robust_input = get_user_input("🛡️  ¿Usar modo robusto? (recomendado para secuencias largas) [s/N]", 
+                                    default="N", input_type=str)
+        robust = robust_input.lower() in ['s', 'sí', 'si', 'y', 'yes']
+    
+    mode_text = "robusto 🛡️" if robust else "estándar 📊"
+    print(f"\n🚀 Ejecutando optimización determinística {mode_text}...")
+    print(f"📋 Configuración: años={years}, V0={V0} Hm³")
+    if robust:
+        print("🛡️  Modo robusto: aplicará recuperación automática ante infactibilidades")
+    
+    run_deterministic(years=years, V0=V0, robust=robust)
+
+
+def run_interactive_montecarlo():
+    """Ejecuta modo Monte Carlo de forma interactiva."""
+    print("\n🎲 MODO MONTE CARLO")
+    print("Simulación estocástica con muestreo bootstrap.")
+    
+    years = get_years_interactive()
+    V0 = get_user_input("💧 Volumen inicial V0 (Hm³)", default=50.0, input_type=float)
+    N = get_user_input("🔢 Número de escenarios", default=50, input_type=int)
+    seed = get_user_input("🌱 Semilla aleatoria", default=42, input_type=int)
+    block_len = get_user_input("📦 Longitud de bloques bootstrap", default=3, input_type=int)
+    
+    print("\n🔊 Ruido lognormal:")
+    print("  0.0 = Sin ruido, 0.1 = Ruido bajo, 0.3 = Ruido alto")
+    noise = get_user_input("📊 Sigma del ruido lognormal", default=0.0, input_type=float)
+    
+    print(f"\n🚀 Ejecutando simulación Monte Carlo...")
+    print(f"📋 Configuración: N={N}, V0={V0}, seed={seed}, block={block_len}, noise={noise}")
+    
+    run_montecarlo(n_scenarios=N, years=years, V0=V0, seed=seed, 
+                  block_len=block_len, noise_sigma=noise)
+
+
+def run_interactive_sensitivity():
+    """Ejecuta análisis de sensibilidad de forma interactiva."""
+    print("\n🔍 MODO SENSIBILIDAD")
+    print("Análisis paramétrico del volumen inicial V0.")
+    
+    years = get_years_interactive()
+    
+    print("\n💧 Configuración del barrido de V0:")
+    V0_min = get_user_input("Volumen mínimo V0 (Hm³)", default=20.0, input_type=float)
+    V0_max = get_user_input("Volumen máximo V0 (Hm³)", default=100.0, input_type=float)
+    V0_step = get_user_input("Paso del barrido (Hm³)", default=10.0, input_type=float)
+    
+    print("\n🎲 Configuración estocástica:")
+    seed = get_user_input("🌱 Semilla aleatoria", default=42, input_type=int)
+    block_len = get_user_input("📦 Longitud de bloques bootstrap", default=3, input_type=int)
+    noise = get_user_input("📊 Sigma del ruido lognormal", default=0.0, input_type=float)
+    
+    print(f"\n🚀 Ejecutando análisis de sensibilidad...")
+    print(f"📋 Configuración: V0=[{V0_min}, {V0_max}] step={V0_step}")
+    
+    run_sensitivity(years=years, v0_min=V0_min, v0_max=V0_max, v0_step=V0_step,
+                   seed=seed, block_len=block_len, noise_sigma=noise)
+
+
+def interactive_mode():
+    """Modo interactivo principal."""
+    while True:
+        print_banner()
+        
+        try:
+            choice = get_user_input("Selecciona una opción", input_type=int)
+            
+            if choice == 0:
+                print("👋 ¡Hasta luego!")
+                break
+            elif choice == 1:
+                run_interactive_deterministic()
+            elif choice == 2:
+                run_interactive_montecarlo()
+            elif choice == 3:
+                run_interactive_sensitivity()
+            elif choice == 4:
+                print("\n📋 MODO CLI - Ejemplos de uso:")
+                print("# Determinístico:")
+                print("python src/main.py det --years 1985 --V0 50")
+                print("\n# Monte Carlo:")
+                print("python src/main.py mc --years 1985 --V0 50 --N 100 --seed 42")
+                print("\n# Sensibilidad:")
+                print("python src/main.py sens --years 1985 --V0min 20 --V0max 100 --V0step 10")
+                print("\nUsa 'python src/main.py --help' para más detalles.")
+                break
+            else:
+                print("❌ Opción inválida. Selecciona un número del 0 al 4.")
+                
+        except KeyboardInterrupt:
+            print("\n\n👋 Saliendo del programa...")
+            break
+        except Exception as e:
+            print(f"❌ Error inesperado: {e}")
+        
+        # Pausa antes de volver al menú
+        input("\n⏸️  Presiona Enter para continuar...")
+
+
+if __name__ == "__main__":
+    # Si no hay argumentos, ejecutar modo interactivo
+    if len(sys.argv) == 1:
+        interactive_mode()
+    else:
+        # Modo CLI tradicional
+        p = argparse.ArgumentParser(
+            description="Control de ejecución — Embalse del Laja",
+            epilog="💡 Ejecuta sin argumentos para modo interactivo: python src/main.py"
+        )
+        sub = p.add_subparsers(dest="cmd", required=True)
+
+        # determinístico
+        pd = sub.add_parser("det", help="Correr determinístico")
+        pd.add_argument("--years", type=str, default="1985")
+        pd.add_argument("--V0", type=float, default=50.0)
+
+        # montecarlo
+        pm = sub.add_parser("mc", help="Correr Monte Carlo")
+        pm.add_argument("--years", type=str, default="1985")
+        pm.add_argument("--V0", type=float, default=50.0)
+        pm.add_argument("--N", type=int, default=50)
+        pm.add_argument("--seed", type=int, default=42)
+        pm.add_argument("--block", type=int, default=3)
+        pm.add_argument("--noise", type=float, default=0.0,
+                       help="sigma lognormal (0=sin ruido)")
+
+        # sensibilidad
+        ps = sub.add_parser("sens", help="Barrido de sensibilidad en V0")
+        ps.add_argument("--years", type=str, default="1985")
+        ps.add_argument("--V0min", type=float, default=20.0)
+        ps.add_argument("--V0max", type=float, default=100.0)
+        ps.add_argument("--V0step", type=float, default=10.0)
+        ps.add_argument("--seed", type=int, default=42)
+        ps.add_argument("--block", type=int, default=3)
+        ps.add_argument("--noise", type=float, default=0.0)
+
+        try:
+            args = p.parse_args()
+            years = parse_years(args.years)
+
+            if args.cmd == "det":
+                run_deterministic(years=years, V0=args.V0)
+
+            elif args.cmd == "mc":
+                run_montecarlo(
+                    n_scenarios=args.N,
+                    years=years,
+                    V0=args.V0,
+                    seed=args.seed,
+                    block_len=args.block,
+                    noise_sigma=args.noise
+                )
+
+            elif args.cmd == "sens":
+                run_sensitivity(
+                    years=years,
+                    v0_min=args.V0min,
+                    v0_max=args.V0max,
+                    v0_step=args.V0step,
+                    seed=args.seed,
+                    block_len=args.block,
+                    noise_sigma=args.noise
+                )
+        except KeyboardInterrupt:
+            print("\n👋 Ejecución cancelada por el usuario.")
+        except Exception as e:
+            print(f"❌ Error en la ejecución: {e}")
+            sys.exit(1)
