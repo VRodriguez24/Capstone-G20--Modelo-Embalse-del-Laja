@@ -17,7 +17,7 @@ Pre-procesamiento: Caudales históricos (semanal → mensual)
 """
 
 CENTRALES_KEEP = [
-    "ALTOPOLC", "ELTORO", "ABANICO", "ANTUCO", "CANECOL", "TUCAPEL", "LAJA_I"
+    "ELTORO", "ABANICO", "ANTUCO", "CANECOL", "TUCAPEL", "LAJA_I"
     ]
 
 MONTH_MAP = {

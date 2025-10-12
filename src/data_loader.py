@@ -24,7 +24,7 @@ CENTRAL_TO_GEN_ARC: Dict[str, Tuple[str, str]] = {
 # Aquí mapeamos el alias que trae el CSV
 # hacia el arco de inyección correspondiente afluente_* → control_*
 CENTRAL_TO_INJ_ARC: Dict[str, Tuple[str, str]] = {
-    "altopolc":  ("afluente_AltoPolc", "AltoPolc"),
+    "eltoro":    ("afluente_Embalse", "Embalse"),
     "abanico":   ("afluente_Abanico",  "control_Abanico"),
     "antuco":    ("afluente_Antuco",   "control_Antuco"),
     "canecol":   ("afluente_Canecol",  "control_Canecol"),
