@@ -84,13 +84,13 @@ def filtraciones_from_volumen(volumen: float) -> float:
 
 def calculate_pwl_segments() -> Dict[int, Dict[str, Any]]:
     """
-    Calcula segmentos PWL basados en rango operativo (1200-3628 Hm3).
+    Calcula segmentos PWL basados en rango operativo completo (0-5582 Hm3).
 
-    Divide el rango operativo en 4 segmentos alineados con colchones:
-    1. Inferior: 1200-1370 Hm3
-    2. Transición: 1370-1730 Hm3
-    3. Intermedio: 1730-1900 Hm3
-    4. Superior: 1900-3628 Hm3
+    Divide el rango en segmentos alineados con la configuración de colchones:
+    1. Inferior: 0-1200 Hm3
+    2. Transición: 1200-1370 Hm3
+    3. Intermedio: 1370-1900 Hm3
+    4. Superior: 1900-5582 Hm3
 
     Returns:
         Diccionario con segmentos PWL, cada uno conteniendo:
@@ -100,8 +100,8 @@ def calculate_pwl_segments() -> Dict[int, Dict[str, Any]]:
     """
     segments = {}
 
-    # Puntos de ruptura alineados con colchones operativos
-    breakpoints = [1200, 1370, 1730, 1900, 3628]
+    # Puntos de ruptura alineados con configuración definitiva de colchones
+    breakpoints = [0, 1200, 1370, 1900, 5582]
 
     for i in range(len(breakpoints) - 1):
         v_min, v_max = breakpoints[i], breakpoints[i + 1]
