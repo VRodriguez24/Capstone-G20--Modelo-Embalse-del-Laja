@@ -16,15 +16,21 @@ Uso: python src/montecarlo.py
 from __future__ import annotations
 
 import sys
+import os
 import numpy as np
 import pandas as pd
+from pathlib import Path
 from typing import Dict, Tuple, List, Optional
 from dataclasses import dataclass
 
 # Importaciones del modelo
 from data_loader import CENTRAL_TO_INJ_ARC
 from embalse import A_inyeccion
-from model import build_model_for_one_year, T, YEARS_HORIZON
+from model import build_model_for_one_year, T, YEARS_HORIZON, Conv
+from filt_cota import cota_from_volumen
+# KPIs
+from kpi import (extract_kpis_montecarlo, print_kpis_montecarlo,
+                 export_kpis_to_csv)
 
 try:
     from kpi import extract_kpis
@@ -40,6 +46,44 @@ except ImportError:
                     model, '_V') else None
             }
         return {'status': -1, 'obj_MWh': None, 'V_end': None}
+
+
+def find_data_path() -> str:
+    """
+    Encuentra automáticamente la ruta al archivo de datos históricos.
+    
+    Returns:
+        Ruta válida al archivo Caudales_historicos_filtrado.csv
+    """
+    # Posibles ubicaciones del archivo
+    possible_paths = [
+        # Desde src/ (cuando se ejecuta montecarlo.py desde src/)
+        "../data/Caudales_historicos_filtrado.csv",
+        # Desde raíz del proyecto (cuando se ejecuta desde la raíz)
+        "data/Caudales_historicos_filtrado.csv",
+        # Ruta absoluta basada en la ubicación del script
+        Path(__file__).parent.parent / "data" / "Caudales_historicos_filtrado.csv"
+    ]
+    
+    for path in possible_paths:
+        if isinstance(path, Path):
+            if path.exists():
+                return str(path)
+        else:
+            if os.path.exists(path):
+                return path
+    
+    # Si no encuentra nada, probar desde el directorio actual
+    current_dir = Path.cwd()
+    
+    # Buscar hacia arriba hasta encontrar el directorio data/
+    for parent in [current_dir] + list(current_dir.parents):
+        data_file = parent / "data" / "Caudales_historicos_filtrado.csv"
+        if data_file.exists():
+            return str(data_file)
+    
+    # Fallback: usar la ruta relativa original
+    return "../data/Caudales_historicos_filtrado.csv"
 
 
 class BlockBootstrapSampler:
@@ -248,6 +292,7 @@ class SimulationResult:
     status: int
     energy_mwh: Optional[float]
     final_volume: Optional[float]
+    toro_usage: Optional[float] = None  # Uso del Toro en Hm³
     error: Optional[str] = None
 
     @property
@@ -272,6 +317,12 @@ class SimulationSummary:
     min_energy: float
     max_energy: float
     feasibility_rate: float
+    mean_toro_usage: float = 0.0
+    mean_volume: float = 0.0
+    mean_cota: float = 0.0
+    max_deficit: float = 0.0
+    mean_deficit: float = 0.0
+    years_with_deficit: int = 0
 
     def __str__(self) -> str:
         return (
@@ -279,7 +330,9 @@ class SimulationSummary:
             f"   Iteraciones: {self.total_iterations}\n"
             f"   Factibilidad: {self.feasibility_rate:.1%}\n"
             f"   Energía promedio: {self.mean_energy:.1f} MWh\n"
-            f"   Desviación estándar: {self.std_energy:.1f} MWh"
+            f"   Desviación estándar: {self.std_energy:.1f} MWh\n"
+            f"   Uso promedio El Toro: {self.mean_toro_usage:.1f} Hm³\n"
+            f"   Cota promedio: {self.mean_cota:.1f} msnm"
         )
 
 
@@ -299,16 +352,19 @@ class MonteCarloSimulator:
 
     def __init__(
         self,
-        data_path: str = "data/Caudales_historicos_filtrado.csv",
+        data_path: Optional[str] = None,
         random_state: int = 42
     ) -> None:
         """
         Inicializa el simulador Monte Carlo.
 
         Args:
-            data_path: Ruta a datos históricos de caudales
+            data_path: Ruta a datos históricos de caudales (None=autodetectar)
             random_state: Semilla para reproducibilidad
         """
+        if data_path is None:
+            data_path = find_data_path()
+        
         self.sampler = BlockBootstrapSampler(data_path, random_state)
         self.random_state = random_state
 
@@ -431,12 +487,22 @@ class MonteCarloSimulator:
             # Extraer KPIs
             kpis = extract_kpis(model)
 
+            # Calcular uso del Toro
+            toro_usage = 0.0
+            if hasattr(model, '_x'):
+                x_vars = model._x
+                toro_usage = sum(
+                    x_vars["Embalse", "ElToro", t].x
+                    for t in T
+                ) * Conv  # Convertir a Hm³
+
             result = SimulationResult(
                 iteration=iteration,
                 year=target_year,
                 status=kpis['status'],
                 energy_mwh=kpis.get('obj_MWh'),
-                final_volume=kpis.get('V_end')
+                final_volume=kpis.get('V_end'),
+                toro_usage=toro_usage
             )
 
             model.dispose()
@@ -449,6 +515,7 @@ class MonteCarloSimulator:
                 status=-1,
                 energy_mwh=None,
                 final_volume=None,
+                toro_usage=0.0,
                 error=str(e)
             )
 
@@ -498,14 +565,44 @@ class MonteCarloSimulator:
         feasible_count = len(feasible_results)
         optimal_count = len(optimal_results)
 
+        # Métricas de energía
         if optimal_results:
-            energies = [r.energy_mwh for r in optimal_results if r.energy_mwh]
+            energies = [
+                r.energy_mwh
+                for r in optimal_results
+                if r.energy_mwh
+            ]
             mean_energy = np.mean(energies) if energies else 0.0
             std_energy = np.std(energies) if len(energies) > 1 else 0.0
             min_energy = np.min(energies) if energies else 0.0
             max_energy = np.max(energies) if energies else 0.0
         else:
             mean_energy = std_energy = min_energy = max_energy = 0.0
+
+        # Métricas del Toro
+        toro_usages = [r.toro_usage for r in optimal_results
+                       if r.toro_usage is not None]
+        mean_toro_usage = np.mean(toro_usages) if toro_usages else 0.0
+
+        # Métricas de volumen y cota
+        volumes = [r.final_volume for r in optimal_results
+                   if r.final_volume is not None]
+        mean_volume = np.mean(volumes) if volumes else 0.0
+        mean_cota = cota_from_volumen(mean_volume) if mean_volume > 0 else 0.0
+
+        # Métricas de déficits (usando El Toro como proxy)
+        if toro_usages:
+            # Convertir de Hm³/año a m³/s promedio
+            toro_annual_m3s = [usage / (12 * Conv) for usage in toro_usages]
+            non_zero_usage = [u for u in toro_annual_m3s if u > 0.1]
+
+            max_deficit = max(non_zero_usage) if non_zero_usage else 0.0
+            mean_deficit = (np.mean(non_zero_usage) if non_zero_usage
+                            else 0.0)
+            years_with_deficit = len(non_zero_usage)
+        else:
+            max_deficit = mean_deficit = 0.0
+            years_with_deficit = 0
 
         return SimulationSummary(
             total_iterations=total,
@@ -515,7 +612,13 @@ class MonteCarloSimulator:
             std_energy=std_energy,
             min_energy=min_energy,
             max_energy=max_energy,
-            feasibility_rate=feasible_count / total if total > 0 else 0.0
+            feasibility_rate=feasible_count / total if total > 0 else 0.0,
+            mean_toro_usage=mean_toro_usage,
+            mean_volume=mean_volume,
+            mean_cota=mean_cota,
+            max_deficit=max_deficit,
+            mean_deficit=mean_deficit,
+            years_with_deficit=years_with_deficit
         )
 
     def _print_multi_year_summary(
@@ -559,6 +662,13 @@ if __name__ == "__main__":
     Interfaz interactiva para simulación Monte Carlo.
     Uso: python src/montecarlo.py
     """
+    
+    # Configurar codificación para Windows
+    try:
+        # Configurar terminal para UTF-8 en Windows
+        os.system('chcp 65001 > nul 2>&1')
+    except Exception:
+        pass
 
     def print_monte_carlo_menu():
         print("=" * 60)
@@ -595,7 +705,7 @@ if __name__ == "__main__":
                 elif input_type == float:
                     print("❌ Ingresa un número decimal válido")
                 else:
-                    print("❌ Entrada inválida")
+                    return ""  # Retornar string vacío para salir del bucle
 
     def validate_year(year):
         """Valida que el año esté en el rango disponible."""
@@ -647,40 +757,89 @@ if __name__ == "__main__":
                 verbose=True
             )
 
-            # Análisis adicional
-            print("\n📈 ANÁLISIS ESTADÍSTICO DETALLADO:")
-            print("=" * 60)
+            # KPIs DETALLADOS MONTE CARLO
+            print("\nRe-ejecutando muestra para KPIs detallados...")
 
-            optimal_results = [r for r in results if r.is_optimal]
-            if optimal_results:
-                energies = [r.energy_mwh for r in optimal_results
-                            if r.energy_mwh]
-                volumes = [r.final_volume for r in optimal_results
-                           if r.final_volume]
+            # Re-ejecutar modelos para muestra representativa (para eficiencia)
+            sample_size = min(20, n_iter // 5)  # Máximo 20 modelos
+            sample_models = []
 
-                if energies:
-                    print("⚡ ENERGÍA:")
-                    print(f"   Promedio: {np.mean(energies):,.1f} MWh")
-                    print(f"   Mediana: {np.median(energies):,.1f} MWh")
-                    p5 = np.percentile(energies, 5)
-                    p95 = np.percentile(energies, 95)
-                    print(f"   Percentil 5: {p5:,.1f} MWh")
-                    print(f"   Percentil 95: {p95:,.1f} MWh")
+            for i in range(sample_size):
+                try:
+                    # Generar escenario
+                    scenario = simulator.sampler.sample_with_noise(
+                        block_len, noise
+                    )
 
-                if volumes:
-                    print("\n💧 VOLUMEN FINAL:")
-                    print(f"   Promedio: {np.mean(volumes):,.1f} Hm³")
-                    print(f"   Mediana: {np.median(volumes):,.1f} Hm³")
-                    print(f"   Mínimo: {np.min(volumes):,.1f} Hm³")
-                    print(f"   Máximo: {np.max(volumes):,.1f} Hm³")
+                    # Construir modelo
+                    model = build_model_for_one_year(
+                        target_year=year,
+                        V0=V0,
+                        I_arc_override=scenario
+                    )
 
+                    model.Params.OutputFlag = 0
+                    model.optimize()
+
+                    if model.status == 2:  # Óptimo
+                        sample_models.append(model)
+
+                except Exception as e:
+                    print(f"   ⚠️ Error en muestra {i+1}: {e}")
+
+            # Calcular y mostrar KPIs Monte Carlo
+            if sample_models:
+                print(
+                    f"\n KPIs MONTE CARLO "
+                    f"(muestra de {len(sample_models)} modelos):"
+                )
+
+                kpis_mc = extract_kpis_montecarlo(
+                    sample_models,
+                    detailed_output=True
+                )
+                print_kpis_montecarlo(kpis_mc, year)
+
+                # Exportar resultados
+                try:
+                    export_files = export_kpis_to_csv(
+                        kpis_mc,
+                        prefix=f"mc_year_{year}"
+                    )
+                    print(
+                        f"\n📁 Resultados Monte Carlo exportados: "
+                        f"{len(export_files)} archivos CSV"
+                    )
+                except Exception as e:
+                    print(f"   ⚠️ Error exportando: {e}")
+
+                # Limpiar memoria
+                for model in sample_models:
+                    model.dispose()
+            else:
+                print("\n⚠️ No se pudieron calcular KPIs detallados")
+                print("Monte Carlo")
+
+            # Análisis de riesgo agregado  
             print("\n🎯 ANÁLISIS DE RIESGO:")
+            optimal_results = [r for r in results if r.is_optimal]
             success_rate = len(optimal_results) / len(results) * 100
             print(f"   Tasa de éxito: {success_rate:.1f}%")
             feasible_count = len([r for r in results if r.is_feasible])
             failed_count = len([r for r in results if not r.is_feasible])
             print(f"   Escenarios factibles: {feasible_count}")
             print(f"   Escenarios fallidos: {failed_count}")
+
+            # Estadísticas básicas de energía
+            if optimal_results:
+                energies = [
+                    r.energy_mwh
+                    for r in optimal_results
+                    if r.energy_mwh
+                ]
+                if energies:
+                    print(f"   Energía promedio: {np.mean(energies):,.1f} MWh")
+                    print(f"   Energía rango: [{np.min(energies):,.1f}, {np.max(energies):,.1f}] MWh")
 
         except Exception as e:
             print(f"❌ Error en simulación: {e}")
@@ -700,7 +859,7 @@ if __name__ == "__main__":
                 print(f"❌ {e}")
 
         n_years = get_input("📆 Número de años", default=5, input_type=int)
-        
+
         # Validar que el rango esté disponible
         end_year = start_year + n_years - 1
         max_available = max(YEARS_HORIZON)
@@ -770,6 +929,102 @@ if __name__ == "__main__":
                 total_scen = stats['total_scenarios']
                 print(f"{year}   | {success_pct:5.1f}%   | "
                       f"{mean_energy:8,.0f} MWh | {total_scen:3d}")
+
+            # Resumen agregado multi-año (formato compatible con model.py)
+            all_results = [result for traj in trajectories
+                          for result in traj]
+            successful_results = [r for r in all_results if r.is_optimal]
+
+            if successful_results:
+                # Energía total
+                total_energy = sum(
+                    r.energy_mwh for r in successful_results
+                    if r.energy_mwh
+                )
+                # Uso total del Toro
+                total_toro = sum(
+                    r.toro_usage for r in successful_results
+                    if r.toro_usage
+                )
+
+                print(f"\n📋 RESUMEN MULTI-AÑO ({start_year}-{end_year}):")
+                print("=" * 64)
+                print(f"🎯 Años procesados: {n_years}")
+                print(f"✅ Trayectorias exitosas: {len(trajectories)}")
+                print(f"⚡ Energía total promedio: {total_energy:,.1f} MWh")
+                print(f"🌊 Uso total El Toro: {total_toro:,.1f} Hm³")
+
+                # Promedios
+                avg_energy = total_energy / len(successful_results)
+                avg_toro = total_toro / len(successful_results)
+                print(f"📊 Energía promedio: {avg_energy:,.1f} MWh/año")
+                print(f"📊 Uso promedio El Toro: {avg_toro:,.1f} Hm³/año")
+
+                # KPIs DETALLADOS MULTI-AÑO
+                print("\n🔄 Calculando KPIs detallados multi-año...")
+
+                # Generar muestra representativa de modelos
+                sample_models = []
+                sample_size = min(15, len(trajectories))  # Máximo 15
+
+                for traj_idx in range(sample_size):
+                    if traj_idx < len(trajectories):
+                        trajectory = trajectories[traj_idx]
+
+                        # Tomar el primer año exitoso de cada 
+                        # trayectoria para muestra
+                        for result in trajectory:
+                            if result.is_optimal:
+                                try:
+                                    # Re-ejecutar modelo para ese año
+                                    # específico
+                                    scenario = simulator.sampler.sample_with_noise(
+                                        block_len, noise)
+
+                                    model = build_model_for_one_year(
+                                        target_year=result.year,
+                                        V0=V0,  # para consistencia
+                                        I_arc_override=scenario
+                                    )
+
+                                    model.Params.OutputFlag = 0
+                                    model.optimize()
+
+                                    if model.status == 2:
+                                        sample_models.append(model)
+                                        break  # Solo un modelo por trayectoria
+
+                                except Exception:
+                                    continue
+
+                # Análisis KPIs multi-año
+                if sample_models:
+                    print(
+                        f"\n📊 KPIs MULTI-AÑO (muestra de "
+                        f"{len(sample_models)} modelos):"
+                    )
+
+                    kpis_multi = extract_kpis_montecarlo(
+                        sample_models,
+                        detailed_output=True
+                    )
+                    print_kpis_montecarlo(kpis_multi)
+
+                    # Exportar resultados multi-año
+                    try:
+                        export_files = export_kpis_to_csv(
+                            kpis_multi,
+                            prefix=f"mc_multiyear_{start_year}-{end_year}"
+                        )
+                        print(f"\n� KPIs multi-año exportados: {len(export_files)} archivos CSV")
+                    except Exception as e:
+                        print(f"   ⚠️ Error exportando multi-año: {e}")
+                    
+                    # Limpiar memoria
+                    for model in sample_models:
+                        model.dispose()
+                else:
+                    print("\n⚠️ No se pudieron calcular KPIs detallados multi-año")
 
         except Exception as e:
             print(f"❌ Error en simulación multi-año: {e}")
