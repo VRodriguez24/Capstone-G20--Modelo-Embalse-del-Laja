@@ -1,516 +1,714 @@
-"""Caso base (diagnóstico de déficits) - LP simplificado
-
-Este script construye y resuelve un LP anual (12 meses) para diagnosticar
-déficits mínimos en Abanico (47 m3/s) y Tucapel (90 m3/s) respetando la
-capacidad física del canal de Tucapel. Usa las inyecciones mensuales y
-la función de filtraciones desde `filt_cota.py` tal como se describe en
-el modelo general, pero sin balance completo ni variables binarias.
-
-Salida: imprime un resumen en consola y guarda un CSV en `results/caso_base_{year}.csv`
-que contiene r_TU_t, d_AB_t, d_TU_t y Filtr_t/Aportes locales.
-"""
-from typing import Dict, Tuple
-import os
-import csv
-
+from typing import Tuple, Optional
 import gurobipy as gp
 from gurobipy import GRB
 
-# Conjuntos y utilidades del workspace
-from embalse import T, A_inyeccion
-from data_loader import load_injections_for_year
-from filt_cota import filtraciones_from_volumen, cota_from_volumen
-import pandas as pd
-import numpy as np
-import matplotlib.pyplot as plt
-from data_loader import load_caudalmax
+# --- Conjuntos/red ---
+from embalse import NODES, ARCS, A_inyeccion, A_generacion, IN, OUT
+# --- Datos (CSV) ---
+from data_loader import load_caudalmax, load_injections_for_year
+# --- Filtraciones y cotas ---
+from filt_cota import filtraciones_from_volumen, get_pwl_segments
 
-# Constantes del caso base
-ABANICO_MIN = 47.0
-TUCAPEL_MIN = 90.0
-# Capacidad física del canal Tucapel (m3/s)
-CAP_TUCAPEL = 56.5
+# =============================
+# CONFIGURACIÓN (parámetros)
+# =============================
+CAUDALMAX_CSV = "data/CaudalMax_filtrado.csv"
+INJ_CSV = "data/Caudales_historicos_filtrado.csv"
 
-# Conversión volumen(m3/s * mes) -> Hm3 usada en el modelo general
-Conv = (86400 * 30) / 1e6
+# Rango de años a correr (el script usará min/max e iterará entre ambos)
+YEARS_HORIZON = [1960, 2023]
+
+# Período hidrológico: Diciembre a Noviembre (30 nov = fin de temporada)
+T = [12, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
+
+# Reglas de riego / ecológico (constantes, mismos valores para todo t)
+TUCAPEL_MIN = 90.0     # m3/s
+ABANICO_MIN = 47.0     # m3/s
+SALTOS_MIN = 7.0       # m3/s
+SALTOS_MIN_T = {t: SALTOS_MIN for t in T}  # comodidad para indexar por t
+
+# Curvas estacionales para 1° y 2° regantes (factor por mes 1..12).
+# Tomadas de la Tabla N°2 (imagen). Valores entre 0 y 1.
+# Columnas usadas: 1° Regantes y 2° Regantes
+# NOTA: Los factores siguen siendo por mes calendario (1=Ene, 12=Dic)
+FIRST_REGANTES_FACTOR = {
+    1: 1.00, 2: 1.00, 3: 1.00, 4: 1.00,
+    5: 0.00, 6: 0.00, 7: 0.00, 8: 0.00,
+    9: 1.00, 10: 1.00, 11: 1.00, 12: 1.00
+}
+# Para segundos regantes la columna "2° Regantes" de la tabla
+SECOND_REGANTES_FACTOR = {
+    1: 1.00, 2: 1.00, 3: 0.80, 4: 0.50,
+    5: 0.00, 6: 0.00, 7: 0.00, 8: 0.00,
+    9: 0.30, 10: 0.65, 11: 0.85, 12: 1.00
+}
+# Base para cálculo de déficit de 2dos regantes (según enunciado: 53 m3/s)
+SECOND_REGANTES_BASE = 53.0
+
+# Big-M y conversión
+M = 6000                        # Big-M
+EPS = 1e-3                      # epsilon para desambiguar límites
+Conv = (86400 * 30) / 1e6       # m^3/s x mes -> Hm3
+
+# Volúmenes embalse (Hm3) - Basado en ANEXO N°1
+V_0 = 1400.0  # Volumen inicial por defecto
+V_min = 0.0     # Volumen mínimo
+V_max = 5582.0  # Volumen máximo
+
+# --- Colchones según configuración definitiva operacional ---
+# Riego puede ser valor fijo en Hm³ o porcentaje, Generación y Lago en %
+COLCHONES = {
+    # R=600 Hm³, G=5%, L=0%
+    "Inferior": {"lo": 0.0, "hi": 1200.0, "shares": (600.0, 0.05, 0.0)},
+    # R=40%, G=5%, L=55%
+    "Transicion": {"lo": 1200.0, "hi": 1370.0, "shares": (0.40, 0.05, 0.55)},
+    # R=40%, G=40%, L=20%
+    "Intermedio": {"lo": 1370.0, "hi": 1900.0, "shares": (0.40, 0.40, 0.20)},
+    # R=25%, G=1200 Hm³, L=10%
+    "Superior":   {"lo": 1900.0, "hi": 5582.0, "shares": (0.25, 1200.0, 0.10)},
+}
+C_LABELS = list(COLCHONES.keys())
+
+# Configuración de filtraciones del embalse El Toro
+FILTR_ARC: Tuple[str, str] = ("Embalse", "control_FiltracionesLaja")
+
+# Importar segmentos PWL desde módulo especializado
+PWL_SEGMENTS = get_pwl_segments()
 
 
-def build_caso_base_model(year: int, V_prev_by_t: Dict[int, float], A_local: Dict[Tuple[str, int], float]):
-    """Construye un modelo LP para el año indicado.
+# =============================
+# MODELO
+# =============================
+def build_model_for_one_year(
+    target_year: int,
+    V0: Optional[float] = None,
+    I_arc_override: Optional[dict] = None,
+) -> gp.Model:
+    """
+    Construye el modelo de optimización del Embalse para un año específico.
 
     Args:
-        year: año (para referencia)
-        V_prev_by_t: dict t->V_{t-1} en Hm3. Para t=1 se espera V_prev_by_t[1]=V0.
-        A_local: dict (label, t) -> aporte m3/s. Debe contener al menos 'Abanico' y
-                 los aportes intermedios para Tucapel (Antuco, Abanico, Rucue, Quilleco).
+        target_year: Año objetivo para la optimización
+        V0: Volumen inicial opcional (Hm3). Si None, usa V_0 por defecto
+        I_arc_override: Diccionario opcional para sobreescribir inyecciones
+
     Returns:
-        Modelo Gurobi (no optimizado todavía)
+        gp.Model: Modelo de Gurobi configurado y listo para optimizar
     """
-    m = gp.Model(f"caso_base_{year}")
-    m.setParam('OutputFlag', 0)
 
-    # Variables: r_TU_t, d_AB_t, d_TU_t
-    r_TU = m.addVars(T, lb=0.0, name="r_TU")
-    d_AB = m.addVars(T, lb=0.0, name="d_AB")
-    d_TU = m.addVars(T, lb=0.0, name="d_TU")
+    # 1) Datos iniciales
+    eta, cap_max, _ = load_caudalmax(CAUDALMAX_CSV)
+    # permitir sobreescribir inyecciones (útil para Monte Carlo)
+    if I_arc_override is None:
+        I_arc = load_injections_for_year(INJ_CSV, target_year)
+    else:
+        I_arc = I_arc_override
+    V0_eff = V_0 if V0 is None else V0
 
-    # Filtraciones dadas por V_prev_by_t: Filtr_t = f(V_{t-1})
-    Filtr = {t: filtraciones_from_volumen(V_prev_by_t.get(t, V_prev_by_t.get(1, 1200.0))) for t in T}
+    # Helpers de balance
+    def sum_in(n: str, t: int):
+        return gp.quicksum(y[i, n, t] for i in IN[n]) \
+             + gp.quicksum(x[i, n, t] for i in IN[n] if (i, n) in A_generacion)
 
-    # Objetivo: minimizar suma de déficits
-    m.setObjective(gp.quicksum(d_AB[t] + d_TU[t] for t in T), GRB.MINIMIZE)
+    def sum_out(n: str, t: int):
+        return gp.quicksum(y[n, j, t] for j in OUT[n]) \
+             + gp.quicksum(
+                 x[n, j, t] for j in OUT[n] if (n, j) in A_generacion
+             )
+    A_ext = {(n, t): 0.0 for n in NODES for t in T}
+    for (i, j) in A_inyeccion:
+        for t in T:
+            A_ext[(i, t)] = (
+                I_arc[(i, j, t)]
+            )  # fuente externa en el nodo i = afluente_*
 
-    # Restricciones CB1: Filtr_t + A_Abanico_t + d_AB_t >= 47
+    # Aportes naturales para déficit (labels de inyección)
+    inj_label = {
+        (i, j): i.replace("afluente_", "").lower()
+        for (i, j) in A_inyeccion
+    }
+    excluir_lbls_tucapel = {"laja_i", "abanico", "eltoro"}
+
+    def A_ab_t(t: int) -> float:
+        # afluente hacia Abanico (arco afluente_Abanico -> control_Abanico)
+        # CORRECCIÓN: Convertir a Hm³/mes para consistencia de unidades
+        for (i, j) in A_inyeccion:
+            if inj_label[(i, j)] == "abanico":
+                return I_arc[(i, j, t)] * Conv  # Hm³/mes
+        return 0.0
+
+    def A_nat_tu_t(t: int) -> float:
+        # suma de afluentes "naturales" salvo {laja_i, abanico, eltoro}
+        # CORRECCIÓN: Convertir a Hm³/mes para consistencia de unidades
+        return sum(I_arc[(i, j, t)] * Conv for (i, j) in A_inyeccion
+                   if inj_label[(i, j)] not in excluir_lbls_tucapel)  # Hm³/mes
+
+    # 2) Modelo
+    m = gp.Model(f"embalse_laja_{target_year}")
+
+    # 3) Variables
+    y = m.addVars(ARCS, T, lb=0.0, name="y")
+    x = m.addVars(A_generacion, T, lb=0.0, name="x")
+    V = m.addVars(T, lb=V_min, ub=V_max, name="V")
+    Filtr = m.addVars(T, lb=0.0, name="Filtr")
+    G = m.addVars(T, lb=0.0, name="G")
+
+    # Déficits y binarias (primeros regantes)
+    DefAb = m.addVars(T, lb=0.0, name="DeficitAbanico")
+    DefTu = m.addVars(T, lb=0.0, name="DeficitTucapel")
+    dAb = m.addVars(T, vtype=GRB.BINARY, name="deltaAb")
+    dTu = m.addVars(T, vtype=GRB.BINARY, name="deltaTu")
+
+    # Excedente de primeros regantes y su binaria
+    # Exc1_t = max{0, (Filtr_t + A_naturales_t) - 90*factor1_t}
+    Exc1 = m.addVars(T, lb=0.0, name="ExcedentePrimeros")
+    dExc1 = m.addVars(T, vtype=GRB.BINARY, name="deltaExc1")
+
+    # Déficit y binaria para los segundos regantes
+    # Def2_t = max{0, SECOND_REGANTES_BASE*factor2_t - Excedente_1os}
+    Def2 = m.addVars(T, lb=0.0, name="Deficit2dosRegantes")
+    d2 = m.addVars(T, vtype=GRB.BINARY, name="delta2")
+
+    # "Pseudo-variable" para V0 y selección de colchón z[c]
+    Vinit = m.addVar(lb=0.0, name="Vinit")
+    m.addConstr(Vinit == V0_eff, name="link_Vinit")
+
+    z = m.addVars(C_LABELS, vtype=GRB.BINARY, name="z")
+    m.addConstr(gp.quicksum(z[c] for c in C_LABELS) == 1, name="C_sum_z")
+
+    # Selección por rangos con Big-M: lo_c + EPS <= Vinit <= hi_c si z[c]=1
+    for c in C_LABELS:
+        lo = COLCHONES[c]["lo"]
+        hi = COLCHONES[c]["hi"]
+        eps_lo = EPS if c != "Inferior" else 0.0   # no excluye 0 del inferior
+        m.addConstr(Vinit >= (lo + eps_lo) - M * (1 - z[c]), name=f"C_{c}_lo")
+        m.addConstr(Vinit <= hi + M * (1 - z[c]), name=f"C_{c}_hi")
+
+    # 4) Restricciones
+
+    # (R0) Inyección fija en A_inyeccion: y = I_arc
+    for (i, j) in A_inyeccion:
+        for t in T:
+            m.addConstr(
+                y[i, j, t] == I_arc[(i, j, t)],
+                name=f"R0_inj_{i}_{j}_{t}"
+            )
+    # (R1) Balance hídrico del embalse
+    for i, t in enumerate(T):
+        if i == 0:  # Primer mes del período hidrológico (Diciembre)
+            m.addConstr(
+                V[t] == Vinit
+                + (sum_in("Embalse", t) - sum_out("Embalse", t)) * Conv,
+                name=f"R1_bal_emb_{t}"
+            )
+        else:
+            prev_t = T[i-1]  # Mes anterior en secuencia hidrológica
+            m.addConstr(
+                V[t] == V[prev_t]
+                + (sum_in("Embalse", t) - sum_out("Embalse", t)) * Conv,
+                name=f"R1_bal_emb_{t}"
+            )
+
+    # (R2) Conservación de flujo en nodos (excepto sumideros/almacenamiento)
+    SKIP_BALANCE = {"Embalse", "NodoMar", "SaltosLaja"}
+    for n in NODES:
+        if n in SKIP_BALANCE:
+            continue
+        for t in T:
+            m.addConstr(
+                sum_in(n, t) + A_ext[(n, t)] == sum_out(n, t),
+                name=f"R2_bal_nodo_{n}_{t}"
+            )
+
+    """# (R3) Capacidad máxima para arcos de generación
+    for (i, j) in A_generacion:
+        for t in T:
+            m.addConstr(y[i, j, t] == 0.0, name=f"R3_y0_gen_{i}_{j}_{t}")
+            cap = cap_max.get((i, j))
+            if cap is not None:
+                m.addConstr(x[i, j, t] <= cap, name=f"R3_cap_{i}_{j}_{t}")"""
+ 
+    # (R5) Filtraciones: PWL manual con variables binarias (MILP puro)
+    f_i, f_j = FILTR_ARC
+
+    # PWL simplificado: usar aproximación lineal directa por segmentos
+    seg_labels = list(PWL_SEGMENTS.keys())
+    delta = m.addVars(seg_labels, T, vtype=GRB.BINARY, name="delta_pwl")
+
     for t in T:
-        a_ab = A_local.get(("Abanico", t), 0.0)
-        m.addConstr(Filtr[t] + a_ab + d_AB[t] >= ABANICO_MIN, name=f"CB1_abanico_{t}")
+        # Igualar arco de filtración con variable
+        m.addConstr(y[f_i, f_j, t] == Filtr[t], name=f"R5a_filtr_arc_{t}")
 
-    # Restricciones CB2: Phi_t + r_TU_t + d_TU_t >= 90
-    # Phi_t = Filtr_t + A_Antuco + A_Abanico + A_Rucue + A_Quilleco
+        # Exactamente un segmento debe estar activo
+        m.addConstr(gp.quicksum(delta[k, t] for k in seg_labels) == 1,
+                    name=f"R5b_one_segment_{t}")
+
+        # Volumen anterior (para primer mes es Vinit,
+        # para otros es mes anterior en secuencia)
+        t_index = T.index(t)
+        if t_index == 0:
+            V_prev = Vinit
+        else:
+            prev_t = T[t_index-1]
+            V_prev = V[prev_t]
+
+        # Restricciones de volumen por segmento activo
+        for k in seg_labels:
+            seg = PWL_SEGMENTS[k]
+            # Si segmento k activo, volumen debe estar en su rango
+            m.addConstr(V_prev >= seg["v_min"] * delta[k, t],
+                        name=f"R5c_vol_min_{k}_{t}")
+            m.addConstr(V_prev <= seg["v_max"] * delta[k, t] +
+                        V_max * (1 - delta[k, t]),
+                        name=f"R5d_vol_max_{k}_{t}")
+
+        # PWL función: usar funciones originales evaluadas en puntos medios
+        # CORRECCIÓN: Convertir filtraciones a Hm³/mes para consistencia
+        filtr_values = {}
+        for k in seg_labels:
+            seg = PWL_SEGMENTS[k]
+            v_mid = (seg["v_min"] + seg["v_max"]) / 2
+            filtr_values[k] = filtraciones_from_volumen(v_mid) * Conv
+
+        # Función PWL: Filtr = suma de valores por segmento activo
+        filtr_expr = gp.quicksum(
+            filtr_values[k] * delta[k, t]
+            for k in seg_labels
+        )
+        m.addConstr(Filtr[t] == filtr_expr, name=f"R5e_pwl_function_{t}")
+
+    # (R6) Déficits (MILP) linealizadas y cobertura por El Toro
+    # Se calculan dos tipos de déficits independientes:
+    # 1) Déficits de primeros regantes (90 m³/s en Tucapel, 47 m³/s en Abanico)
+    # 2) Déficits de segundos regantes (53 m³/s, basado en excedente de 1os)
     for t in T:
-        phi = Filtr[t]
-        for lab in ("Antuco", "Abanico", "Rucue", "Quilleco"):
-            phi += A_local.get((lab, t), 0.0)
+        # Factores estacionales para el mes t
+        first_factor = FIRST_REGANTES_FACTOR.get(t, 1.0)
 
-        # Además imponemos la capacidad física del canal como un upper bound en r_TU
-        m.addConstr(r_TU[t] <= CAP_TUCAPEL, name=f"cap_rTU_{t}")
-        m.addConstr(phi + r_TU[t] + d_TU[t] >= TUCAPEL_MIN, name=f"CB2_tucapel_{t}")
+        # PRIMEROS REGANTES
+        # Abanico: DefAb_t = max{0, 47*factor1_t - Filtr_t - A_abanico_t}
+        # Convertir demandas a Hm³/mes para consistencia de unidades
+        demanda_abanico = ABANICO_MIN * first_factor * Conv  # Hm³/mes
+        expr_ab = demanda_abanico - Filtr[t] - A_ab_t(t)
+        m.addConstr(DefAb[t] >= expr_ab - M * (1 - dAb[t]), name=f"DAb_lb_{t}")
+        m.addConstr(
+            DefAb[t] <= expr_ab + M * (1 - dAb[t]), name=f"DAb_ub1_{t}"
+            )
+        m.addConstr(DefAb[t] <= M * dAb[t], name=f"DAb_ub2_{t}")
 
-    # Adjuntar metadatos para postprocesamiento
+        # Tucapel: DefTu_t = max{0, 90*factor1_t - Filtr_t - A_naturales_t}
+        # Convertir demandas a Hm³/mes para consistencia de unidades
+        demanda_tucapel = TUCAPEL_MIN * first_factor * Conv  # Hm³/mes
+        expr_tu = demanda_tucapel - Filtr[t] - A_nat_tu_t(t)
+        m.addConstr(DefTu[t] >= expr_tu - M * (1 - dTu[t]), name=f"DTu_lb_{t}")
+        m.addConstr(
+            DefTu[t] <= expr_tu + M * (1 - dTu[t]), name=f"DTu_ub1_{t}"
+            )
+        m.addConstr(DefTu[t] <= M * dTu[t], name=f"DTu_ub2_{t}")
+
+        # SEGUNDOS REGANTES (medido en Tucapel):
+        # Paso 1: Calcular excedente de primeros regantes
+        # Exc1_t = max{0, (Filtr_t + A_naturales_t) - 90*factor1_t}
+        caudal_disponible_1os = Filtr[t] + A_nat_tu_t(t)
+        expr_exc1 = caudal_disponible_1os - demanda_tucapel
+
+        # Linearización del excedente con variable binaria dExc1[t]
+        m.addConstr(Exc1[t] >= expr_exc1 - M * (1 - dExc1[t]),
+                    name=f"Exc1_lb_{t}")
+        m.addConstr(Exc1[t] <= expr_exc1 + M * (1 - dExc1[t]),
+                    name=f"Exc1_ub1_{t}")
+        m.addConstr(Exc1[t] <= M * dExc1[t], name=f"Exc1_ub2_{t}")
+
+        # Cobertura desde Embalse via El Toro (suma de déficits)
+        # Q_extraccion_El_Toro >= Q_deficit_1os 
+        m.addConstr(
+            x["Embalse", "ElToro", t] >= DefAb[t] + DefTu[t],
+            name=f"D_cover_by_ElToro_{t}"
+        )
+
+    # 5) FO: Minimizar suma de déficits en Abanico y Tucapel (diagnóstico de meses críticos)
+    m.setObjective(gp.quicksum(DefAb[t] + DefTu[t] for t in T), GRB.MINIMIZE)
+
+    # Adjuntar variables y metadatos al modelo para postprocesamiento
+    m._y = y
+    m._x = x
+    m._V = V
     m._Filtr = Filtr
-    m._A_local = A_local
-    m._r_TU = r_TU
-    m._d_AB = d_AB
-    m._d_TU = d_TU
+    m._G = G
+    m._meta = {
+        "eta": eta,
+        "Conv": Conv,
+        "A_generacion": A_generacion,
+        "ARCS": ARCS
+    }
 
     return m
 
 
-def run_caso_base_for_year(year: int, V0: float = 1400.0):
-    """Carga datos del CSV y corre el caso base para `year`.
-
-    Estrategia: usar `load_injections_for_year` para obtener I_arc y mapear a
-    aportes locales por etiqueta (Antuco, Abanico, Rucue, Quilleco,...).
-    Para V_{t-1} se usa una aproximación simple: todo V_prev = V0 (constante)
-    o se puede pasar un dict con variación mensual.
-    """
-    # Cargar inyecciones mensuales (I_arc[(i,j,t)])
-    I_arc = load_injections_for_year("data/Caudales_historicos_filtrado.csv", year)
-
-    # Mapear aportes locales por etiqueta (usando las claves de embalse CENTRAL_TO_INJ_ARC
-    # definidas en data_loader). Aquí esperamos los nombres sin prefijo 'afluente_'
-    # Ej: A_local[("Abanico", t)] = caudal m3/s que llega a control_Abanico desde afluente_Abanico
-    A_local = {}
-    for (i, j) in A_inyeccion:
-        # etiqueta del nodo receptor: por ejemplo control_Abanico -> Abanico
-        # si j empieza con 'control_' removemos prefijo
-        label = j.replace("control_", "")
-        for t in T:
-            A_local.setdefault((label, t), 0.0)
-            A_local[(label, t)] += I_arc.get((i, j, t), 0.0)
-
-    # Construir V_prev_by_t como constante V0 para todos t (simple)
-    V_prev_by_t = {t: V0 for t in T}
-
-    m = build_caso_base_model(year, V_prev_by_t, A_local)
-    m.optimize()
-
-    status = m.Status
-    obj = m.ObjVal if status == GRB.OPTIMAL else None
-
-    print(f"Año {year}: Status={status}, Obj(sum deficits)={obj}")
-
-    # Propagación simple de volumen mes a mes (balance hidrológico simplificado)
-    # V_prev = V0 (Hm3). Inflow hacia Embalse proviene de 'AltoPolc' en A_local.
-    V_prev = V0
-    V_posts = []
-    cotas = []
-    Filtr_prop = {}
-    for t in T:
-        filtr_t = filtraciones_from_volumen(V_prev)
-        Filtr_prop[t] = filtr_t
-        inflow_emb = A_local.get(("AltoPolc", t), 0.0)
-        V_new = V_prev + (inflow_emb - filtr_t) * Conv
-        V_posts.append(V_new)
-        cotas.append(cota_from_volumen(V_new))
-        V_prev = V_new
-
-    # Guardar resultados en CSV
-    os.makedirs("results", exist_ok=True)
-    csv_path = os.path.join("results", f"caso_base_{year}.csv")
-    with open(csv_path, "w", newline="") as f:
-        writer = csv.writer(f)
-        header = ["mes", "Filtr_m3s", "A_Abanico_m3s", "A_Antuco_m3s", "A_Rucue_m3s", "A_Quilleco_m3s", "r_TU_m3s", "d_AB_m3s", "d_TU_m3s", "V_Hm3", "cota_m"]
-        writer.writerow(header)
-        for t in T:
-            row = [t]
-            # usar filtraciones propagadas (dependen de V_{t-1})
-            filtr = Filtr_prop.get(t, m._Filtr.get(t, 0.0))
-            row.append(f"{filtr:.6f}")
-            for lab in ("Abanico", "Antuco", "Rucue", "Quilleco"):
-                row.append(f"{m._A_local.get((lab, t), 0.0):.6f}")
-            # variables
-            r_val = m._r_TU[t].x if m._r_TU[t] is not None else 0.0
-            d_ab_val = m._d_AB[t].x if m._d_AB[t] is not None else 0.0
-            d_tu_val = m._d_TU[t].x if m._d_TU[t] is not None else 0.0
-            row += [f"{r_val:.6f}", f"{d_ab_val:.6f}", f"{d_tu_val:.6f}"]
-            # volumen y cota post-mes
-            v_post = V_posts[t-1]
-            cota = cotas[t-1]
-            row += [f"{v_post:.6f}", f"{cota:.6f}"]
-            writer.writerow(row)
-
-    print(f"Guardado: {csv_path}")
-    # Graficar cota vs mes usando la serie propagada (post-mes)
-    try:
-        png_path = os.path.join("results", f"cota_caso_base_{year}.png")
-        plt.figure(figsize=(8, 3))
-        plt.plot(T, cotas, marker='o')
-        plt.xticks(T)
-        plt.xlabel("Mes")
-        plt.ylabel("Cota (m)")
-        plt.title(f"Cota mensual (caso base, propagada) - año {year}")
-        plt.grid(True)
-        plt.tight_layout()
-        plt.savefig(png_path, dpi=150)
-        plt.close()
-        print(f"Guardado gráfico cota: {png_path}")
-    except Exception as e:
-        print(f"⚠️ Error generando gráfico de cota: {e}")
-
-    # RESUMEN DETERMINÍSTICO (si la solución es factible u óptima)
-    # Objetivo del caso base es minimizar suma de déficits (unidad: m3/s)
-    deficits_monthly = [ (m._d_AB[t].x if m._d_AB[t] is not None else 0.0) +
-                         (m._d_TU[t].x if m._d_TU[t] is not None else 0.0)
-                         for t in T ]
-    total_deficit = sum(deficits_monthly)
-    avg_deficit_monthly = total_deficit / len(T) if len(T) > 0 else 0.0
-
-    # Imprimir bloque formateado similar al ejemplo solicitado
-    print("\n📋 RESUMEN DETERMINÍSTICO")
-    print("=" * 80)
-    print(f"🎯 Años procesados: 1")
-    # Gurobi no define GRB.FEASIBLE; considerar solución factible si hay incumbente o status óptimo/subóptimo
-    feas_flag = 1 if (status in (GRB.OPTIMAL, getattr(GRB, 'SUBOPTIMAL', -1)) or getattr(m, 'SolCount', 0) > 0) else 0
-    print(f"✅ Soluciones factibles: {feas_flag}")
-    print(f"📉 Déficit total (suma mensual d_AB+d_TU): {total_deficit:.3f} m3/s")
-    print(f"📊 Déficit promedio mensual: {avg_deficit_monthly:.3f} m3/s\n")
-
-    # Estimación aproximada de generación (proxy)
-    try:
-        eta, cap_max, _ = load_caudalmax("data/CaudalMax_filtrado.csv")
-        if not eta:
-            print("⚠️ Aviso: mapa de rendimientos 'eta' vacío. Verifica 'data/CaudalMax_filtrado.csv'.")
-        total_energy = 0.0
-        # Usar solo arcos de generación para proxy y respetar cap_max si está disponible
-        from embalse import A_generacion
-        for t in T:
-            energy_t = 0.0
-            for (i, j) in A_generacion:
-                eta_val = eta.get((i, j), 0.0)
-                # flujo proxy: usar aporte local al nodo j si existe
-                flow_proxy = A_local.get((j, t), 0.0)
-                # aplicar cap_max si está definido
-                cap = None
-                try:
-                    cap = cap_max.get((i, j))
-                except Exception:
-                    cap = None
-                if cap is not None and cap > 0:
-                    flow_used = min(flow_proxy, cap)
-                else:
-                    flow_used = flow_proxy
-                energy_t += eta_val * flow_used
-            total_energy += energy_t
-
-        avg_energy_annual = total_energy
-        avg_energy_monthly = total_energy / len(T) if len(T) > 0 else 0.0
-
-        print("⚡ Estimación proxy de generación (arcos de generación, con cap_max)")
-        print(f"   - Energía total (proxy): {avg_energy_annual:,.1f} MWh")
-        print(f"   - Energía promedio mensual (proxy): {avg_energy_monthly:,.1f} MWh\n")
-        print("(Nota: proxy usando A_generacion y cap_max; no sustituye al cálculo del MILP)")
-    except Exception as e:
-        print(f"⚠️ No fue posible calcular estimación de generación: {e}")
-
-    return status, obj
-def run_montecarlo_caso_base(n_sims: int = 100, target_year: int = None,
-                             V0_mean: float = 1400.0, V0_std: float = 0.0,
-                             V0_min: float = 0.0, V0_max: float = 0.0,
-                             seed: int = 0):
-    """Ejecuta Monte Carlo por bootstrap mensual para el caso base.
-
-    - Muestrea las inyecciones mensuales por arco mediante bootstrap (elección aleatoria
-      dentro de la muestra histórica mensual por (i,j,t)).
-    - Muestrea V0: si V0_std>0 usa normal truncada (>=0), si V0_min/V0_max definidos usa uniforme.
-
-    Retorna lista de tuplas (sim_id, status, obj_val, V0_sample)
-    """
-    rng = np.random.default_rng(seed)
-
-    # Leer todo el CSV histórico y construir pools mensuales por (i,j,t)
-    df = pd.read_csv("data/Caudales_historicos_filtrado.csv")
-    # normalizar nombres y columnas (compatibilidad con data_loader)
-    df = df.rename(columns={"central": "central", "fecha (mm-aaaa)": "fecha", "caudal (m^3/s)": "caudal_m3s"})
-
-    # importar utilidades
-    from data_loader import _norm_central_for_inj, _parse_mm_yyyy, CENTRAL_TO_INJ_ARC
-
-    months_pool = {}
-    for row in df.itertuples(index=False):
-        try:
-            month, year = _parse_mm_yyyy(row.fecha)
-        except Exception:
-            continue
-        cent_key = _norm_central_for_inj(row.central)
-        if cent_key not in CENTRAL_TO_INJ_ARC:
-            continue
-        i, j = CENTRAL_TO_INJ_ARC[cent_key]
-        # pool keyed by (i,j,month)
-        months_pool.setdefault((i, j, month), []).append(float(row.caudal_m3s))
-
-    # asegurar pools mínimos
-    for (i, j) in A_inyeccion:
-        for t in T:
-            months_pool.setdefault((i, j, t), [0.0])
-
-    # precargar eta para proxy de generación
-    try:
-        eta_map, _, _ = load_caudalmax("data/CaudalMax_filtrado.csv")
-    except Exception:
-        eta_map = {}
-
-    results = []
-    for s in range(n_sims):
-        # muestrear V0
-        if V0_min > 0.0 and V0_max > 0.0 and V0_max > V0_min:
-            v0_sample = float(rng.uniform(V0_min, V0_max))
-        elif V0_std > 0.0:
-            v0_sample = float(max(0.0, rng.normal(V0_mean, V0_std)))
-        else:
-            v0_sample = float(V0_mean)
-
-        # muestrear inyecciones mensuales
-        I_arc_sim = {}
-        for (i, j) in A_inyeccion:
-            for t in T:
-                pool = months_pool.get((i, j, t), [0.0])
-                I_arc_sim[(i, j, t)] = float(rng.choice(pool))
-
-        # mapear a A_local
-        A_local = {}
-        for (i, j) in A_inyeccion:
-            label = j.replace("control_", "")
-            for t in T:
-                A_local.setdefault((label, t), 0.0)
-                A_local[(label, t)] += I_arc_sim.get((i, j, t), 0.0)
-
-        V_prev_by_t = {t: v0_sample for t in T}
-        m = build_caso_base_model(target_year if target_year is not None else 2000, V_prev_by_t, A_local)
-        m.optimize()
-        status = m.Status
-        obj = m.ObjVal if status == GRB.OPTIMAL else None
-        # Estimación proxy de generación para esta simulación
-        total_energy_sim = 0.0
-        for t in T:
-            energy_t = 0.0
-            for (i_j), eta_val in eta_map.items():
-                if isinstance(i_j, tuple) and len(i_j) == 2:
-                    i_arc, j_arc = i_j
-                else:
-                    continue
-                flow_proxy = A_local.get((j_arc, t), 0.0)
-                energy_t += eta_val * flow_proxy
-            total_energy_sim += energy_t
-
-        results.append((s, int(status), obj, v0_sample, total_energy_sim))
-
-    return results
-
-
-def check_years_coverage(path_csv: str = "data/Caudales_historicos_filtrado.csv", top_n: int = 10):
-    """Analiza la cobertura de datos por año en el CSV de inyecciones.
-    Imprime por año el total de filas y cuántas de ellas tienen caudal != 0.
-    """
-    df = pd.read_csv(path_csv)
-    colmap = {"fecha (mm-aaaa)": "fecha", "caudal (m^3/s)": "caudal"}
-    df = df.rename(columns=colmap)
-
-    def _parse(s):
-        try:
-            mm, yy = s.split("-")
-            return int(yy)
-        except Exception:
-            return None
-
-    df['year'] = df['fecha'].map(_parse)
-    years = sorted(df['year'].dropna().unique())
-    summary = []
-    for y in years:
-        d = df[df['year'] == y]
-        total = len(d)
-        nonzero = int((d['caudal'].fillna(0) != 0).sum())
-        summary.append((y, total, nonzero))
-
-    summary_sorted = sorted(summary, key=lambda x: (-x[2], -x[1], x[0]))
-    print("\n📊 Cobertura de datos por año (top por meses no nulos):")
-    print("year | total_rows | nonzero_rows")
-    for row in summary_sorted[:top_n]:
-        print(f"{row[0]:4d} | {row[1]:10d} | {row[2]:12d}")
-    return summary_sorted
-
-
-def run_caso_base_silent(year: int, V0: float = 1400.0):
-    """Versión silenciosa de run_caso_base_for_year que no escribe archivos.
-    Retorna (status, obj, deficits_total)
-    """
-    # Cargar inyecciones
-    I_arc = load_injections_for_year("data/Caudales_historicos_filtrado.csv", year)
-    A_local = {}
-    for (i, j) in A_inyeccion:
-        label = j.replace("control_", "")
-        for t in T:
-            A_local.setdefault((label, t), 0.0)
-            A_local[(label, t)] += I_arc.get((i, j, t), 0.0)
-
-    V_prev_by_t = {t: V0 for t in T}
-    m = build_caso_base_model(year, V_prev_by_t, A_local)
-    m.optimize()
-    status = m.Status
-    obj = m.ObjVal if status == GRB.OPTIMAL else None
-    deficits_monthly = [ (m._d_AB[t].x if m._d_AB[t] is not None else 0.0) + (m._d_TU[t].x if m._d_TU[t] is not None else 0.0) for t in T ]
-    total_deficit = sum(deficits_monthly)
-    return status, obj, total_deficit
-
-
-def scan_full_coverage_years(min_nonzero: int = 84, V0: float = 1400.0, top_k: int = 5):
-    """Escanea años con cobertura completa (nonzero_rows >= min_nonzero) y retorna top_k por menor déficit.
-    Retorna lista de tuples (year, status, obj, total_deficit)
-    """
-    summary = check_years_coverage()
-    full_years = [y for (y, total, nonzero) in summary if nonzero >= min_nonzero]
-    results = []
-    for y in full_years:
-        status, obj, total_def = run_caso_base_silent(y, V0=V0)
-        results.append((y, status, obj, total_def))
-
-    results_sorted = sorted(results, key=lambda x: (x[3], x[2] if x[2] is not None else float('inf')))
-    return results_sorted[:top_k]
-
-
+# =============================
+# INTERFAZ PRINCIPAL SENCILLA
+# =============================
 if __name__ == "__main__":
-    # Ejecuta caso base desde CLI, permitiendo variar año y V0 manualmente
-    import argparse
+    """
+    Interfaz sencilla para ejecutar el modelo determinístico.
+    Uso: python src/model.py
+    """
+    import sys
 
-    parser = argparse.ArgumentParser(description="Caso base: diagnosticar déficits en Abanico/Tucapel")
-    parser.add_argument("--year", type=int, help="Año a evaluar (por ejemplo 2000). Requerido si no usa --scan-full-years ni --export-best-year ni --mc")
-    parser.add_argument("--V0", type=float, default=1400.0, help="Volumen inicial V0 en Hm3 (por defecto 1400.0)")
-    parser.add_argument("--check-years", action='store_true', help="Analiza la cobertura de datos por año y muestra los top años")
-    parser.add_argument("--scan-full-years", action='store_true', help="Escanea años con cobertura completa y devuelve top-5 por menor déficit")
-    parser.add_argument("--export-best-year", action='store_true', help="Escanea años con cobertura completa y ejecuta caso base (CSV+PNG) para el mejor año")
-    parser.add_argument("--mc", type=int, default=0, help="Número de simulaciones Monte Carlo (bootstrap mensual). Si 0, corre una sola vez.")
-    parser.add_argument("--mc-v0-std", type=float, default=0.0, help="Desvío estándar para muestrear V0 (si >0 usa normal truncada alrededor de --V0)")
-    parser.add_argument("--mc-v0-min", type=float, default=0.0, help="Valor mínimo para muestreo uniforme de V0 (si >0 activa muestreo uniforme entre min/max)")
-    parser.add_argument("--mc-v0-max", type=float, default=0.0, help="Valor máximo para muestreo uniforme de V0 (si >0 activa muestreo uniforme entre min/max)")
-    parser.add_argument("--seed", type=int, default=0, help="Seed aleatoria para reproducibilidad")
-    args = parser.parse_args()
+    def print_simple_menu():
+        print("=" * 60)
+        print("  🌊 MODELO EMBALSE DEL LAJA - Ejecución Directa")
+        print("=" * 60)
+        min_year, max_year = min(YEARS_HORIZON), max(YEARS_HORIZON)
+        print(f"📊 Datos disponibles: {min_year} - {max_year}")
+        print("📅 Período hidrológico: Diciembre → Noviembre")
+        print("    (fin temporada 30-Nov)")
+        print("\n🎯 Opciones:")
+        print("1️⃣  Año/Rango específico (ej: '1985' o '1980-1990')")
+        print("2️⃣  Todos los años disponibles (1960-2023)")
+        print("0️⃣  Salir")
+        print("-" * 64)
 
-    if getattr(args, 'check_years', False):
-        check_years_coverage()
-        exit(0)
+    def get_input(prompt, default=None, input_type=str):
+        while True:
+            try:
+                if default is not None:
+                    value = input(f"{prompt} [{default}]: ").strip()
+                    if not value:
+                        return default
+                else:
+                    value = input(f"{prompt}: ").strip()
 
-    if getattr(args, 'scan_full_years', False):
-        print("\n🔎 Escaneando años con cobertura completa (nonzero_rows >= 84)...")
-        best = scan_full_coverage_years(min_nonzero=84, V0=args.V0, top_k=1)
-        if not best:
-            print("No se encontraron años con cobertura completa.")
-            exit(1)
+                if input_type == int:
+                    return int(value)
+                elif input_type == float:
+                    return float(value)
+                return value
+            except (ValueError, KeyboardInterrupt):
+                if input_type == int:
+                    print("❌ Ingresa un número entero válido")
+                elif input_type == float:
+                    print("❌ Ingresa un número decimal válido")
+                else:
+                    print("❌ Entrada inválida")
 
-        # Tomar sólo el mejor año (top-1)
-        y, status, obj, total_def = best[0]
-        print(f"\nMejor año por menor déficit total: {y} | status: {status} | obj: {'' if obj is None else f'{obj:.6f}'} | total_deficit_m3s: {total_def:.6f}")
+    def parse_years_input(years_str):
+        """
+        Parsea entrada de años: '1985' o '1980-1990'
+        Retorna lista de años válidos
+        """
+        min_year, max_year = min(YEARS_HORIZON), max(YEARS_HORIZON)
 
-        # Ejecutar caso_base completo para el mejor año y guardar solo sus archivos (CSV + PNG)
-        print(f"\nEjecutando caso_base completo para el mejor año: {y} (guardando un único CSV y PNG)")
-        run_caso_base_for_year(y, V0=args.V0)
-        # Renombrar los archivos generados para dejar claro que son del mejor año
-        os.makedirs("results", exist_ok=True)
-        src_csv = os.path.join("results", f"caso_base_{y}.csv")
-        src_png = os.path.join("results", f"cota_caso_base_{y}.png")
-        dst_csv = os.path.join("results", f"best_caso_base_{y}.csv")
-        dst_png = os.path.join("results", f"best_cota_caso_base_{y}.png")
         try:
-            if os.path.exists(src_csv):
-                os.replace(src_csv, dst_csv)
-            if os.path.exists(src_png):
-                os.replace(src_png, dst_png)
-            print(f"Guardado único CSV: {dst_csv}")
-            print(f"Guardado único PNG: {dst_png}")
+            if '-' in years_str:
+                # Formato de rango: "1980-1990"
+                parts = years_str.split('-')
+                if len(parts) != 2:
+                    raise ValueError("Formato de rango inválido")
+
+                start_year = int(parts[0].strip())
+                end_year = int(parts[1].strip())
+
+                if start_year > end_year:
+                    start_year, end_year = end_year, start_year  # Intercambiar
+
+                # Validar rango
+                if start_year < min_year or end_year > max_year:
+                    raise ValueError(f"Rango fuera de límites "
+                                     f"({min_year}-{max_year})")
+
+                return list(range(start_year, end_year + 1))
+            else:
+                # Año único: "1985"
+                year = int(years_str.strip())
+                if year < min_year or year > max_year:
+                    raise ValueError(f"Año fuera de rango "
+                                     f"({min_year}-{max_year})")
+                return [year]
+
+        except ValueError as e:
+            if "invalid literal" in str(e):
+                raise ValueError("Formato inválido. Use '1985' o '1980-1990'")
+            raise e
+
+    def run_custom_range():
+        """Ejecuta el modelo para un año específico o rango de años."""
+        min_year, max_year = min(YEARS_HORIZON), max(YEARS_HORIZON)
+
+        print("\n📅 AÑO/RANGO ESPECÍFICO")
+        print(f"📊 Datos disponibles: {min_year}-{max_year}")
+        print("📅 Cada 'año' = período hidrológico Dic→Nov")
+        print("    (ej: 1985 = Dic'84 a Nov'85)")
+        print("💡 Ejemplos:")
+        print("   • Un año: '1985' (Dic'84 → Nov'85)")
+        print("   • Rango: '1980-1990' (11 períodos hidrológicos)")
+        print("   • Década: '1990-1999' (10 períodos hidrológicos)")
+
+        while True:
+            try:
+                years_input = get_input("Especifica año(s)")
+                years = parse_years_input(years_input)
+                break
+            except ValueError as e:
+                print(f"❌ {e}")
+                continue
+
+        V0 = get_input("💧 Volumen inicial V0 (Hm³)", default=1400.0,
+                       input_type=float)
+
+        years_count = len(years)
+        if years_count == 1:
+            print(f"\n🚀 Ejecutando modelo para el año {years[0]}...")
+        else:
+            print(f"\n🚀 Ejecutando modelo para {years_count} años "
+                  f"({years[0]}-{years[-1]})...")
+
+        print(f"💧 Volumen inicial: {V0:,.1f} Hm³")
+        print("=" * 60)
+
+        # Ejecutar simulación
+        results = []
+        current_V0 = V0
+        total_deficit = 0
+        total_toro_usage = 0  # Total de agua por el Toro
+
+        for i, year in enumerate(years):
+            print(f"\n📅 Procesando año {year} ({i+1}/{years_count})")
+            print(f"💧 V0: {current_V0:,.1f} Hm³")
+
+            try:
+                model = build_model_for_one_year(
+                    target_year=year,
+                    V0=current_V0
+                )
+                model.optimize()
+
+                if model.status == 2:  # Óptimo
+                    deficit = model.objVal
+                    V_vars = model._V
+                    final_month = max(T)  # Noviembre (mes 11)
+                    v_final = V_vars[final_month].x
+
+                    # Calcular uso del Toro (agua de déficit)
+                    x_vars = model._x
+                    toro_usage = sum(
+                        x_vars["Embalse", "ElToro", t].x
+                        for t in T
+                    ) * Conv  # Convertir a Hm³
+
+                    print(f"✅ Déficit total (FO): {deficit:,.3f} Hm³ | "
+                          f"V_final: {v_final:,.1f} Hm³ | "
+                          f"Uso Toro: {toro_usage:,.1f} Hm³")
+
+                    total_deficit += deficit
+                    total_toro_usage += toro_usage
+                    current_V0 = v_final  # Recursivo para siguiente año
+                    results.append({
+                        'year': year, 'deficit': deficit, 'v_final': v_final,
+                        'toro_usage': toro_usage, 'status': 'OK'
+                    })
+                else:
+                    print("❌ No factible - usando V0 de seguridad (1400 Hm³)")
+                    current_V0 = 1400.0  # Reset a volumen seguro
+                    results.append({
+                        'year': year, 'deficit': 0, 'v_final': None,
+                        'toro_usage': 0, 'status': 'FAIL'
+                    })
+
+                model.dispose()
+
+            except Exception as e:
+                print(f"❌ Error en año {year}: {e}")
+                results.append({
+                    'year': year, 'deficit': 0, 'v_final': None,
+                    'toro_usage': 0, 'status': 'ERROR'
+                })
+
+        # Resumen mejorado
+        print("\n" + "=" * 60)
+        print("📋 RESUMEN DETALLADO")
+        print("=" * 60)
+
+        successful = [r for r in results if r['status'] == 'OK']
+        success_rate = len(successful) / years_count * 100
+
+        print(f"🎯 Años procesados: {years_count}")
+        print(f"✅ Años exitosos: {len(successful)} ({success_rate:.1f}%)")
+        print(f"📉 Déficit total (suma FO): {total_deficit:,.3f} Hm³")
+        print(f"🌊 Uso total El Toro: {total_toro_usage:,.1f} Hm³")
+
+        if successful:
+            avg_deficit = total_deficit / len(successful)
+            avg_toro = total_toro_usage / len(successful)
+            print(f"📊 Déficit promedio (por año exitoso): {avg_deficit:,.3f} Hm³/año")
+            print(f"📊 Uso promedio El Toro: {avg_toro:,.1f} Hm³/año")
+
+            # Estadísticas adicionales
+            v_initial = V0
+            v_final_last = successful[-1]['v_final'] if successful else V0
+            volume_change = v_final_last - v_initial
+            change_sign = "📈" if volume_change >= 0 else "📉"
+
+            print("\n💧 BALANCE DE VOLUMEN:")
+            print(f"   Inicial: {v_initial:,.1f} Hm³")
+            print(f"   Final: {v_final_last:,.1f} Hm³")
+            print(f"   {change_sign} Cambio: {volume_change:+,.1f} Hm³")
+
+        # Tabla detallada si hay múltiples años
+        if years_count > 1:
+            print("\n📊 DETALLE POR AÑO:")
+            print("━" * 80)
+            print("Año   Estado  Déficit (Hm³)  V_final (Hm³)  Uso Toro (Hm³)")
+            print("━" * 80)
+
+            for r in results:
+                status_icon = "✅" if r['status'] == 'OK' else "❌"
+                if r['status'] == 'OK':
+                    print(
+                        f"{r['year']}   {status_icon}    {r.get('deficit', 0):>8,.3f}"
+                        f"{r['v_final']:>7,.1f}      {r['toro_usage']:>6,.1f}"
+                    )
+                else:
+                    print(
+                        f"{r['year']}   {status_icon}       ---          ---"
+                        "          ---"
+                    )
+            print("━" * 80)
+
+    def run_all_years():
+        """Ejecuta el modelo para todos los años disponibles."""
+        min_year, max_year = min(YEARS_HORIZON), max(YEARS_HORIZON)
+        total_years = max_year - min_year + 1
+
+        print("\n🚀 SIMULACIÓN COMPLETA")
+        print(f"📊 Período: {min_year}-{max_year} ({total_years} períodos)")
+        print("📅 Cada período: Diciembre → Noviembre (fin temporada 30-Nov)")
+
+        confirm_msg = f"¿Confirmas ejecutar {total_years} años? [s/N]"
+        confirm = get_input(confirm_msg, default="N")
+        if confirm.lower() not in ['s', 'sí', 'si', 'y', 'yes']:
+            print("❌ Operación cancelada")
+            return
+
+        V0 = get_input("💧 Volumen inicial V0 (Hm³)", default=1400.0,
+                       input_type=float)
+
+        print("\n🚀 Iniciando simulación completa...")
+        print("=" * 60)
+
+        results = []
+        current_V0 = V0
+        total_energy = 0
+        total_toro_usage = 0
+
+        for year in range(min_year, max_year + 1):
+            year_num = year - min_year + 1
+            print(f"\n📅 Año {year} ({year_num}/{total_years})")
+            print(f"💧 V0: {current_V0:,.1f} Hm³")
+
+            try:
+                model = build_model_for_one_year(
+                    target_year=year,
+                    V0=current_V0
+                )
+                model.optimize()
+
+                if model.status == 2:  # Óptimo
+                    energy = model.objVal
+                    V_vars = model._V
+                    final_month = max(T)  # Noviembre (mes 11)
+                    v_final = V_vars[final_month].x
+
+                    # Calcular uso del Toro
+                    x_vars = model._x
+                    toro_usage = sum(
+                        x_vars["Embalse", "ElToro", t].x
+                        for t in T
+                    ) * Conv
+
+                    print(f"✅ E: {energy:,.0f} MWh | "
+                          f"V_f: {v_final:,.0f} | "
+                          f"Toro: {toro_usage:,.1f} Hm³")
+
+                    total_energy += energy
+                    total_toro_usage += toro_usage
+                    current_V0 = v_final  # Recursivo
+                    results.append({
+                        'year': year, 'energy': energy, 'v_final': v_final,
+                        'toro_usage': toro_usage, 'status': 'OK'
+                    })
+                else:
+                    print("❌ No factible - reset a 1400 Hm³")
+                    current_V0 = 1400.0
+                    results.append({
+                        'year': year, 'energy': 0, 'v_final': None,
+                        'toro_usage': 0, 'status': 'FAIL'
+                    })
+
+                model.dispose()
+
+            except Exception as e:
+                print(f"❌ Error: {e}")
+                results.append({
+                    'year': year, 'energy': 0, 'v_final': None,
+                    'toro_usage': 0, 'status': 'ERROR'
+                })
+
+        # Resumen completo
+        print("\n" + "=" * 60)
+        print("📋 RESUMEN SIMULACIÓN COMPLETA (1960-2023)")
+        print("=" * 60)
+
+        successful = [r for r in results if r['status'] == 'OK']
+        success_rate = len(successful) / total_years * 100
+
+        print(f"🎯 Años procesados: {total_years}")
+        print(f"✅ Años exitosos: {len(successful)} ({success_rate:.1f}%)")
+        print(f"⚡ Energía total: {total_energy:,.1f} MWh")
+        print(f"🌊 Uso total El Toro: {total_toro_usage:,.1f} Hm³")
+
+        if successful:
+            avg_energy = total_energy / len(successful)
+            avg_toro = total_toro_usage / len(successful)
+            print(f"📊 Energía promedio: {avg_energy:,.1f} MWh/año")
+            print(f"📊 Uso promedio El Toro: {avg_toro:,.1f} Hm³/año")
+
+            # Balance volumétrico histórico
+            v_initial = V0
+            v_final_last = successful[-1]['v_final'] if successful else V0
+            volume_change = v_final_last - v_initial
+            change_sign = "📈" if volume_change >= 0 else "📉"
+
+            print("\n💧 BALANCE VOLUMÉTRICO HISTÓRICO:")
+            print(f"   Inicial (Dic'59): {v_initial:,.1f} Hm³")
+            print(f"   Final (Nov'23): {v_final_last:,.1f} Hm³")
+            print(f"   {change_sign} Cambio neto: {volume_change:+,.1f} Hm³")
+
+    # Bucle principal
+    while True:
+        try:
+            print_simple_menu()
+
+            choice = get_input("\nSelecciona una opción", input_type=int)
+
+            if choice == 0:
+                print("👋 ¡Hasta luego!")
+                break
+            elif choice == 1:
+                run_custom_range()
+            elif choice == 2:
+                run_all_years()
+            else:
+                print("❌ Opción inválida. Selecciona 0, 1 o 2.")
+
+            # Pausa antes de volver al menú
+            input("\n⏸️  Presiona Enter para continuar...")
+            print("\n")
+
+        except KeyboardInterrupt:
+            print("\n\n👋 Saliendo del programa...")
+            break
         except Exception as e:
-            print(f"⚠️ Error al renombrar/guardar archivos del mejor año: {e}")
+            print(f"❌ Error inesperado: {e}")
 
-        exit(0)
-
-    if getattr(args, 'export_best_year', False):
-        best = scan_full_coverage_years(min_nonzero=84, V0=args.V0, top_k=1)
-        if not best:
-            print("No se encontró año con cobertura completa.")
-            exit(1)
-        y, status, obj, total_def = best[0]
-        print(f"Ejecutando caso base completo para el mejor año: {y}")
-        run_caso_base_for_year(y, V0=args.V0)
-        exit(0)
-
-    if args.mc and args.mc > 0:
-        # correr Monte Carlo
-        target_year = args.year
-        if target_year is None:
-            print("--mc solicitado sin --year: buscando el mejor año con cobertura completa...")
-            best = scan_full_coverage_years(min_nonzero=84, V0=args.V0, top_k=1)
-            if not best:
-                print("No se encontró año con cobertura completa para usar en MC.")
-                exit(1)
-            target_year = best[0][0]
-            print(f"Usando año {target_year} para Monte Carlo (top-1)")
-
-        results_mc = run_montecarlo_caso_base(n_sims=args.mc, target_year=target_year,
-                                             V0_mean=args.V0, V0_std=args.mc_v0_std,
-                                             V0_min=args.mc_v0_min, V0_max=args.mc_v0_max,
-                                             seed=args.seed)
-        # Guardar resumen
-        os.makedirs("results", exist_ok=True)
-        out_csv = os.path.join("results", f"mc_caso_base_{target_year}.csv")
-        with open(out_csv, "w", newline="") as f:
-            writer = csv.writer(f)
-            writer.writerow(["sim", "status", "obj_sum_deficits", "V0_sample", "energy_proxy_MWh"])
-            for sim, status, obj, v0s, energy in results_mc:
-                writer.writerow([sim, status, "" if obj is None else f"{obj:.6f}", f"{v0s:.6f}", f"{energy:.6f}"])
-        print(f"Guardado resumen Monte Carlo: {out_csv}")
-
-        # Resumen agregado
-        opt_count = sum(1 for (_, st, _, _, _) in results_mc if st == GRB.OPTIMAL)
-        feasible_count = sum(1 for (_, st, _, _, _) in results_mc if st in (GRB.OPTIMAL, getattr(GRB, 'SUBOPTIMAL', -1)))
-        energies = [r[4] for r in results_mc]
-        objs = [r[2] for r in results_mc if r[2] is not None]
-        total_energy = sum(energies)
-        avg_energy = (total_energy / len(energies)) if energies else None
-        avg_obj = (sum(objs) / len(objs)) if objs else None
-
-        print("\n📋 RESUMEN MONTE CARLO")
-        print("=" * 80)
-        print(f"🎯 Año usado en MC: {target_year}")
-        print(f"🔁 Simulaciones: {len(results_mc)}")
-        print(f"✅ Óptimos: {opt_count}, Factibles (óptimo/subóptimo): {feasible_count}")
-        if avg_energy is not None:
-            print(f"⚡ Energía total (proxy, suma sims): {total_energy:,.1f} MWh")
-            print(f"📊 Energía promedio por simulación (proxy): {avg_energy:,.1f} MWh")
-        if avg_obj is not None:
-            print(f"📉 Objetivo promedio (déficit) entre sims: {avg_obj:.3f} m3/s")
-    else:
-        # Si no se pidió scan/export/mc, exigir que el usuario haya pasado --year
-        if args.year is None:
-            parser.error("--year es requerido cuando no se usan --scan-full-years, --export-best-year o --mc")
-        run_caso_base_for_year(args.year, V0=args.V0)
-
-
-# end of file
+    sys.exit(0)
