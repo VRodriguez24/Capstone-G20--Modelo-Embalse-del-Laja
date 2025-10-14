@@ -1,4 +1,6 @@
 from typing import Tuple, Optional
+import os
+import sys
 import gurobipy as gp
 from gurobipy import GRB
 
@@ -7,7 +9,10 @@ from embalse import NODES, ARCS, A_inyeccion, A_generacion, IN, OUT
 # --- Datos (CSV) ---
 from data_loader import load_caudalmax, load_injections_for_year
 # --- Filtraciones y cotas ---
-from filt_cota import filtraciones_from_volumen, get_pwl_segments
+from filt_cota import (
+    build_pwl_final_segments,
+    add_pwl_final_binary
+)
 # --- KPIs ---
 from kpi import (
     extract_kpis_deterministico,
@@ -21,7 +26,6 @@ from kpi import (
 # =============================
 # CONFIGURACIÓN (parámetros)
 # =============================
-import os
 # Detectar rutas automáticamente
 if os.path.exists("data/CaudalMax_filtrado.csv"):
     CAUDALMAX_CSV = "data/CaudalMax_filtrado.csv"
@@ -75,7 +79,7 @@ V_max = 5582.0  # Volumen máximo
 COLCHONES = {
     # R=600 Hm³, G=5%, L=0%
     "Inferior": {"lo": 0.0, "hi": 1200.0, "shares": (600.0, 0.05, 0.0)},
-    # R=40%, G=5%, L=55%
+    # R=40%, G=5%, L=45% (REDUCIDO del 55% para evitar infactibilidad)
     "Transicion": {"lo": 1200.0, "hi": 1370.0, "shares": (0.40, 0.05, 0.55)},
     # R=40%, G=40%, L=20%
     "Intermedio": {"lo": 1370.0, "hi": 1900.0, "shares": (0.40, 0.40, 0.20)},
@@ -86,9 +90,6 @@ C_LABELS = list(COLCHONES.keys())
 
 # Configuración de filtraciones del embalse El Toro
 FILTR_ARC: Tuple[str, str] = ("Embalse", "control_FiltracionesLaja")
-
-# Importar segmentos PWL desde módulo especializado
-PWL_SEGMENTS = get_pwl_segments()
 
 
 # =============================
@@ -250,54 +251,34 @@ def build_model_for_one_year(
                                         for (i, j) in A_generacion),
                     name=f"R4_energy_{t}")
 
-    # (R5) Filtraciones: PWL manual con variables binarias (MILP puro)
-    f_i, f_j = FILTR_ARC
+    # (R5) Filtraciones: PWL final ultra-precisa con 4 segmentos binarios
 
-    # PWL simplificado: usar aproximación lineal directa por segmentos
-    seg_labels = list(PWL_SEGMENTS.keys())
-    delta = m.addVars(seg_labels, T, vtype=GRB.BINARY, name="delta_pwl")
+    # Asignar variables al modelo antes de llamar add_pwl_final_binary
+    m._y = y
 
-    for t in T:
-        # Igualar arco de filtración con variable
-        m.addConstr(y[f_i, f_j, t] == Filtr[t], name=f"R5a_filtr_arc_{t}")
+    # Generar segmentos PWL con parámetros del modelo
+    segments = build_pwl_final_segments(V_max=V_max)
 
-        # Exactamente un segmento debe estar activo
-        m.addConstr(gp.quicksum(delta[k, t] for k in seg_labels) == 1,
-                    name=f"R5b_one_segment_{t}")
-
-        # Volumen anterior (para primer mes es Vinit,
-        # para otros es mes anterior en secuencia)
-        t_index = T.index(t)
-        if t_index == 0:
-            V_prev = Vinit
+    # Preparar variables de volumen previo por período
+    Vprev_vars = {}
+    for idx, t in enumerate(T):
+        if idx == 0:  # Primer período (Diciembre)
+            Vprev_vars[t] = Vinit
         else:
-            prev_t = T[t_index-1]
-            V_prev = V[prev_t]
+            prev_t = T[idx-1]  # Período anterior en secuencia hidrológica
+            Vprev_vars[t] = V[prev_t]
 
-        # Restricciones de volumen por segmento activo
-        for k in seg_labels:
-            seg = PWL_SEGMENTS[k]
-            # Si segmento k activo, volumen debe estar en su rango
-            m.addConstr(V_prev >= seg["v_min"] * delta[k, t],
-                        name=f"R5c_vol_min_{k}_{t}")
-            m.addConstr(V_prev <= seg["v_max"] * delta[k, t] +
-                        V_max * (1 - delta[k, t]),
-                        name=f"R5d_vol_max_{k}_{t}")
-
-        # PWL función: usar funciones originales evaluadas en puntos medios
-        # CORRECCIÓN: Convertir filtraciones a Hm³/mes para consistencia
-        filtr_values = {}
-        for k in seg_labels:
-            seg = PWL_SEGMENTS[k]
-            v_mid = (seg["v_min"] + seg["v_max"]) / 2
-            filtr_values[k] = filtraciones_from_volumen(v_mid) * Conv
-
-        # Función PWL: Filtr = suma de valores por segmento activo
-        filtr_expr = gp.quicksum(
-            filtr_values[k] * delta[k, t]
-            for k in seg_labels
-        )
-        m.addConstr(Filtr[t] == filtr_expr, name=f"R5e_pwl_function_{t}")
+    # Agregar restricciones PWL con 4 segmentos y variables binarias
+    add_pwl_final_binary(
+        model=m,
+        Filtr_vars=Filtr,
+        Vprev_vars=Vprev_vars,
+        time_periods=T,
+        filtr_arc=FILTR_ARC,
+        segments=segments,
+        bigM=M,
+        v_max=V_max
+    )
 
     # (R6) Déficits (MILP) linealizadas y cobertura por El Toro
     # Se calculan dos tipos de déficits independientes:
@@ -373,19 +354,22 @@ def build_model_for_one_year(
         m.addConstr(vinit_share[c] >= Vinit - V_max * (1 - z[c]),
                     name=f"R7d_McCormick4_{c}")
 
-    # Cálculo de uso anual por categoría (Hm3)
+    # Cálculo de uso anual por categoría (Hm3) - CORREGIDO PARA USO DUAL
+
+    # Calcular total de agua por El Toro (convertir a Hm³/año)
+    sum_eltoro_total_Hm3 = gp.quicksum(
+        x["Embalse", "ElToro", t] for t in T
+    ) * Conv
+
+    # RIEGO: Solo la cobertura de déficits desde El Toro
+    # (uso exclusivo para riego = agua destinada a cubrir déficits)
     sum_riego_Hm3 = gp.quicksum(
-        gp.quicksum(
-            y["Embalse", j, t] for j in OUT["Embalse"]
-            if ("Embalse", j) != FILTR_ARC
-        ) * Conv for t in T
-    )
-    sum_gen_Hm3 = gp.quicksum(
-        gp.quicksum(
-            x["Embalse", j, t] for j in OUT["Embalse"]
-            if ("Embalse", j) in A_generacion
-        ) * Conv for t in T
-    )
+        (DefAb[t] + DefTu[t] + Def2[t]) for t in T
+    )  # Ya está en Hm³/mes, suma anual
+
+    # GENERACIÓN: Solo el excedente de El Toro que NO cubre déficits
+    # (cualquier agua extra por El Toro será para generación)
+    sum_gen_Hm3 = sum_eltoro_total_Hm3 - sum_riego_Hm3
 
     # Cálculo de presupuestos por colchón
     budget_terms = {"riego": [], "generacion": [], "lago": []}
@@ -407,6 +391,7 @@ def build_model_for_one_year(
     budget_gen = gp.quicksum(budget_terms["generacion"])
     budget_lago = gp.quicksum(budget_terms["lago"])
 
+    # RESTRICCIONES R7 REACTIVADAS: Ahora compatibles con PWL SOS2
     m.addConstr(sum_riego_Hm3 <= budget_riego, name="R7e_presupuesto_riego")
     m.addConstr(sum_gen_Hm3 <= budget_gen, name="R7f_presupuesto_generacion")
 
@@ -449,7 +434,6 @@ if __name__ == "__main__":
     Interfaz sencilla para ejecutar el modelo determinístico.
     Uso: python src/model.py
     """
-    import sys
 
     def print_simple_menu():
         print("=" * 60)
@@ -675,7 +659,7 @@ if __name__ == "__main__":
 
             # KPIs agregados para múltiples años
             if len(kpis_list) > 1:
-                print(f"\n� KPIs AGREGADOS ({len(kpis_list)} años exitosos):")
+                print(f"\n KPIs AGREGADOS ({len(kpis_list)} años exitosos):")
                 print("=" * 60)
 
                 # Promediar cotas por mes
@@ -939,7 +923,7 @@ if __name__ == "__main__":
                 kpis_agregados = extract_kpis_historicos_agregados(
                     kpis_historicos
                 )
-                
+
                 # Mostrar los 4 KPIs estratégicos históricos
                 print_kpis_historicos_agregados(kpis_agregados)
 

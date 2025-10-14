@@ -1,9 +1,9 @@
 kpi_categoria,kpi_detalle,valor,unidad
-Tiempo_Colchones,Inferior,56.119791666666664,%
-Tiempo_Colchones,Transicion,12.5,%
-Tiempo_Colchones,Intermedio,28.124999999999996,%
-Tiempo_Colchones,Superior,2.8645833333333335,%
-Uso_Presupuestos,riego,0.0,%
-Uso_Presupuestos,generacion,99.2717679547793,%
-Participacion_ElToro,energia_total,16.676604658738906,%
+Tiempo_Colchones,Inferior,19.010416666666664,%
+Tiempo_Colchones,Transicion,13.151041666666666,%
+Tiempo_Colchones,Intermedio,45.18229166666666,%
+Tiempo_Colchones,Superior,22.65625,%
+Uso_Presupuestos,riego,229.20152618817573,%
+Uso_Presupuestos,generacion,2109.899848821755,%
+Participacion_ElToro,energia_total,32.5085180790182,%
 Factor_Utilizacion,sistema,0.0,%

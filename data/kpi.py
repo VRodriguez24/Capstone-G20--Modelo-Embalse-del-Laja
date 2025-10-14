@@ -11,78 +11,31 @@ from filt_cota import cota_from_volumen
 Módulo de KPIs para el Embalse del Laja
 ======================================
 
-Este módulo implementa 4 KPIs estratégicos para evaluar la operación del Embalse del Laja:
+KPIs estratégicos implementados:
+1. 🏗️ Tiempo en colchones operativos (%) - Tensión operativa
+2. 💰 Uso de presupuestos riego/generación (%) - Eficiencia presupuestaria
+3. 🏭 Participación El Toro en generación (%) - Dominancia energética
+4. 🏗️ Factor de utilización (%) - Eficiencia hidráulica
 
-📊 KPIs ESTRATÉGICOS:
-
-1. 🏗️ TIEMPO EN COLCHONES OPERATIVOS (%)
-   - Definición: Porcentaje del tiempo que el embalse opera en cada rango de volumen
-   - Propósito: Medir tensión operativa y distribución de estados
-   - Rangos: Inferior (0-1200), Transición (1200-1370), Intermedio (1370-1900), Superior (1900-5582 Hm³)
-   - Interpretación: Mayor tiempo en colchones superiores = mayor disponibilidad de agua
-
-2. 💰 USO DE PRESUPUESTOS RIEGO/GENERACIÓN (%)
-   - Definición: Porcentaje de uso real vs presupuesto asignado según colchón activo
-   - Propósito: Medir eficiencia en asignación de recursos hídricos
-   - Cálculo: (Uso_real_anual / Presupuesto_asignado) × 100
-   - Interpretación: >100% indica sobre-uso, <100% indica subutilización
-
-3. 🏭 PARTICIPACIÓN EL TORO EN GENERACIÓN (%)
-   - Definición: Porcentaje de energía generada por Central El Toro vs total del sistema
-   - Propósito: Medir dominancia energética de la central principal
-   - Cálculo: (Energía_ElToro / Energía_Total_Sistema) × 100
-   - Interpretación: Mayor % indica mayor dependencia de El Toro para generación
-
-4. 🏗️ FACTOR DE UTILIZACIÓN (%)
-   - Definición: Porcentaje de uso real vs capacidad disponible ponderado por tamaño
-   - Propósito: Medir eficiencia hidráulica del sistema de centrales
-   - Cálculo: Promedio ponderado por capacidad instalada de cada central
-   - Interpretación: Mayor % indica mejor aprovechamiento de infraestructura
-
-📈 FUNCIONES PRINCIPALES:
+Funciones principales:
 - extract_kpis(model): Extrae KPIs de un modelo individual
 - aggregate_kpis(kpis_list): Agrega múltiples KPIs (Monte Carlo/histórico)
 - print_kpis(kpis, context): Imprime KPIs formateados
 - export_kpis_csv(kpis, output_dir): Exporta a CSV
-
-💡 METODOLOGÍA:
-- Período hidrológico: Diciembre→Noviembre (12 meses)
-- Colchones: Basados en volumen inicial y normativa DGA
-- Presupuestos: Dinámicos según colchón activo al inicio del período
-- Agregación: Promedios ponderados para análisis multi-año
-
-✅ MEJORAS IMPLEMENTADAS v2.0:
-- KPI 2: Cálculo mejorado incluyendo flujos downstream y déficits cubiertos
-- KPI 4: Ponderación por capacidad instalada evitando sesgo de centrales pequeñas
-- Comentarios: Documentación completa con definiciones, metodología y propósito
-- Exportación: Formato CSV estructurado para análisis posterior
-- Visualización: Gráficos históricos profesionales para reportes ejecutivos
 """
 
 
 def extract_kpis(model, include_detailed: bool = True) -> Dict[str, Any]:
     """
-    Extrae KPIs estratégicos de un modelo optimizado del Embalse del Laja.
-    
-    Esta función es universal y compatible con análisis determinísticos, Monte Carlo e históricos.
-    Calcula los 4 KPIs estratégicos principales más métricas complementarias.
+    Extrae KPIs estratégicos de un modelo optimizado.
+    Función universal para análisis determinístico y Monte Carlo.
 
     Args:
-        model: Modelo optimizado de Gurobi con variables del embalse
-        include_detailed: Si incluir KPIs detallados (parámetro de compatibilidad)
+        model: Modelo optimizado de Gurobi
+        include_detailed: Si incluir KPIs detallados (compatibilidad)
 
     Returns:
-        Dict[str, Any]: Diccionario con estructura:
-            - 'status': Estado de optimización del modelo (2=óptimo)
-            - 'obj_MWh': Valor objetivo (energía total generada)
-            - 'V_end': Volumen final del embalse (Hm³)
-            - 'tiempo_colchones_%': Dict con % tiempo en cada colchón
-            - 'uso_presupuestos_%': Dict con % uso de presupuestos riego/generación
-            - 'participacion_toro_%': % participación energética de El Toro
-            - 'factor_utilizacion_%': Dict con factor utilización sistema/centrales
-            - 'cota_mensual': Dict con cotas mensuales (msnm)
-            - 'dependencia_lago_m3s': Dict con déficits mensuales (m³/s)
-            - 'volumenes_mensuales': Dict con volúmenes mensuales (Hm³)
+        Diccionario con KPIs estratégicos y resultados del modelo
     """
     # Validación básica
     if not hasattr(model, 'status'):
@@ -132,187 +85,107 @@ def extract_kpis(model, include_detailed: bool = True) -> Dict[str, Any]:
 
 def _calculate_strategic_kpis(model) -> Dict[str, Any]:
     """
-    Calcula los 4 KPIs estratégicos del modelo optimizado.
-    
-    Esta función interna implementa la lógica de cálculo de cada KPI según
-    las mejores prácticas definidas para el Embalse del Laja.
-    
-    Args:
-        model: Modelo optimizado de Gurobi con estado óptimo (status=2)
-        
-    Returns:
-        Dict[str, Any]: KPIs estratégicos calculados
-        
-    KPIs calculados:
-        1. Tiempo en colchones: Distribución temporal por rangos de volumen
-        2. Uso de presupuestos: Eficiencia en asignación riego/generación  
-        3. Participación El Toro: Dominancia energética de central principal
-        4. Factor utilización: Eficiencia hidráulica del sistema
+    Calcula los 4 KPIs estratégicos del modelo.
+    Función interna para evitar duplicación de código.
     """
     from model import T, Conv, COLCHONES, C_LABELS
 
-    # PASO 1: Extraer datos base del modelo optimizado
-    # ================================================
-    
-    # Extraer volúmenes mensuales y convertir a cotas
+    # Extraer volumenes y cotas mensuales
     volumenes_mensuales = {}
     cota_mensual = {}
     for t in T:
-        volumen_hm3 = model._V[t].x  # Volumen del embalse en mes t (Hm³)
+        volumen_hm3 = model._V[t].x
         volumenes_mensuales[t] = volumen_hm3
-        # Convertir volumen a cota usando curva embalse El Toro
         cota_mensual[t] = cota_from_volumen(volumen_hm3)
 
-    # Calcular dependencia del lago: suma de déficits que requieren apoyo del embalse
-    # Déficits en Hm³/mes se convierten a m³/s para interpretación operacional
+    # Calcular dependencia del lago (déficits)
     dependencia_lago_m3s = {}
     for t in T:
         deficit_total = 0.0
-        # Sumar déficits de todos los usuarios (regantes primarios y secundarios)
-        for deficit_name in ["DeficitAbanico", "DeficitTucapel", "Deficit2dosRegantes"]:
+        # Sumar todos los déficits convertidos a m³/s
+        for deficit_name in ["DeficitAbanico", "DeficitTucapel",
+                            "Deficit2dosRegantes"]:
             try:
                 deficit_var = model.getVarByName(f"{deficit_name}[{t}]")
                 if deficit_var:
-                    # Convertir de Hm³/mes a m³/s: deficit_Hm³ / Conv = m³/s
                     deficit_total += deficit_var.x / Conv
             except Exception:
                 pass
         dependencia_lago_m3s[t] = deficit_total
 
-    # ================================================
-    # KPI 1: TIEMPO EN COLCHONES OPERATIVOS ✓ CORRECTO
-    # ================================================
-    # Definición: % del tiempo que el embalse opera en cada rango de volumen
-    # Metodología: Clasifica cada mes según volumen vs rangos definidos
-    # Validación: Evita solapamientos con epsilon, suma total = 100%
-    # Rangos (Hm³): Inferior(0-1200), Transición(1200-1370), Intermedio(1370-1900), Superior(1900-5582)
-    
+    # KPI 1: Tiempo en colchones operativos
     tiempo_colchones = {c: 0 for c in C_LABELS}
     for t in T:
         volumen = volumenes_mensuales[t]
-        # Clasificar mes según rango de volumen (solo uno por mes)
         for c in C_LABELS:
-            lo = COLCHONES[c]["lo"]  # Límite inferior del colchón
-            hi = COLCHONES[c]["hi"]  # Límite superior del colchón
-            eps = 1e-3 if c != "Inferior" else 0.0  # Evita solapamiento en límites
+            lo = COLCHONES[c]["lo"]
+            hi = COLCHONES[c]["hi"]
+            eps = 1e-3 if c != "Inferior" else 0.0
             if lo + eps <= volumen <= hi:
                 tiempo_colchones[c] += 1
-                break  # Solo un colchón por mes
+                break
 
-    # Convertir conteos a porcentajes
     tiempo_colchones_pct = {c: (count / len(T)) * 100.0
-                            for c, count in tiempo_colchones.items()}
+                           for c, count in tiempo_colchones.items()}
 
-    # ================================================
-    # KPI 2: USO DE PRESUPUESTOS ✅ MEJORADO
-    # ================================================
-    # Definición: % de uso real vs presupuesto asignado según colchón activo
-    # Metodología: Suma TODOS los flujos de riego/generación vs límites por colchón
-    # Mejora: Incluye flujos downstream y déficits cubiertos por el sistema
-    # Fórmula: (Uso_real_anual_Hm³ / Presupuesto_asignado_Hm³) × 100
-    
-    uso_riego_hm3, uso_gen_hm3 = 0.0, 0.0  # Uso real acumulado anual
-    presupuesto_riego, presupuesto_gen = 0.0, 0.0  # Presupuestos según colchón activo
+    # KPI 2: Uso de presupuestos
+    uso_riego_hm3, uso_gen_hm3 = 0.0, 0.0
+    presupuesto_riego, presupuesto_gen = 0.0, 0.0
 
-    # Obtener arcos de generación del modelo
-    A_gen = model._meta.get("A_generacion", []) if hasattr(model, '_meta') else []
-    if not A_gen:
-        try:
-            from model import A_generacion
-            A_gen = A_generacion
-        except ImportError:
-            A_gen = []
-
-    # CALCULAR USO REAL ANUAL (suma de todos los meses)
+    # Calcular uso real
     for t in T:
-        # RIEGO: Flujos de agua destinados a riego (no generación)
-        # Incluye: flujos directos desde embalse + agua para cubrir déficits downstream
-        if hasattr(model, '_y'):
-            arcos_y = set((i, j) for (i, j, _) in model._y.keys())
-            for (i, j) in arcos_y:
-                # 1) Flujos directos desde embalse (excepto generación)
-                if i == "Embalse" and (i, j) not in A_gen:
-                    try:
-                        var = model._y[i, j, t]
-                        if var:
-                            uso_riego_hm3 += var.x * Conv  # m³/s → Hm³
-                    except Exception:
-                        pass
-                        
-                # 2) Flujos downstream para cubrir déficits de riego
-                # Solo cuenta si efectivamente hay déficit siendo cubierto
-                if j in ["control_Abanico", "control_Tucapel"] and i != "Embalse":
-                    try:
-                        var = model._y[i, j, t]
-                        if var:
-                            # Verificar si hay déficit activo en este punto
-                            deficit_var = None
-                            if j == "control_Abanico":
-                                deficit_var = model.getVarByName(f"DeficitAbanico[{t}]")
-                            elif j == "control_Tucapel": 
-                                deficit_var = model.getVarByName(f"DeficitTucapel[{t}]")
-                            
-                            # Solo contar si deficit > 0 (hay necesidad real)
-                            if deficit_var and deficit_var.x > 1e-6:
-                                uso_riego_hm3 += var.x * Conv
-                    except Exception:
-                        pass
+        # Riego: flujos desde embalse
+        for j in ["control_Antuco", "control_Abanico", "control_Tucapel"]:
+            try:
+                var = model.getVarByName(f"y[Embalse,{j},{t}]")
+                if var:
+                    uso_riego_hm3 += var.x * Conv
+            except Exception:
+                pass
 
-        # GENERACIÓN: Agua usada en todas las centrales hidroeléctricas
-        if hasattr(model, '_x'):
-            for (i, j) in A_gen:
-                try:
-                    var = model._x[i, j, t]
-                    if var:
-                        uso_gen_hm3 += var.x * Conv  # m³/s → Hm³
-                except Exception:
-                    pass
-                except Exception:
-                    pass
+        # Generación: flujos hacia centrales
+        for central in ["Antuco", "ElToro", "Abanico"]:
+            try:
+                var = model.getVarByName(f"x[Embalse,{central},{t}]")
+                if var:
+                    uso_gen_hm3 += var.x * Conv
+            except Exception:
+                pass
 
-    # CALCULAR PRESUPUESTOS según colchón activo al inicio del período
-    # Los presupuestos se determinan por el volumen inicial y colchón seleccionado
+    # Calcular presupuestos según colchón activo
     v_inicial = model.getVarByName("Vinit")
-    v_init_val = v_inicial.x if v_inicial else 1400.0  # Valor por defecto
+    v_init_val = v_inicial.x if v_inicial else 1400.0
 
-    # Identificar colchón activo (z[c] = 1)
     for c in C_LABELS:
         z_var = model.getVarByName(f"z[{c}]")
-        if z_var and z_var.x > 0.5:  # Colchón activo
+        if z_var and z_var.x > 0.5:
             r_share, g_share, l_share = COLCHONES[c]["shares"]
-            # Calcular presupuestos: valor fijo (>1.0) o porcentaje (≤1.0) del volumen inicial
-            presupuesto_riego = (r_share if r_share > 1.0 else r_share * v_init_val)
-            presupuesto_gen = (g_share if g_share > 1.0 else g_share * v_init_val)
+            presupuesto_riego = (r_share if r_share > 1.0
+                               else r_share * v_init_val)
+            presupuesto_gen = (g_share if g_share > 1.0
+                             else g_share * v_init_val)
             break
 
-    # Calcular porcentajes de uso vs presupuesto
     uso_presupuestos_pct = {
-        "riego": (uso_riego_hm3 / presupuesto_riego * 100.0 if presupuesto_riego > 0 else 0.0),
-        "generacion": (uso_gen_hm3 / presupuesto_gen * 100.0 if presupuesto_gen > 0 else 0.0)
+        "riego": (uso_riego_hm3 / presupuesto_riego * 100.0
+                 if presupuesto_riego > 0 else 0.0),
+        "generacion": (uso_gen_hm3 / presupuesto_gen * 100.0
+                      if presupuesto_gen > 0 else 0.0)
     }
 
-    # ================================================
-    # KPI 3: PARTICIPACIÓN DE EL TORO ✓ CORRECTO
-    # ================================================
-    # Definición: % de energía generada por Central El Toro vs total del sistema
-    # Metodología: Usa factores de conversión eta (m³/s → MWh) correctamente
-    # Propósito: Medir dominancia energética de la central principal del embalse
-    # Fórmula: (Energía_ElToro / Energía_Total_Sistema) × 100
-    
-    energia_toro, energia_total = 0.0, 0.0  # Energía acumulada anual (MWh)
+    # KPI 3: Participación de El Toro
+    energia_toro, energia_total = 0.0, 0.0
     try:
         from model import A_generacion
-        # Factores de conversión: eta[arco] = MWh por m³/s
         eta = model._meta.get("eta", {}) if hasattr(model, '_meta') else {}
 
         for t in T:
-            # Energía generada por El Toro en mes t
+            # Energía de El Toro
             x_toro_var = model.getVarByName(f"x[Embalse,ElToro,{t}]")
             if x_toro_var and ("Embalse", "ElToro") in eta:
-                # Energía = factor_conversión × caudal_turbinado
                 energia_toro += eta[("Embalse", "ElToro")] * x_toro_var.x
 
-            # Energía total del sistema en mes t (suma de todas las centrales)
+            # Energía total
             for (i, j) in A_generacion:
                 x_var = model.getVarByName(f"x[{i},{j},{t}]")
                 if x_var and (i, j) in eta:
@@ -320,63 +193,31 @@ def _calculate_strategic_kpis(model) -> Dict[str, Any]:
     except Exception:
         pass
 
-    # Calcular participación porcentual
-    participacion_toro_pct = (energia_toro / energia_total * 100.0 if energia_total > 0 else 0.0)
+    participacion_toro_pct = (energia_toro / energia_total * 100.0
+                             if energia_total > 0 else 0.0)
 
-    # ================================================
-    # KPI 4: FACTOR DE UTILIZACIÓN ✅ MEJORADO
-    # ================================================
-    # Definición: % de uso real vs capacidad disponible ponderado por tamaño de central
-    # Metodología: Promedio ponderado por capacidad instalada + detalle individual
-    # Propósito: Medir eficiencia hidráulica del sistema evitando sesgo de centrales pequeñas
-    # Mejora: Centrales grandes tienen mayor peso en el promedio del sistema
-    # Fórmula: Σ(FU_central × Capacidad_central) / Σ(Capacidad_central)
-    
-    factor_utilizacion = {"sistema": 0.0}  # Resultado principal + detalles por central
+    # KPI 4: Factor de utilización
+    factor_utilizacion = {"sistema": 0.0}
     try:
-        # Capacidades máximas por central (m³/s)
-        cap_max = (model._meta.get("cap_max", {}) if hasattr(model, '_meta') else {})
+        from model import A_generacion
+        cap_max = (model._meta.get("cap_max", {})
+                  if hasattr(model, '_meta') else {})
 
-        if cap_max and hasattr(model, '_x'):
-            uso_total_ponderado, capacidad_total_ponderada = 0.0, 0.0
-            
-            # Calcular factor de utilización por central y agregar con ponderación
-            for (i, j) in A_gen:
-                if (i, j) in cap_max and cap_max[(i, j)] is not None:
-                    capacidad_max = cap_max[(i, j)]  # Capacidad máxima (m³/s)
-                    
-                    # Uso real anual de la central (suma de todos los meses)
-                    uso_central = sum(
-                        model._x[i, j, t].x for t in T if (i, j, t) in model._x
-                    )
-                    
-                    # Capacidad disponible total anual (capacidad × número_meses)
-                    capacidad_anual = capacidad_max * len(T)
-                    
-                    # Factor de utilización individual de la central (0-1)
-                    fu_central = (uso_central / capacidad_anual) if capacidad_anual > 0 else 0.0
-                    
-                    # Ponderar por capacidad instalada para el promedio del sistema
-                    peso = capacidad_max  # Centrales más grandes tienen mayor peso
-                    uso_total_ponderado += fu_central * peso
-                    capacidad_total_ponderada += peso
+        uso_total, capacidad_total = 0.0, 0.0
+        for (i, j) in A_generacion:
+            if (i, j) in cap_max:
+                uso_central = sum(
+                    model.getVarByName(f"x[{i},{j},{t}]").x
+                    for t in T
+                    if model.getVarByName(f"x[{i},{j},{t}]")
+                )
+                capacidad_central = cap_max[(i, j)] * len(T)
+                uso_total += uso_central
+                capacidad_total += capacidad_central
 
-            # Factor de utilización del sistema (promedio ponderado)
-            if capacidad_total_ponderada > 0:
-                factor_utilizacion["sistema"] = (uso_total_ponderado / capacidad_total_ponderada * 100.0)
-                
-            # Detalle individual por central para análisis específico
-            factor_utilizacion["por_central"] = {}
-            for (i, j) in A_gen:
-                if (i, j) in cap_max and cap_max[(i, j)] is not None:
-                    capacidad_max = cap_max[(i, j)]
-                    uso_central = sum(
-                        model._x[i, j, t].x for t in T if (i, j, t) in model._x
-                    )
-                    capacidad_anual = capacidad_max * len(T)
-                    fu_central = (uso_central / capacidad_anual * 100.0) if capacidad_anual > 0 else 0.0
-                    factor_utilizacion["por_central"][f"{i}-{j}"] = fu_central
-                    
+        if capacidad_total > 0:
+            factor_utilizacion["sistema"] = (uso_total / capacidad_total
+                                           * 100.0)
     except Exception:
         pass
 
@@ -397,29 +238,13 @@ def _calculate_strategic_kpis(model) -> Dict[str, Any]:
 def aggregate_kpis(kpis_list: List[Dict[str, Any]]) -> Dict[str, Any]:
     """
     Agrega múltiples KPIs para análisis Monte Carlo o histórico.
-    
-    Esta función es fundamental para consolidar resultados de múltiples simulaciones
-    o años históricos en métricas promedio representativas del comportamiento del sistema.
-    
-    Casos de uso:
-    - Análisis Monte Carlo: Promedia KPIs de N simulaciones estocásticas
-    - Análisis histórico: Promedia KPIs de múltiples años (1960-2023)
-    - Evaluación de sensibilidad: Consolida resultados de diferentes escenarios
+    Función universal que calcula promedios y estadísticas.
 
     Args:
-        kpis_list: Lista de diccionarios de KPIs individuales (uno por simulación/año)
-                  Cada elemento debe contener los 4 KPIs estratégicos
+        kpis_list: Lista de diccionarios de KPIs
 
     Returns:
-        Dict[str, Any]: KPIs agregados con estructura:
-            - Promedios de los 4 KPIs estratégicos
-            - Trayectorias promedio mensuales (cota, dependencia)
-            - Metadata de agregación (num_kpis, num_total)
-            
-    Metodología de agregación:
-        - KPIs estratégicos: Promedio aritmético simple
-        - Trayectorias mensuales: Promedio por mes específico
-        - Filtrado: Solo incluye casos con optimización exitosa (status=2)
+        Diccionario con KPIs agregados y estadísticas
     """
     if not kpis_list:
         return {}
@@ -431,50 +256,51 @@ def aggregate_kpis(kpis_list: List[Dict[str, Any]]) -> Dict[str, Any]:
     if not valid_kpis:
         return {"error": "No hay KPIs válidos para agregar"}
 
-    # AGREGACIÓN DE KPIs ESTRATÉGICOS
-    # ===============================
-    
-    # KPI 1: Promedio de tiempo en colchones por tipo
+    # Agregar KPI 1: Tiempo en colchones
     colchones_agregados = {}
     for colchon in ["Inferior", "Transicion", "Intermedio", "Superior"]:
-        valores = [kpi['tiempo_colchones_%'].get(colchon, 0.0) for kpi in valid_kpis]
+        valores = [kpi['tiempo_colchones_%'].get(colchon, 0.0)
+                  for kpi in valid_kpis]
         colchones_agregados[colchon] = np.mean(valores) if valores else 0.0
 
-    # KPI 2: Promedio de uso de presupuestos por categoría
-    riego_valores = [kpi['uso_presupuestos_%'].get('riego', 0.0) for kpi in valid_kpis]
-    gen_valores = [kpi['uso_presupuestos_%'].get('generacion', 0.0) for kpi in valid_kpis]
+    # Agregar KPI 2: Uso de presupuestos
+    riego_valores = [kpi['uso_presupuestos_%'].get('riego', 0.0)
+                    for kpi in valid_kpis]
+    gen_valores = [kpi['uso_presupuestos_%'].get('generacion', 0.0)
+                  for kpi in valid_kpis]
+
     uso_presupuestos_agregado = {
         "riego": np.mean(riego_valores) if riego_valores else 0.0,
         "generacion": np.mean(gen_valores) if gen_valores else 0.0
     }
 
-    # KPI 3: Promedio de participación de El Toro
-    toro_valores = [kpi.get('participacion_toro_%', 0.0) for kpi in valid_kpis]
-    participacion_toro_agregada = np.mean(toro_valores) if toro_valores else 0.0
+    # Agregar KPI 3: Participación El Toro
+    toro_valores = [kpi.get('participacion_toro_%', 0.0)
+                   for kpi in valid_kpis]
+    participacion_toro_agregada = (np.mean(toro_valores)
+                                  if toro_valores else 0.0)
 
-    # KPI 4: Promedio de factor de utilización del sistema
-    fu_valores = [kpi['factor_utilizacion_%'].get('sistema', 0.0) for kpi in valid_kpis]
+    # Agregar KPI 4: Factor de utilización
+    fu_valores = [kpi['factor_utilizacion_%'].get('sistema', 0.0)
+                 for kpi in valid_kpis]
     factor_utilizacion_agregado = {
         "sistema": np.mean(fu_valores) if fu_valores else 0.0
     }
 
-    # AGREGACIÓN DE TRAYECTORIAS MENSUALES
-    # ===================================
-    # Promedia valores por mes específico (conserva estacionalidad)
-    
+    # Agregar resultados del modelo
     cota_mensual_agregada = {}
     dependencia_agregada = {}
 
+    # Promediar por mes
     from model import T
-    for t in T:  # Para cada mes del período hidrológico
-        # Cotas promedio por mes
-        cotas_mes = [kpi['cota_mensual'].get(t, 0.0) for kpi in valid_kpis 
+    for t in T:
+        cotas_mes = [kpi['cota_mensual'].get(t, 0.0) for kpi in valid_kpis
                     if kpi.get('cota_mensual')]
-        cota_mensual_agregada[t] = np.mean(cotas_mes) if cotas_mes else 0.0
-        
-        # Dependencia promedio por mes
-        deps_mes = [kpi['dependencia_lago_m3s'].get(t, 0.0) for kpi in valid_kpis
+        deps_mes = [kpi['dependencia_lago_m3s'].get(t, 0.0)
+                   for kpi in valid_kpis
                    if kpi.get('dependencia_lago_m3s')]
+
+        cota_mensual_agregada[t] = np.mean(cotas_mes) if cotas_mes else 0.0
         dependencia_agregada[t] = np.mean(deps_mes) if deps_mes else 0.0
 
     return {
@@ -496,31 +322,12 @@ def aggregate_kpis(kpis_list: List[Dict[str, Any]]) -> Dict[str, Any]:
 
 def print_kpis(kpis: Dict[str, Any], context: str = "") -> None:
     """
-    Imprime KPIs en formato legible y organizado para análisis operacional.
-    
-    Esta función presenta los resultados de manera estructurada con emojis y formato
-    que facilita la interpretación rápida de los indicadores estratégicos.
-    
-    Formatos soportados:
-    - Análisis individual: KPIs de un año específico o simulación única
-    - Análisis agregado: Promedios históricos o Monte Carlo
-    - Comparativo: Múltiples contextos con sufijos explicativos
-    
+    Imprime KPIs en formato legible.
+    Función universal para cualquier tipo de análisis.
+
     Args:
-        kpis: Diccionario con KPIs calculados (individual o agregado)
-        context: Contexto del análisis para personalizar mensaje:
-                - "año XXXX": Análisis de año específico
-                - "histórico": Promedio de análisis histórico completo
-                - "Monte Carlo": Promedio de simulaciones estocásticas
-                - "": Sin contexto específico (genérico)
-                
-    Salida formateada:
-        📊 Título con contexto y número de casos (si aplica)
-        🏗️ KPI 1: Distribución por colchones con códigos de color
-        💰 KPI 2: Eficiencia de uso de presupuestos
-        🏭 KPI 3: Dominancia energética de El Toro
-        🏗️ KPI 4: Eficiencia hidráulica del sistema
-        📋 Resumen operacional: cotas, déficits, autosuficiencia
+        kpis: Diccionario con KPIs calculados
+        context: Contexto del análisis (año, "histórico", "Monte Carlo", etc.)
     """
     if not kpis or 'tiempo_colchones_%' not in kpis:
         print("⚠️ No hay KPIs válidos para mostrar")
@@ -612,67 +419,46 @@ def export_kpis_to_csv(kpis: Dict[str, Any],
                       output_dir: str = "resultados",
                       prefix: str = "kpis") -> List[str]:
     """
-    Exporta KPIs a archivos CSV estructurados para análisis posterior.
-    
-    Esta función genera archivos CSV normalizados que permiten:
-    - Análisis estadístico con herramientas externas (R, Python, Excel)
-    - Integración con sistemas de reporting empresarial
-    - Comparación temporal y entre escenarios
-    - Visualización avanzada con herramientas BI
-    
-    Archivos generados:
-    1. {prefix}_kpis_estrategicos.csv: Los 4 KPIs principales en formato largo
-    2. {prefix}_trayectoria_cota.csv: Evolución mensual de cotas del embalse
-    
-    Estructura CSV (KPIs):
-        - kpi_categoria: Tipo de KPI (Tiempo_Colchones, Uso_Presupuestos, etc.)
-        - kpi_detalle: Subcategoría específica (Inferior, riego, sistema, etc.)
-        - valor: Valor numérico del KPI
-        - unidad: Unidad de medida (%, m³/s, msnm)
+    Exporta KPIs a archivos CSV.
+    Función universal para cualquier tipo de análisis.
 
     Args:
-        kpis: Diccionario con KPIs calculados (individual o agregado)
-        output_dir: Directorio de salida (se crea si no existe)
-        prefix: Prefijo para nombres de archivo (ej: "2023", "historico", "montecarlo")
+        kpis: Diccionario con KPIs calculados
+        output_dir: Directorio de salida
+        prefix: Prefijo para nombres de archivo
 
     Returns:
-        List[str]: Lista de rutas completas de archivos CSV generados
-        
-    Nota: Compatible con KPIs individuales y agregados automáticamente
+        Lista de archivos CSV generados
     """
-    # VALIDACIÓN Y PREPARACIÓN
-    # ========================
     output_path = Path(output_dir)
-    output_path.mkdir(exist_ok=True)  # Crear directorio si no existe
+    output_path.mkdir(exist_ok=True)
     files_created = []
 
     if not kpis or 'tiempo_colchones_%' not in kpis:
-        return files_created  # Sin KPIs válidos, no generar archivos
+        return files_created
 
-    # ESTRUCTURACIÓN DE DATOS EN FORMATO LARGO (TIDY DATA)
-    # ===================================================
-    # Formato normalizado: cada fila = una observación de un KPI específico
+    # Crear DataFrame con todos los KPIs
     data = []
 
-    # KPI 1: Tiempo en colchones - Distribución por rango operativo
+    # KPI 1: Colchones
     for colchon, valor in kpis.get('tiempo_colchones_%', {}).items():
         data.append({
             'kpi_categoria': 'Tiempo_Colchones',
-            'kpi_detalle': colchon,  # Inferior, Transicion, Intermedio, Superior
+            'kpi_detalle': colchon,
             'valor': valor,
             'unidad': '%'
         })
 
-    # KPI 2: Uso de presupuestos - Eficiencia por tipo de uso
+    # KPI 2: Presupuestos
     for tipo, valor in kpis.get('uso_presupuestos_%', {}).items():
         data.append({
             'kpi_categoria': 'Uso_Presupuestos',
-            'kpi_detalle': tipo,  # riego, generacion
+            'kpi_detalle': tipo,
             'valor': valor,
             'unidad': '%'
         })
 
-    # KPI 3: Participación energética de El Toro
+    # KPI 3: Participación El Toro
     data.append({
         'kpi_categoria': 'Participacion_ElToro',
         'kpi_detalle': 'energia_total',
@@ -680,35 +466,32 @@ def export_kpis_to_csv(kpis: Dict[str, Any],
         'unidad': '%'
     })
 
-    # KPI 4: Factor de utilización - Eficiencia hidráulica
+    # KPI 4: Factor utilización
     for tipo, valor in kpis.get('factor_utilizacion_%', {}).items():
         data.append({
             'kpi_categoria': 'Factor_Utilizacion',
-            'kpi_detalle': tipo,  # sistema, por_central (si existe)
+            'kpi_detalle': tipo,
             'valor': valor,
             'unidad': '%'
         })
 
-    # EXPORTACIÓN DE ARCHIVO PRINCIPAL
-    # ===============================
+    # Exportar KPIs principales
     if data:
         kpis_df = pd.DataFrame(data)
         kpis_file = output_path / f"{prefix}_kpis_estrategicos.csv"
-        kpis_df.to_csv(kpis_file, index=False, encoding='utf-8')
+        kpis_df.to_csv(kpis_file, index=False)
         files_created.append(str(kpis_file))
 
-    # EXPORTACIÓN DE TRAYECTORIA MENSUAL
-    # =================================
-    # Serie temporal de cotas para análisis estacional
+    # Exportar trayectoria de cota
     cota_data = kpis.get('cota_mensual', {})
     if cota_data:
         from model import T
         cota_df = pd.DataFrame({
-            "mes": T,  # Período hidrológico: [12,1,2,...,11]
+            "mes": T,
             "cota_msnm": [cota_data.get(t, 0) for t in T]
         })
         cota_file = output_path / f"{prefix}_trayectoria_cota.csv"
-        cota_df.to_csv(cota_file, index=False, encoding='utf-8')
+        cota_df.to_csv(cota_file, index=False)
         files_created.append(str(cota_file))
 
     return files_created
@@ -718,36 +501,15 @@ def generate_historical_plots(kpis_historicos: List[Dict[str, Any]],
                              years: List[int],
                              output_dir: str = "resultados") -> List[str]:
     """
-    Genera gráficos de evolución histórica para análisis visual de tendencias.
-    
-    Esta función produce visualizaciones profesionales que permiten identificar:
-    - Tendencias temporales en la operación del embalse
-    - Años críticos con baja disponibilidad hídrica
-    - Patrones de dependencia del sistema respecto al embalse
-    - Correlaciones entre disponibilidad y demandas hídricas
-    
-    Gráficos generados:
-    1. Evolución del nivel del lago (cota promedio anual)
-    2. Dependencia anual del embalse (déficits totales)
-    
-    Aplicaciones:
-    - Informes ejecutivos y presentaciones
-    - Análisis de riesgo hídrico multi-año
-    - Evaluación de políticas de gestión
-    - Identificación de períodos críticos históricos
+    Genera gráficos históricos de evolución.
 
     Args:
-        kpis_historicos: Lista de KPIs calculados por año histórico
-        years: Lista de años correspondientes (misma longitud que kpis_historicos)
-        output_dir: Directorio donde guardar los gráficos PNG
+        kpis_historicos: Lista de KPIs por año
+        years: Lista de años correspondientes
+        output_dir: Directorio de salida
 
     Returns:
-        List[str]: Lista de rutas completas de archivos PNG generados
-        
-    Formato de salida:
-        - Resolución: 300 DPI (calidad publicación)
-        - Formato: PNG con compresión optimizada
-        - Tamaño: 14x10 pulgadas (ideal para presentaciones)
+        Lista de archivos de gráfico generados
     """
     output_path = Path(output_dir)
     output_path.mkdir(exist_ok=True)
