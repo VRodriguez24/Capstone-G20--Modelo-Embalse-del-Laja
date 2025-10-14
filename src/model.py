@@ -11,16 +11,15 @@ from data_loader import load_caudalmax, load_injections_for_year
 # --- Filtraciones y cotas ---
 from filt_cota import (
     build_pwl_final_segments,
-    add_pwl_final_binary
+    get_pwl_segments
 )
 # --- KPIs ---
 from kpi import (
-    extract_kpis_deterministico,
-    print_kpis_deterministico,
+    extract_kpis,
+    aggregate_kpis,
+    print_kpis,
     export_kpis_to_csv,
-    generate_historical_plots,
-    extract_kpis_historicos_agregados,
-    print_kpis_historicos_agregados
+    generate_historical_plots
 )
 
 # =============================
@@ -90,6 +89,99 @@ C_LABELS = list(COLCHONES.keys())
 
 # Configuración de filtraciones del embalse El Toro
 FILTR_ARC: Tuple[str, str] = ("Embalse", "control_FiltracionesLaja")
+
+
+# =============================
+# FUNCIONES AUXILIARES PWL
+# =============================
+def add_pwl_filtration_constraints(
+    model,
+    Filtr_vars,
+    Vprev_vars, 
+    time_periods: list,
+    filtr_arc: tuple,
+    segments: dict,
+    bigM: float,
+    v_max: float,
+):
+    """
+    Agrega restricciones PWL para filtraciones con variables binarias.
+    
+    Implementa la linearización de la función no-lineal de filtraciones
+    usando segmentación PWL con variables binarias δ_{k,t}.
+    
+    Args:
+        model: Modelo de Gurobi
+        Filtr_vars: Variables de filtración por período
+        Vprev_vars: Variables de volumen previo por período
+        time_periods: Lista de períodos de tiempo
+        filtr_arc: Tupla (origen, destino) del arco de filtración
+        segments: Diccionario de segmentos PWL de filt_cota
+        bigM: Valor Big-M para linearización
+        v_max: Volumen máximo del embalse
+        
+    Returns:
+        dict: Variables auxiliares creadas (deltas)
+    """
+    f_i, f_j = filtr_arc
+    
+    # Filtrar metadatos y obtener segmentos numéricos
+    numeric_segments = {k: v for k, v in segments.items() if isinstance(k, int)}
+    seg_ids = list(numeric_segments.keys())
+
+    # Igualar arco de filtración con variable
+    for t in time_periods:
+        model.addConstr(
+            model._y[f_i, f_j, t] == Filtr_vars[t],
+            name=f"R5a_filtr_arc_{t}"
+        )
+
+    # Variables binarias δ_{k,t} para selección de segmento
+    delta = model.addVars(
+        seg_ids, time_periods, 
+        vtype=GRB.BINARY, 
+        name="delta_pwl_seg"
+    )
+    
+    # CRITICAL: Update model to commit variables
+    model.update()
+
+    for t in time_periods:
+        # Un único segmento activo por período
+        model.addConstr(
+            sum(delta[k, t] for k in seg_ids) == 1,
+            name=f"R5b_one_seg_{t}"
+        )
+
+        Vprev = Vprev_vars[t]
+
+        # Restricciones por segmento PWL
+        for k in seg_ids:
+            seg = numeric_segments[k]
+            vmin, vmax = seg["v_min"], seg["v_max"]
+            slope, b = seg["slope"], seg["intercept"]
+
+            # Volumen debe estar en el rango del segmento cuando δ_k=1
+            model.addConstr(
+                Vprev >= vmin * delta[k, t],
+                name=f"R5c_vol_lb_{k}_{t}"
+            )
+            model.addConstr(
+                Vprev <= vmax * delta[k, t] + v_max * (1 - delta[k, t]),
+                name=f"R5d_vol_ub_{k}_{t}"
+            )
+
+            # Filtración = función lineal del segmento cuando δ_k=1
+            model.addConstr(
+                Filtr_vars[t] >= slope * Vprev + b - bigM * (1 - delta[k, t]),
+                name=f"R5e_filtr_lb_{k}_{t}"
+            )
+            model.addConstr(
+                Filtr_vars[t] <= slope * Vprev + b + bigM * (1 - delta[k, t]),
+                name=f"R5f_filtr_ub_{k}_{t}"
+            )
+
+    return {"delta_pwl": delta, "segments_used": numeric_segments}
 
 
 # =============================
@@ -269,7 +361,7 @@ def build_model_for_one_year(
             Vprev_vars[t] = V[prev_t]
 
     # Agregar restricciones PWL con 4 segmentos y variables binarias
-    add_pwl_final_binary(
+    pwl_vars = add_pwl_filtration_constraints(
         model=m,
         Filtr_vars=Filtr,
         Vprev_vars=Vprev_vars,
@@ -646,12 +738,12 @@ if __name__ == "__main__":
                     model.optimize()
 
                     if model.status == 2:
-                        kpis = extract_kpis_deterministico(model)
+                        kpis = extract_kpis(model)
                         kpis_list.append(kpis)
 
                         # Mostrar KPIs para primer año como ejemplo
                         if len(kpis_list) == 1:
-                            print_kpis_deterministico(kpis, year)
+                            print_kpis(kpis, f"Año {year}")
 
                     model.dispose()
                 except Exception as e:
@@ -905,7 +997,7 @@ if __name__ == "__main__":
                     model.optimize()
 
                     if model.status == 2:
-                        kpis = extract_kpis_deterministico(model)
+                        kpis = extract_kpis(model)
                         kpis_historicos.append(kpis)
 
                         # Actualizar V0 para siguiente muestra
@@ -920,12 +1012,10 @@ if __name__ == "__main__":
             # Análisis agregado con KPIs estratégicos históricos
             if kpis_historicos:
                 # Calcular KPIs estratégicos agregados
-                kpis_agregados = extract_kpis_historicos_agregados(
-                    kpis_historicos
-                )
+                kpis_agregados = aggregate_kpis(kpis_historicos)
 
                 # Mostrar los 4 KPIs estratégicos históricos
-                print_kpis_historicos_agregados(kpis_agregados)
+                print_kpis(kpis_agregados, "Histórico")
 
                 # Exportar resultados históricos
                 try:

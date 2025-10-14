@@ -380,12 +380,28 @@ def _calculate_strategic_kpis(model) -> Dict[str, Any]:
     except Exception:
         pass
 
+    # Calcular totales para nuevos KPIs
+    uso_real_agua = {"riego": uso_riego_hm3, "generacion": uso_gen_hm3}
+    
+    # Energía total del sistema
+    energia_total = 0.0
+    if hasattr(model, '_G'):
+        for t in T:
+            try:
+                energia_total += model._G[t].x
+            except Exception:
+                pass
+
     return {
         # KPIs estratégicos
         'tiempo_colchones_%': tiempo_colchones_pct,
         'uso_presupuestos_%': uso_presupuestos_pct,
         'participacion_toro_%': participacion_toro_pct,
         'factor_utilizacion_%': factor_utilizacion,
+
+        # Nuevos campos para KPIs mejorados
+        'uso_real_agua_hm3': uso_real_agua,
+        'energia_total_mwh': energia_total,
 
         # Resultados del modelo
         'cota_mensual': cota_mensual,
@@ -458,6 +474,39 @@ def aggregate_kpis(kpis_list: List[Dict[str, Any]]) -> Dict[str, Any]:
         "sistema": np.mean(fu_valores) if fu_valores else 0.0
     }
 
+    # AGREGACIÓN DE NUEVAS MÉTRICAS ABSOLUTAS
+    # =======================================
+    # Promedio de uso real de agua y eficiencia energética
+    
+    # Uso real de agua promedio
+    riego_agua_valores = [
+        kpi.get('uso_real_agua_hm3', {}).get('riego', 0.0)
+        for kpi in valid_kpis
+    ]
+    gen_agua_valores = [
+        kpi.get('uso_real_agua_hm3', {}).get('generacion', 0.0)
+        for kpi in valid_kpis
+    ]
+    
+    uso_real_agua_agregado = {
+        "riego": np.mean(riego_agua_valores) if riego_agua_valores else 0.0,
+        "generacion": np.mean(gen_agua_valores) if gen_agua_valores else 0.0
+    }
+    # Calcular total
+    total_riego = uso_real_agua_agregado["riego"]
+    total_gen = uso_real_agua_agregado["generacion"]
+    uso_real_agua_agregado["total"] = total_riego + total_gen
+    
+    # Energía total promedio
+    energia_valores = [kpi.get('energia_total_mwh', 0.0) for kpi in valid_kpis]
+    energia_total_agregada = (np.mean(energia_valores) 
+                             if energia_valores else 0.0)
+    
+    # Eficiencia energética promedio (MWh/Hm³)
+    total_agua = uso_real_agua_agregado["total"]
+    eficiencia_energetica_agregada = (energia_total_agregada / total_agua
+                                     if total_agua > 0 else 0.0)
+
     # AGREGACIÓN DE TRAYECTORIAS MENSUALES
     # ===================================
     # Promedia valores por mes específico (conserva estacionalidad)
@@ -478,11 +527,16 @@ def aggregate_kpis(kpis_list: List[Dict[str, Any]]) -> Dict[str, Any]:
         dependencia_agregada[t] = np.mean(deps_mes) if deps_mes else 0.0
 
     return {
-        # KPIs estratégicos agregados
+        # KPIs estratégicos agregados (sistema viejo para compatibilidad)
         'tiempo_colchones_%': colchones_agregados,
         'uso_presupuestos_%': uso_presupuestos_agregado,
         'participacion_toro_%': participacion_toro_agregada,
         'factor_utilizacion_%': factor_utilizacion_agregado,
+
+        # KPIs estratégicos nuevos (sistema mejorado)
+        'uso_real_agua_hm3': uso_real_agua_agregado,
+        'energia_total_mwh': energia_total_agregada,
+        'eficiencia_energetica_mwh_hm3': eficiencia_energetica_agregada,
 
         # Resultados agregados
         'cota_mensual': cota_mensual_agregada,
@@ -547,25 +601,40 @@ def print_kpis(kpis: Dict[str, Any], context: str = "") -> None:
         sufijo = " (promedio histórico)" if "histórico" in context else ""
         print(f"   {emoji} {colchon:11s}: {porcentaje:5.1f}%{sufijo}")
 
-    # KPI 2: Uso de presupuestos
-    print("\n💰 KPI 2 - USO DE PRESUPUESTOS:")
-    presupuestos = kpis.get('uso_presupuestos_%', {})
-    sufijo = " (promedio histórico)" if "histórico" in context else ""
-    print(f"   🌾 Riego:      {presupuestos.get('riego', 0):6.1f}%{sufijo}")
-    print(f"   ⚡ Generación: "
-          f"{presupuestos.get('generacion', 0):6.1f}%{sufijo}")
+    # KPI 2: Uso real de agua (sistema mejorado) o presupuestos (compatibilidad)
+    if 'uso_real_agua_hm3' in kpis:
+        print("\n💰 KPI 2 - USO REAL PROMEDIO DE AGUA:")
+        agua_data = kpis.get('uso_real_agua_hm3', {})
+        sufijo = " (promedio histórico)" if "histórico" in context else ""
+        print(f"   🌾 Riego:      {agua_data.get('riego', 0):7.1f} Hm³/año{sufijo}")
+        print(f"   ⚡ Generación: {agua_data.get('generacion', 0):7.1f} Hm³/año{sufijo}")
+        print(f"   🏭 Total:      {agua_data.get('total', 0):7.1f} Hm³/año{sufijo}")
+    else:
+        print("\n💰 KPI 2 - USO DE PRESUPUESTOS:")
+        presupuestos = kpis.get('uso_presupuestos_%', {})
+        sufijo = " (promedio histórico)" if "histórico" in context else ""
+        print(f"   🌾 Riego:      {presupuestos.get('riego', 0):6.1f}%{sufijo}")
+        print(f"   ⚡ Generación: "
+              f"{presupuestos.get('generacion', 0):6.1f}%{sufijo}")
 
     # KPI 3: Participación El Toro
-    print("\n🏭 KPI 3 - PARTICIPACIÓN EL TORO:")
+    print("\n🏭 KPI 3 - PARTICIPACIÓN PROMEDIO EL TORO:")
     participacion = kpis.get('participacion_toro_%', 0.0)
     sufijo = " (promedio histórico)" if "histórico" in context else ""
     print(f"   ⚡ El Toro: {participacion:6.1f}% de energía total{sufijo}")
 
-    # KPI 4: Factor de utilización
-    print("\n🏗️ KPI 4 - FACTOR DE UTILIZACIÓN:")
-    fu_data = kpis.get('factor_utilizacion_%', {})
-    sufijo = " (promedio histórico)" if "histórico" in context else ""
-    print(f"   🏭 Sistema: {fu_data.get('sistema', 0):6.1f}%{sufijo}")
+    # KPI 4: Eficiencia energética (sistema mejorado) o factor utilización (compatibilidad)
+    if 'eficiencia_energetica_mwh_hm3' in kpis:
+        print("\n⚡ KPI 4 - EFICIENCIA ENERGÉTICA PROMEDIO:")
+        eficiencia = kpis.get('eficiencia_energetica_mwh_hm3', 0.0)
+        sufijo = " (promedio histórico)" if "histórico" in context else ""
+        print(f"   🔋 Sistema:   {eficiencia:.2f} MWh/Hm³{sufijo}")
+        print(f"   💡 Interpretación: {eficiencia:.2f} MWh por cada Hm³ de agua utilizada")
+    else:
+        print("\n🏗️ KPI 4 - FACTOR DE UTILIZACIÓN:")
+        fu_data = kpis.get('factor_utilizacion_%', {})
+        sufijo = " (promedio histórico)" if "histórico" in context else ""
+        print(f"   🏭 Sistema: {fu_data.get('sistema', 0):6.1f}%{sufijo}")
 
     # Resultados del modelo
     print("\n📋 RESULTADOS DEL MODELO:")
@@ -873,18 +942,19 @@ def extract_kpis_historicos_agregados(kpis_historicos: List[Dict[str, Any]]) -> 
         else:
             tiempo_colchones_promedio[colchon] = 0.0
     
-    # 2) KPI 2: Uso promedio de presupuestos
-    uso_riego_historico = []
-    uso_gen_historico = []
+    # 2) KPI 2: Uso real promedio de agua (Hm³/año)
+    uso_riego_real_historico = []
+    uso_gen_real_historico = []
     
     for kpis in kpis_historicos:
-        uso_presup = kpis.get("uso_presupuestos_%", {})
-        uso_riego_historico.append(uso_presup.get("riego", 0.0))
-        uso_gen_historico.append(uso_presup.get("generacion", 0.0))
+        # Obtener uso real en Hm³/año directamente, no porcentajes
+        uso_real = kpis.get("uso_real_agua_hm3", {})
+        uso_riego_real_historico.append(uso_real.get("riego", 0.0))
+        uso_gen_real_historico.append(uso_real.get("generacion", 0.0))
     
-    uso_presupuestos_promedio = {
-        "riego": sum(uso_riego_historico) / len(uso_riego_historico) if uso_riego_historico else 0.0,
-        "generacion": sum(uso_gen_historico) / len(uso_gen_historico) if uso_gen_historico else 0.0
+    uso_real_agua_promedio = {
+        "riego": sum(uso_riego_real_historico) / len(uso_riego_real_historico) if uso_riego_real_historico else 0.0,
+        "generacion": sum(uso_gen_real_historico) / len(uso_gen_real_historico) if uso_gen_real_historico else 0.0
     }
     
     # 3) KPI 3: Participación promedio de El Toro
@@ -896,30 +966,23 @@ def extract_kpis_historicos_agregados(kpis_historicos: List[Dict[str, Any]]) -> 
     participacion_toro_promedio = (sum(participacion_toro_historico) / len(participacion_toro_historico)
                                   if participacion_toro_historico else 0.0)
     
-    # 4) KPI 4: Factor de utilización promedio
-    fu_sistema_historico = []
-    fu_centrales_historico = {}
+    # 4) KPI 4: Eficiencia energética promedio (MWh/Hm³)
+    eficiencia_energetica_historico = []
     
     for kpis in kpis_historicos:
-        fu_data = kpis.get("factor_utilizacion_%", {})
-        fu_sistema_historico.append(fu_data.get("sistema", 0.0))
+        # Calcular eficiencia: Energía total / Agua total usada
+        energia_total = kpis.get("energia_total_mwh", 0.0)
+        agua_total = kpis.get("uso_real_agua_hm3", {})
+        uso_total_hm3 = agua_total.get("riego", 0.0) + agua_total.get("generacion", 0.0)
         
-        # Agregar datos por central
-        for central, fu_val in fu_data.items():
-            if central != "sistema":
-                if central not in fu_centrales_historico:
-                    fu_centrales_historico[central] = []
-                fu_centrales_historico[central].append(fu_val)
+        if uso_total_hm3 > 0:
+            eficiencia = energia_total / uso_total_hm3
+            eficiencia_energetica_historico.append(eficiencia)
     
-    fu_sistema_promedio = (sum(fu_sistema_historico) / len(fu_sistema_historico)
-                          if fu_sistema_historico else 0.0)
-    
-    fu_centrales_promedio = {}
-    for central, valores in fu_centrales_historico.items():
-        if valores:
-            fu_centrales_promedio[central] = sum(valores) / len(valores)
-    
-    factor_utilizacion_promedio = {"sistema": fu_sistema_promedio, **fu_centrales_promedio}
+    eficiencia_energetica_promedio = (
+        sum(eficiencia_energetica_historico) / len(eficiencia_energetica_historico)
+        if eficiencia_energetica_historico else 0.0
+    )
     
     # Resultados del modelo (no KPIs) - promedios históricos
     cota_mensual_historica = {}
@@ -951,11 +1014,11 @@ def extract_kpis_historicos_agregados(kpis_historicos: List[Dict[str, Any]]) -> 
         dependencia_mensual_historica[mes] = dependencia_sums[mes] / dependencia_counts[mes]
     
     return {
-        # KPIs estratégicos históricos
+        # KPIs estratégicos históricos mejorados
         "tiempo_colchones_%": tiempo_colchones_promedio,
-        "uso_presupuestos_%": uso_presupuestos_promedio,
+        "uso_real_agua_hm3": uso_real_agua_promedio,
         "participacion_toro_%": participacion_toro_promedio,
-        "factor_utilizacion_%": factor_utilizacion_promedio,
+        "eficiencia_energetica_mwh_hm3": eficiencia_energetica_promedio,
         
         # Resultados del modelo (históricos)
         "cota_mensual": cota_mensual_historica,
@@ -989,30 +1052,28 @@ def print_kpis_historicos_agregados(kpis_agregados: Dict[str, Any]) -> None:
                     "Intermedio": "🟢", "Superior": "🔵"}.get(colchon, "⚪")
             print(f"   {emoji} {colchon:11s}: {porcentaje:5.1f}% (promedio histórico)")
     
-    # KPI 2: Uso de presupuestos
-    print(f"\n💰 KPI 2 - USO PROMEDIO DE PRESUPUESTOS:")
-    presupuestos = kpis_agregados.get("uso_presupuestos_%", {})
-    uso_riego = presupuestos.get("riego", 0.0)
-    uso_gen = presupuestos.get("generacion", 0.0)
+    # KPI 2: Uso real de agua
+    print(f"\n� KPI 2 - USO REAL PROMEDIO DE AGUA:")
+    uso_agua = kpis_agregados.get("uso_real_agua_hm3", {})
+    uso_riego = uso_agua.get("riego", 0.0)
+    uso_gen = uso_agua.get("generacion", 0.0)
+    uso_total = uso_riego + uso_gen
     
-    print(f"   🌾 Riego:      {uso_riego:6.1f}% (promedio histórico)")
-    print(f"   ⚡ Generación: {uso_gen:6.1f}% (promedio histórico)")
+    print(f"   🌾 Riego:      {uso_riego:6.1f} Hm³/año (promedio histórico)")
+    print(f"   ⚡ Generación: {uso_gen:6.1f} Hm³/año (promedio histórico)")
+    print(f"   🏭 Total:      {uso_total:6.1f} Hm³/año (promedio histórico)")
     
     # KPI 3: Participación de El Toro
     print(f"\n🏭 KPI 3 - PARTICIPACIÓN PROMEDIO EL TORO:")
     participacion_toro = kpis_agregados.get("participacion_toro_%", 0.0)
     print(f"   ⚡ El Toro: {participacion_toro:6.1f}% de energía total (promedio histórico)")
     
-    # KPI 4: Factor de utilización
-    print(f"\n🏗️ KPI 4 - FACTOR DE UTILIZACIÓN PROMEDIO:")
-    fu_data = kpis_agregados.get("factor_utilizacion_%", {})
-    fu_sistema = fu_data.get("sistema", 0.0)
-    print(f"   🏭 Sistema: {fu_sistema:6.1f}% (promedio histórico)")
-    
-    # Detalle por central si está disponible
-    for central, fu in fu_data.items():
-        if central != "sistema":
-            print(f"   📍 {central}: {fu:6.1f}%")
+    # KPI 4: Eficiencia energética
+    print(f"\n⚡ KPI 4 - EFICIENCIA ENERGÉTICA PROMEDIO:")
+    eficiencia = kpis_agregados.get("eficiencia_energetica_mwh_hm3", 0.0)
+    print(f"   🔋 Sistema: {eficiencia:6.2f} MWh/Hm³ (promedio histórico)")
+    if eficiencia > 0:
+        print(f"   � Interpretación: {eficiencia:.2f} MWh por cada Hm³ de agua utilizada")
     
     # Resultados adicionales (no KPIs)
     print(f"\n📋 RESULTADOS HISTÓRICOS DEL MODELO:")

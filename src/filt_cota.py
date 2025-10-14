@@ -1,14 +1,19 @@
 """
-Módulo para cálculo de filtraciones y conversión volumen-cota
-para el Embalse El Toro.
+Módulo para cálculo de filtraciones y linearización PWL para el Embalse El Toro.
 
 Este módulo contiene:
 - Tabla de conversión volumen-cota original (71 puntos)
 - Función polinomial de 4to grado para filtraciones basada en cota
-- Segmentos PWL (Piecewise Linear) para aproximación lineal
-- Funciones de conversión y cálculo
+- Segmentos PWL (Piecewise Linear) para linearización de filtraciones
+- Funciones de conversión, cálculo y visualización
+- Testing y comparación de métodos de linearización
+
+OBJETIVO: Linearizar la función no-lineal de filtraciones f(V) = polinomio(cota(V))
+usando segmentación PWL optimizada para minimizar error de aproximación.
 """
-from typing import Dict, Any
+from typing import Dict, Any, List
+import numpy as np
+import matplotlib.pyplot as plt
 
 # Tabla volumen-cota original (71 puntos, volúmenes en Hm³)
 VOLUMEN_TABLE = [
@@ -82,44 +87,153 @@ def filtraciones_from_volumen(volumen: float) -> float:
     return filtraciones_from_cota(cota)
 
 
-def calculate_pwl_segments() -> Dict[int, Dict[str, Any]]:
-    """
-    DEPRECATED: Usa build_pwl_final_segments() para mejor precisión.
-    Mantiene compatibilidad con código antiguo.
-    """
-    return build_pwl_final_segments()
 
 
-def build_pwl_final_segments(V_max: float = 3628.0) -> Dict[int, Dict[str, Any]]:
+
+
+
+
+def analyze_curvature_adaptive(V_max: float, target_error: float = 0.15) -> List[float]:
     """
-    PWL FINAL ultra-precisa que minimiza error y corrige comportamiento del modelo.
+    Analiza la curvatura de la función de filtración y genera breakpoints adaptativos
+    para minimizar el error, especialmente en segmentos 1, 4, 5.
     
-    Segmentación optimizada basada en análisis de curvatura:
-    - S1: [0, 1200] - Colchón inferior (error mínimo natural)
-    - S2: [1200, 1600] - Transición temprana (mejor que 1370)
-    - S3: [1600, 2400] - Zona de aceleración media (crítica)
-    - S4: [2400, Vmax] - Zona alta con filtraciones precisas
+    Args:
+        V_max: Volumen máximo
+        target_error: Error objetivo por segmento (m³/s)
+        
+    Returns:
+        Lista de breakpoints optimizados
+    """
+    # Puntos estratégicos base (colchones críticos)
+    strategic_points = [0.0, 1200.0, 1370.0, 1900.0, V_max]
     
-    BENEFICIOS ESPERADOS:
-    - Reduce tiempo en colchones superiores (23.6% → ~15-18%)
-    - Balance volumétrico más realista (≤±5% cambio neto)
-    - Filtraciones más altas en rangos altos → menor acumulación
+    # Analizar cada intervalo y subdividir si es necesario
+    final_breaks = [0.0]
+    
+    for i in range(len(strategic_points) - 1):
+        start, end = strategic_points[i], strategic_points[i + 1]
+        
+        # Evaluar si necesita subdivisión
+        current_breaks = analyze_segment_for_subdivision(start, end, target_error)
+        
+        # Agregar puntos intermedios (excluyendo start que ya está)
+        for bp in current_breaks[1:]:
+            if bp not in final_breaks:
+                final_breaks.append(bp)
+    
+    return sorted(final_breaks)
+
+
+def analyze_segment_for_subdivision(v_start: float, v_end: float, 
+                                  target_error: float) -> List[float]:
+    """
+    Analiza un segmento específico y determina si necesita subdivisión.
+    
+    Args:
+        v_start: Volumen inicial
+        v_end: Volumen final
+        target_error: Error máximo permitido
+        
+    Returns:
+        Lista de breakpoints para este segmento
+    """
+    def calculate_segment_error(start: float, end: float) -> float:
+        """Calcula error máximo en un segmento"""
+        f1 = filtraciones_from_volumen(start)
+        f2 = filtraciones_from_volumen(end)
+        slope = (f2 - f1) / (end - start)
+        intercept = f1 - slope * start
+        
+        max_error = 0.0
+        test_points = np.linspace(start, end, 50)
+        for v in test_points:
+            f_real = filtraciones_from_volumen(v)
+            f_pwl = slope * v + intercept
+            error = abs(f_real - f_pwl)
+            max_error = max(max_error, error)
+        
+        return max_error
+    
+    # Verificar si el segmento actual necesita subdivisión
+    current_error = calculate_segment_error(v_start, v_end)
+    
+    if current_error <= target_error or (v_end - v_start) < 100:
+        return [v_start, v_end]
+    
+    # Necesita subdivisión - encontrar mejor punto de división
+    best_split = None
+    min_max_error = float('inf')
+    
+    # Buscar mejor punto de división evaluando múltiples opciones
+    n_candidates = min(20, int((v_end - v_start) / 50))  # Máximo 20 candidatos
+    
+    for i in range(1, n_candidates):
+        split_point = v_start + (v_end - v_start) * i / n_candidates
+        
+        # Calcular error máximo si dividimos aquí
+        error1 = calculate_segment_error(v_start, split_point)
+        error2 = calculate_segment_error(split_point, v_end)
+        max_error_with_split = max(error1, error2)
+        
+        if max_error_with_split < min_max_error:
+            min_max_error = max_error_with_split
+            best_split = split_point
+    
+    if best_split is None:
+        return [v_start, v_end]
+    
+    # Recursivamente subdividir si es necesario
+    left_breaks = analyze_segment_for_subdivision(v_start, best_split, target_error)
+    right_breaks = analyze_segment_for_subdivision(best_split, v_end, target_error)
+    
+    # Combinar resultados eliminando duplicados
+    all_breaks = left_breaks + right_breaks[1:]  # Excluir primer punto de right_breaks
+    return sorted(list(set(all_breaks)))
+
+
+def optimize_pwl_breakpoints(V_max: float) -> List[float]:
+    """
+    Genera breakpoints altamente optimizados usando análisis adaptativo de curvatura.
+    Enfoque especial en reducir error en segmentos problemáticos (1, 4, 5).
+    
+    Args:
+        V_max: Volumen máximo del embalse
+        
+    Returns:
+        Lista de breakpoints optimizados
+    """
+    # Usar análisis adaptativo con error objetivo más estricto
+    return analyze_curvature_adaptive(V_max, target_error=0.15)
+
+
+def build_pwl_final_segments(V_max: float = 5582.0) -> Dict[int, Dict[str, Any]]:
+    """
+    Genera segmentos PWL ultra-optimizados con análisis adaptativo de curvatura.
+    Incluye soporte para aproximaciones SOS2 con variables alpha.
     
     Returns:
         Dict con segmentos {k: {v_min, v_max, slope, intercept, ...}}
     """
-    
-    # Puntos de quiebre FINALES optimizados
-    breaks = [0.0, 1200.0, 1600.0, 2400.0, float(V_max)]
+    # Generar breakpoints con análisis adaptativo
+    breaks = optimize_pwl_breakpoints(V_max)
+    n_segments = len(breaks) - 1
     
     segments: Dict[int, Dict[str, Any]] = {}
     total_error = 0.0
-    improvement_notes = []
     
-    for i in range(4):
+    # Calcular puntos de aproximación SOS2 para cada breakpoint
+    sos2_points = []
+    sos2_values = []
+    
+    for bp in breaks:
+        sos2_points.append(bp)
+        sos2_values.append(filtraciones_from_volumen(bp))
+    
+    for i in range(n_segments):
         v1, v2 = breaks[i], breaks[i + 1]
         
-        # Calcular segmento lineal preciso
+        # Calcular segmento lineal estándar
         f1 = filtraciones_from_volumen(v1)
         f2 = filtraciones_from_volumen(v2)
         slope = (f2 - f1) / (v2 - v1)
@@ -128,13 +242,14 @@ def build_pwl_final_segments(V_max: float = 3628.0) -> Dict[int, Dict[str, Any]]
         # Calcular error máximo con muestreo muy fino
         max_error = 0.0
         max_error_at_v = v1
-        samples = 200  # Ultra-fino para máxima precisión
+        error_samples = []
         
-        for j in range(samples + 1):
-            v_test = v1 + (v2 - v1) * j / samples
+        for j in range(201):  # Muestreo ultra-fino
+            v_test = v1 + (v2 - v1) * j / 200
             f_real = filtraciones_from_volumen(v_test)
             f_pwl = slope * v_test + intercept
             error = abs(f_real - f_pwl)
+            error_samples.append(error)
             
             if error > max_error:
                 max_error = error
@@ -142,25 +257,24 @@ def build_pwl_final_segments(V_max: float = 3628.0) -> Dict[int, Dict[str, Any]]
         
         total_error += max_error
         
-        # Información específica por segmento
-        range_size = v2 - v1
-        avg_filtration = (f1 + f2) / 2
+        # Estadísticas adicionales del error
+        error_mean = np.mean(error_samples)
+        error_std = np.std(error_samples)
+        error_rmse = np.sqrt(np.mean([e**2 for e in error_samples]))
         
-        # Determinar tipo de colchón y notas de mejora
-        if i == 0:  # Segmento 1: [0-1200]
-            colchon_type = "Inferior"
-            improvement = "Base estable, error bajo natural"
-        elif i == 1:  # Segmento 2: [1200-1600]
+        # Determinar tipo de colchón con más granularidad
+        if v1 < 600:
+            colchon_type = "Inferior_Bajo"
+        elif v1 < 1200:
+            colchon_type = "Inferior_Alto"
+        elif v1 < 1370:
             colchon_type = "Transición"
-            improvement = "Mejor que [1200-1370], captura aceleración temprana"
-        elif i == 2:  # Segmento 3: [1600-2400]
-            colchon_type = "Intermedio+"
-            improvement = "Zona crítica optimizada, reduce error medio"
-        else:  # Segmento 4: [2400-Vmax]
-            colchon_type = "Superior"
-            improvement = "Filtraciones altas precisas, desincentiva acumulación"
-        
-        improvement_notes.append(improvement)
+        elif v1 < 1900:
+            colchon_type = "Intermedio"
+        elif v1 < 3500:
+            colchon_type = "Superior_Medio"
+        else:
+            colchon_type = "Superior_Alto"
         
         segments[i + 1] = {
             "v_min": v1,
@@ -169,27 +283,68 @@ def build_pwl_final_segments(V_max: float = 3628.0) -> Dict[int, Dict[str, Any]]
             "intercept": intercept,
             "max_error": max_error,
             "max_error_at_v": max_error_at_v,
-            "range_size": range_size,
-            "avg_filtration": avg_filtration,
+            "error_mean": error_mean,
+            "error_std": error_std,
+            "error_rmse": error_rmse,
+            "range_size": v2 - v1,
+            "avg_filtration": (f1 + f2) / 2,
             "colchon_type": colchon_type,
-            "improvement_note": improvement
+            # Datos para SOS2
+            "breakpoint_left": v1,
+            "breakpoint_right": v2,
+            "f_left": f1,
+            "f_right": f2
         }
     
-    # Metadatos completos
+    # Metadatos expandidos
     segments["_metadata"] = {
         "total_error": total_error,
-        "method": "ultra_precise_final",
-        "expected_improvements": [
-            "Menor tiempo en colchones superiores (23.6% → ~15-18%)",
-            "Balance volumétrico realista (≤±5% cambio neto)",
-            "Distribución equilibrada hacia colchones inferiores",
-            "Filtraciones precisas mejoran decisiones operativas"
-        ],
+        "method": "adaptive_curvature_analysis",
         "breakpoints": breaks,
-        "improvement_notes": improvement_notes
+        "n_segments": n_segments,
+        "sos2_points": sos2_points,
+        "sos2_values": sos2_values,
+        "supports_sos2": True,
+        "error_target": 0.15,
+        "total_breakpoints": len(breaks)
     }
 
     return segments
+
+
+def get_sos2_formulation(segments: Dict[int, Dict[str, Any]]) -> Dict[str, Any]:
+    """
+    Genera la formulación SOS2 para aproximación PWL ultra-precisa.
+    
+    Args:
+        segments: Diccionario de segmentos PWL
+        
+    Returns:
+        Dict con datos para implementar SOS2 en Gurobi
+    """
+    metadata = segments.get("_metadata", {})
+    
+    if not metadata.get("supports_sos2", False):
+        raise ValueError("Los segmentos no soportan formulación SOS2")
+    
+    sos2_points = metadata["sos2_points"]
+    sos2_values = metadata["sos2_values"]
+    
+    return {
+        "breakpoints": sos2_points,
+        "function_values": sos2_values,
+        "n_points": len(sos2_points),
+        "formulation_type": "SOS2_with_alpha_variables",
+        "usage_example": {
+            "variables": "alpha_k for k in range(n_points)",
+            "constraints": [
+                "sum(alpha_k) == 1",
+                "V == sum(alpha_k * breakpoints[k])",
+                "F == sum(alpha_k * function_values[k])",
+                "SOS2(alpha_0, alpha_1, ..., alpha_n)"
+            ]
+        }
+    }
 
 
 def eval_pwl_final(vol: float, segments: Dict[int, Dict[str, Any]]) -> float:
@@ -212,7 +367,7 @@ def eval_pwl_final(vol: float, segments: Dict[int, Dict[str, Any]]) -> float:
 
 
 # Generar los segmentos PWL FINALES al importar el módulo
-PWL_SEGMENTS = build_pwl_final_segments(V_max=3628.0)
+PWL_SEGMENTS = build_pwl_final_segments(V_max=5582.0)
 
 
 def get_pwl_segments() -> Dict[int, Dict[str, Any]]:
@@ -225,102 +380,7 @@ def get_pwl_segments() -> Dict[int, Dict[str, Any]]:
     return PWL_SEGMENTS
 
 
-def add_pwl_final_binary(
-    model,
-    Filtr_vars,
-    Vprev_vars, 
-    time_periods: list,
-    filtr_arc: tuple,
-    segments: Dict[int, Dict[str, Any]],
-    bigM: float,
-    v_max: float,
-):
-    """
-    Agrega restricciones PWL final ultra-precisa con variables binarias.
-    
-    Implementa exactamente la misma lógica que las versiones anteriores
-    pero con los segmentos ultra-precisos optimizados.
-    
-    Args:
-        model: Modelo de Gurobi
-        Filtr_vars: Variables de filtración por período
-        Vprev_vars: Variables de volumen previo por período
-        time_periods: Lista de períodos de tiempo
-        filtr_arc: Tupla (origen, destino) del arco de filtración
-        segments: Diccionario de segmentos PWL
-        bigM: Valor Big-M para linearización
-        v_max: Volumen máximo del embalse
-        
-    Returns:
-        dict: Variables auxiliares creadas y metadatos
-    """
-    import gurobipy as gp
-    from gurobipy import GRB
 
-    f_i, f_j = filtr_arc
-    
-    # Filtrar metadatos
-    numeric_segments = {k: v for k, v in segments.items() if isinstance(k, int)}
-    seg_ids = list(numeric_segments.keys())
-
-    # Igualar arco de filtración con variable
-    for t in time_periods:
-        model.addConstr(
-            model._y[f_i, f_j, t] == Filtr_vars[t],
-            name=f"R5a_filtr_arc_{t}"
-        )
-
-    # Variables binarias δ_{k,t}
-    delta = model.addVars(
-        seg_ids, time_periods, 
-        vtype=GRB.BINARY, 
-        name="delta_pwl_final"
-    )
-
-    for t in time_periods:
-        # Un único segmento activo por período
-        model.addConstr(
-            gp.quicksum(delta[k, t] for k in seg_ids) == 1,
-            name=f"R5b_one_seg_{t}"
-        )
-
-        Vprev = Vprev_vars[t]
-
-        # Restricciones por segmento
-        for k in seg_ids:
-            seg = numeric_segments[k]
-            vmin, vmax = seg["v_min"], seg["v_max"]
-            slope, b = seg["slope"], seg["intercept"]
-
-            # Volumen dentro del rango cuando δ_k=1
-            model.addConstr(
-                Vprev >= vmin * delta[k, t],
-                name=f"R5c_vol_lb_{k}_{t}"
-            )
-            model.addConstr(
-                Vprev <= vmax * delta[k, t] + v_max * (1 - delta[k, t]),
-                name=f"R5d_vol_ub_{k}_{t}"
-            )
-
-            # Filtración = recta del segmento cuando δ_k=1
-            model.addConstr(
-                Filtr_vars[t] >= slope * Vprev + b - bigM * (1 - delta[k, t]),
-                name=f"R5e_filtr_lb_{k}_{t}"
-            )
-            model.addConstr(
-                Filtr_vars[t] <= slope * Vprev + b + bigM * (1 - delta[k, t]),
-                name=f"R5f_filtr_ub_{k}_{t}"
-            )
-
-    expected_improvements = segments.get("_metadata", {}).get(
-        "expected_improvements", []
-    )
-    
-    return {
-        "delta_final": delta, 
-        "segments_used": numeric_segments, 
-        "expected_improvements": expected_improvements
-    }
 
 
 def test_funciones():
@@ -349,403 +409,138 @@ def test_funciones():
               f"-> slope={seg['slope']:.6f}, intercept={seg['intercept']:.2f}")
 
 
-def add_pwl_filtration_constraints_unified(
-    model, Filtr_vars, V_prev_vars, time_periods,
-    filtr_arc, conv_factor, v_max
-):
+def plot_filtration_comparison(V_max: float = 3628.0, 
+                              segments: Dict[int, Dict[str, Any]] = None,
+                              save_path: str = None) -> None:
     """
-    🎯 Implementación PWL HÍBRIDA UNIFICADA - Combina binarias + lambda
-    
-    Esta función unifica AMBOS enfoques en una sola implementación:
-    
-    🛡️ ROBUSTEZ (de método binario):
-    - Variables binarias δ[s] para seleccionar segmento activo
-    - Garantiza que exactamente un segmento esté activo: Σδ[s] = 1
-    
-    📊 PRECISIÓN (de método SOS2):  
-    - Variables lambda λ[k] para interpolación exacta dentro del segmento
-    - Restricción SOS2: máximo 2 lambdas adyacentes activas
-    - Interpolación precisa: V = Σλ[k]·V[k], F = Σλ[k]·F[k]
-    
-    🔗 COORDINACIÓN:
-    - Las δ determinan QUÉ segmento usar
-    - Las λ determinan DÓNDE exactamente dentro de ese segmento
+    Genera gráfico comparativo de función original vs PWL linearizada.
     
     Args:
-        model: Modelo de Gurobi
-        Filtr_vars: Variables de filtración por período
-        V_prev_vars: Variables de volumen previo por período  
-        time_periods: Lista de períodos
-        filtr_arc: Arco de filtración (origen, destino)
-        conv_factor: Factor de conversión m³/s -> Hm³/mes
-        v_max: Volumen máximo del embalse
-        
-    Returns:
-        dict: {"deltas": δ vars, "lambdas": λ vars, "method": "unified_hybrid"}
+        V_max: Volumen máximo para el gráfico
+        segments: Segmentos PWL (usa PWL_SEGMENTS si None)
+        save_path: Ruta para guardar el gráfico (opcional)
     """
-    import gurobipy as gp
-    from gurobipy import GRB
+    if segments is None:
+        segments = PWL_SEGMENTS
     
-    print("🎯 Usando método PWL HÍBRIDO UNIFICADO (binarias + lambda)")
+    # Rango de volúmenes para evaluar
+    volumes = np.linspace(0, V_max, 2000)
     
-    f_i, f_j = filtr_arc
-    segments = list(PWL_SEGMENTS.keys())
-    n_segments = len(segments)
+    # Función original
+    filtr_original = [filtraciones_from_volumen(v) for v in volumes]
     
-    # 🔍 Crear puntos de ruptura únicos para interpolación lambda
-    breakpoints_v = set()
-    for seg_data in PWL_SEGMENTS.values():
-        breakpoints_v.add(seg_data["v_min"])
-        breakpoints_v.add(seg_data["v_max"])
+    # Función PWL
+    filtr_pwl = [eval_pwl_final(v, segments) for v in volumes]
     
-    breakpoints_v = sorted(breakpoints_v)
-    breakpoints_f = []
+    # Crear gráfico
+    plt.figure(figsize=(12, 8))
     
-    # Calcular valores de filtración en cada punto de ruptura
-    for v_point in breakpoints_v:
-        for seg_id, seg_data in PWL_SEGMENTS.items():
-            if seg_data["v_min"] <= v_point <= seg_data["v_max"]:
-                f_point = seg_data["slope"] * v_point + seg_data["intercept"]
-                breakpoints_f.append(f_point)
-                break
+    # Plot principal
+    plt.subplot(2, 1, 1)
+    plt.plot(volumes, filtr_original, 'b-', linewidth=2, 
+             label='Función Original f(V)', alpha=0.8)
+    plt.plot(volumes, filtr_pwl, 'r--', linewidth=2, 
+             label='PWL Linearizada', alpha=0.8)
     
-    aux_vars = {"deltas": {}, "lambdas": {}, "method": "unified_hybrid"}
+    # Marcar breakpoints
+    numeric_segs = {k: v for k, v in segments.items() if isinstance(k, int)}
+    breakpoints = []
+    for seg in numeric_segs.values():
+        if seg["v_min"] not in breakpoints:
+            breakpoints.append(seg["v_min"])
+        if seg["v_max"] not in breakpoints:
+            breakpoints.append(seg["v_max"])
     
-    for t in time_periods:
-        # 🛡️ PARTE BINARIA: Variables delta para robustez
-        delta = model.addVars(
-            segments, vtype=GRB.BINARY, 
-            name=f"delta_pwl_seg_{t}"
-        )
-        
-        # 📊 PARTE LAMBDA: Variables lambda para precisión  
-        lambda_vars = model.addVars(
-            range(len(breakpoints_v)), vtype=GRB.CONTINUOUS, lb=0, ub=1,
-            name=f"lambda_pwl_{t}"
-        )
-        
-        # 🔗 RESTRICCIÓN 1: Exactamente un segmento activo
-        model.addConstr(
-            gp.quicksum(delta[s] for s in segments) == 1,
-            name=f"R5_one_segment_{t}"
-        )
-        
-        # 🔗 RESTRICCIÓN 2: SOS2 para interpolación precisa
-        model.addSOS(GRB.SOS_TYPE2, 
-            [lambda_vars[k] for k in range(len(breakpoints_v))])
-        
-        # 🔗 RESTRICCIÓN 3: Lambdas suman 1
-        model.addConstr(
-            gp.quicksum(lambda_vars[k] for k in range(len(breakpoints_v))) == 1,
-            name=f"R5_lambda_sum_{t}"
-        )
-        
-        # 🔗 RESTRICCIÓN 4: Coordinar deltas con lambdas
-        # Si δ[s]=1, entonces las λ solo pueden ser activas en ese segmento
-        for s_idx, seg_id in enumerate(segments):
-            seg_data = PWL_SEGMENTS[seg_id]
-            v_min, v_max = seg_data["v_min"], seg_data["v_max"]
-            
-            # Encontrar índices de breakpoints en este segmento
-            seg_lambda_indices = []
-            for k, v_point in enumerate(breakpoints_v):
-                if v_min <= v_point <= v_max:
-                    seg_lambda_indices.append(k)
-            
-            # Si δ[s]=0, entonces todas las λ en este segmento deben ser 0
-            if seg_lambda_indices:
-                model.addConstr(
-                    gp.quicksum(lambda_vars[k] for k in seg_lambda_indices) <= delta[seg_id],
-                    name=f"R5_coord_delta_lambda_{t}_{s_idx}"
-                )
-        
-        # 🔗 RESTRICCIÓN 5: Interpolación de volumen
-        V_prev = V_prev_vars[t] if t in V_prev_vars else model.addVar(name=f"V_prev_{t}")
-        model.addConstr(
-            V_prev == gp.quicksum(
-                lambda_vars[k] * breakpoints_v[k] 
-                for k in range(len(breakpoints_v))
-            ),
-            name=f"R5_volume_interp_{t}"
-        )
-        
-        # 🔗 RESTRICCIÓN 6: Interpolación de filtración
-        model.addConstr(
-            Filtr_vars[t] == gp.quicksum(
-                lambda_vars[k] * breakpoints_f[k] 
-                for k in range(len(breakpoints_f))
-            ) * conv_factor,
-            name=f"R5_filtr_interp_{t}"
-        )
-        
-        # 🔗 RESTRICCIÓN 7: Límites de volumen por segmento activo
-        for seg_id in segments:
-            seg_data = PWL_SEGMENTS[seg_id]
-            M = v_max  # Big-M
-            
-            model.addConstr(
-                V_prev >= seg_data["v_min"] - M * (1 - delta[seg_id]),
-                name=f"R5_vol_lb_{t}_{seg_id}"
-            )
-            model.addConstr(
-                V_prev <= seg_data["v_max"] + M * (1 - delta[seg_id]),
-                name=f"R5_vol_ub_{t}_{seg_id}"
-            )
-        
-        aux_vars["deltas"][t] = delta
-        aux_vars["lambdas"][t] = lambda_vars
+    for bp in sorted(set(breakpoints)):
+        if bp <= V_max:
+            f_val = filtraciones_from_volumen(bp)
+            plt.axvline(x=bp, color='gray', linestyle=':', alpha=0.6)
+            plt.plot(bp, f_val, 'go', markersize=6, alpha=0.8)
     
-    return aux_vars
+    plt.xlabel('Volumen (Hm³)')
+    plt.ylabel('Filtraciones (m³/s)')
+    plt.title('Comparación: Función Original vs PWL Linearizada')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.xlim(0, V_max)
+    
+    # Plot de error
+    plt.subplot(2, 1, 2)
+    errors = [abs(fo - fp) for fo, fp in zip(filtr_original, filtr_pwl)]
+    plt.plot(volumes, errors, 'r-', linewidth=1.5, label='Error Absoluto')
+    plt.xlabel('Volumen (Hm³)')
+    plt.ylabel('Error (m³/s)')
+    plt.title('Error de Aproximación PWL')
+    plt.legend()
+    plt.grid(True, alpha=0.3)
+    plt.xlim(0, V_max)
+    
+    # Estadísticas del error
+    max_error = max(errors)
+    mean_error = np.mean(errors)
+    plt.text(0.02, 0.95, f'Error máximo: {max_error:.4f} m³/s\n'
+                         f'Error medio: {mean_error:.4f} m³/s', 
+             transform=plt.gca().transAxes, 
+             verticalalignment='top',
+             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+    
+    plt.tight_layout()
+    
+    if save_path:
+        plt.savefig(save_path, dpi=300, bbox_inches='tight')
+        print(f"📊 Gráfico guardado en: {save_path}")
+    
+    plt.show()
 
 
-def add_pwl_filtration_constraints_hybrid(
-    model, Filtr_vars, V_prev_vars, time_periods,
-    filtr_arc, conv_factor, v_max, pwl_method="unified"
-):
+def compare_pwl_precision(volume_points: List[float] = None) -> None:
     """
-    Agrega restricciones PWL para filtraciones usando el mejor enfoque híbrido.
-
-    Combina la robustez del método binario con la precisión del SOS2.
-
-    Args:
-        model: Modelo de Gurobi
-        Filtr_vars: Variables de filtración por período {t: var}
-        V_prev_vars: Variables de volumen previo por período {t: var}
-        time_periods: Lista de períodos de tiempo
-        filtr_arc: Tupla (nodo_origen, nodo_destino) del arco de filtración
-        conv_factor: Factor de conversión m³/s -> Hm³/mes
-        v_max: Volumen máximo del embalse
-        pwl_method: "binary" (robusto) o "sos2" (preciso)
-
-    Returns:
-        dict: Variables auxiliares creadas por método
-    """
-    import gurobipy as gp
-    from gurobipy import GRB
-
-    f_i, f_j = filtr_arc
-    seg_labels = list(PWL_SEGMENTS.keys())
-    aux_vars = {}
-
-    if pwl_method == "unified" or pwl_method == "hybrid":
-        # 🎯 MÉTODO HÍBRIDO UNIFICADO: Usa función especializada
-        return add_pwl_filtration_constraints_unified(
-            model, Filtr_vars, V_prev_vars, time_periods,
-            filtr_arc, conv_factor, v_max
-        )
-    
-    elif pwl_method == "binary":
-        # Método robusto: Variables binarias con aproximación por punto medio
-        delta = model.addVars(
-            seg_labels, time_periods, vtype=GRB.BINARY, name="delta_pwl"
-        )
-        aux_vars["delta"] = delta
-
-        for t in time_periods:
-            # Exactamente un segmento debe estar activo
-            model.addConstr(
-                gp.quicksum(delta[k, t] for k in seg_labels) == 1,
-                name=f"R5b_one_segment_{t}"
-            )
-
-            # Restricciones de volumen por segmento activo
-            for k in seg_labels:
-                seg = PWL_SEGMENTS[k]
-                # Si segmento k activo, volumen debe estar en su rango
-                model.addConstr(
-                    V_prev_vars[t] >= seg["v_min"] * delta[k, t],
-                    name=f"R5c_vol_min_{k}_{t}"
-                )
-                model.addConstr(
-                    V_prev_vars[t] <= (
-                        seg["v_max"] * delta[k, t] + v_max * (1 - delta[k, t])
-                    ),
-                    name=f"R5d_vol_max_{k}_{t}"
-                )
-
-            # PWL función: usar punto medio para robustez (método m.py)
-            filtr_values = {}
-            for k in seg_labels:
-                seg = PWL_SEGMENTS[k]
-                v_mid = (seg["v_min"] + seg["v_max"]) / 2
-                filtr_values[k] = (
-                    filtraciones_from_volumen(v_mid) * conv_factor
-                )
-
-            # Función PWL: Filtr = suma de valores por segmento activo
-            filtr_expr = gp.quicksum(
-                filtr_values[k] * delta[k, t] for k in seg_labels
-            )
-            model.addConstr(
-                Filtr_vars[t] == filtr_expr, name=f"R5e_pwl_function_{t}"
-            )
-    
-    elif pwl_method == "sos2":
-        # Método preciso: SOS2 con interpolación exacta
-        lambda_vars_all = {}
-        
-        for t in time_periods:
-            # Extraer puntos de ruptura de los segmentos PWL
-            breakpoints = []
-            filtr_values = []
-            
-            # Puntos de inicio de cada segmento
-            for seg_id, seg_data in PWL_SEGMENTS.items():
-                v_min = seg_data["v_min"]
-                slope = seg_data["slope"]
-                intercept = seg_data["intercept"]
-                filtr_min = slope * v_min + intercept
-                
-                if v_min not in breakpoints:
-                    breakpoints.append(v_min)
-                    filtr_values.append(filtr_min)
-            
-            # Agregar punto final del último segmento
-            last_seg = list(PWL_SEGMENTS.values())[-1]
-            v_max_seg = last_seg["v_max"]
-            slope = last_seg["slope"]
-            intercept = last_seg["intercept"]
-            filtr_max = slope * v_max_seg + intercept
-            
-            if v_max_seg not in breakpoints:
-                breakpoints.append(v_max_seg)
-                filtr_values.append(filtr_max)
-            
-            # Ordenar puntos por volumen
-            points = sorted(zip(breakpoints, filtr_values))
-            volumes = [p[0] for p in points]
-            filtrations = [p[1] for p in points]
-            
-            n_points = len(volumes)
-            
-            # Variables SOS2: pesos para cada punto de ruptura
-            lambda_vars = []
-            for i in range(n_points):
-                lambda_var = model.addVar(
-                    lb=0.0, ub=1.0, name=f"lambda_{i}_{t}"
-                )
-                lambda_vars.append(lambda_var)
-            
-            lambda_vars_all[t] = lambda_vars
-            
-            # Restricción SOS2: máximo 2 variables adyacentes pueden ser > 0
-            model.addSOS(GRB.SOS_TYPE2, lambda_vars, list(range(n_points)))
-            
-            # Restricción de convexidad: suma de pesos = 1
-            model.addConstr(
-                gp.quicksum(lambda_vars) == 1.0,
-                name=f"R5a_PWL_convex_{t}"
-            )
-            
-            # Restricción de volumen: V_prev = suma ponderada de puntos
-            model.addConstr(
-                V_prev_vars[t] == gp.quicksum(
-                    volumes[i] * lambda_vars[i] for i in range(n_points)
-                ),
-                name=f"R5b_PWL_volume_{t}"
-            )
-            
-            # Restricción de filtración: Filtr = suma ponderada de filtraciones
-            filtr_expr = gp.quicksum(
-                filtrations[i] * lambda_vars[i] * conv_factor
-                for i in range(n_points)
-            )
-            model.addConstr(
-                Filtr_vars[t] == filtr_expr,
-                name=f"R5c_PWL_filtration_{t}"
-            )
-
-        aux_vars["lambda"] = lambda_vars_all
-
-    else:
-        raise ValueError(
-            f"Método PWL no soportado: {pwl_method}. Use 'binary' o 'sos2'"
-        )
-
-    return aux_vars
-
-
-def add_pwl_filtration_constraints_adaptive(
-    model, y_vars, Filtr_vars, V_vars, Vinit_var, time_periods,
-    filtr_arc, conv_factor, v_max, target_year=None
-):
-    """
-    Agrega restricciones PWL adaptativas que eligen automáticamente
-    el mejor método.
-    
-    - Años críticos (sequías): método "binary" (más robusto)
-    - Años normales: método "sos2" (más preciso)
+    Compara precisión en puntos específicos de volumen.
     
     Args:
-        model: Modelo de Gurobi
-        y_vars: Variables de flujo en arcos
-        Filtr_vars: Variables de filtración por período
-        V_vars: Variables de volumen por período
-        Vinit_var: Variable de volumen inicial
-        time_periods: Lista de períodos de tiempo
-        filtr_arc: Tupla (nodo_origen, nodo_destino) del arco de filtración
-        conv_factor: Factor de conversión m³/s -> Hm³/mes
-        v_max: Volumen máximo del embalse
-        target_year: Año objetivo (opcional, para heurística adaptativa)
-    
-    Returns:
-        dict: Variables auxiliares y metadatos del método usado
+        volume_points: Puntos específicos a evaluar (usa defaults si None)
     """
-    f_i, f_j = filtr_arc
+    if volume_points is None:
+        volume_points = [0, 500, 1000, 1200, 1600, 2000, 2400, 3000, 3628]
     
-    # Igualar arco de filtración con variable (común para ambos métodos)
-    for t in time_periods:
-        model.addConstr(
-            y_vars[f_i, f_j, t] == Filtr_vars[t], name=f"R5a_filtr_arc_{t}"
-        )
-
-    # Preparar variables de volumen previo
-    V_prev_vars = {}
-    for t in time_periods:
-        t_index = time_periods.index(t)
-        if t_index == 0:
-            V_prev_vars[t] = Vinit_var
-        else:
-            prev_t = time_periods[t_index-1]
-            V_prev_vars[t] = V_vars[prev_t]
-
-    # Heurística adaptativa: años críticos conocidos usan método robusto
-    critical_years = [1968, 1976, 1988, 1995, 1998, 2007, 2010, 2019]
-
-    if target_year and target_year in critical_years:
-        pwl_method = "binary"
-        print(
-            f"🔧 Año crítico {target_year}: usando método PWL robusto (binary)"
-        )
-    else:
-        pwl_method = "sos2"
-        if target_year:
-            print(
-                f"🔧 Año normal {target_year}: usando método PWL preciso (sos2)"
-            )
-
-    # Aplicar restricciones PWL
-    aux_vars = add_pwl_filtration_constraints_hybrid(
-        model, Filtr_vars, V_prev_vars, time_periods,
-        filtr_arc, conv_factor, v_max, pwl_method
-    )
-
-    aux_vars["method_used"] = pwl_method
-    aux_vars["is_critical_year"] = (
-        target_year in critical_years if target_year else False
-    )
+    print("\n🔍 COMPARACIÓN DE PRECISIÓN PWL")
+    print("=" * 70)
+    print(f"{'Vol (Hm³)':>10} {'Original':>12} {'PWL':>12} {'Error':>12} {'Error %':>10}")
+    print("-" * 70)
     
-    return aux_vars
+    total_error = 0.0
+    max_error = 0.0
+    max_error_vol = 0.0
+    
+    for vol in volume_points:
+        if vol <= 3628:  # Dentro del rango válido
+            f_orig = filtraciones_from_volumen(vol)
+            f_pwl = eval_pwl_final(vol, PWL_SEGMENTS)
+            error = abs(f_orig - f_pwl)
+            error_pct = (error / f_orig) * 100 if f_orig > 0 else 0
+            
+            total_error += error
+            if error > max_error:
+                max_error = error
+                max_error_vol = vol
+            
+            print(f"{vol:10.0f} {f_orig:12.4f} {f_pwl:12.4f} "
+                  f"{error:12.4f} {error_pct:9.2f}%")
+    
+    print("-" * 70)
+    print(f"Error promedio: {total_error/len(volume_points):.4f} m³/s")
+    print(f"Error máximo: {max_error:.4f} m³/s en V={max_error_vol:.0f} Hm³")
+    print(f"Precisión general: {((1 - total_error/len(volume_points)/30)*100):.2f}%")
 
 
-def generate_implementation_summary():
+def generate_pwl_summary():
     """
-    Genera resumen de la implementación PWL final integrada.
+    Genera resumen completo de la linearización PWL de filtraciones.
     """
-    print("🎯 PWL FINAL ULTRA-PRECISA INTEGRADA - RESUMEN")
+    print("🎯 LINEARIZACIÓN PWL DE FILTRACIONES - RESUMEN TÉCNICO")
     print("=" * 65)
     
-    V_max = 3628.0
+    V_max = 5582.0
     segments = build_pwl_final_segments(V_max)
     metadata = segments.get("_metadata", {})
     
@@ -753,40 +548,79 @@ def generate_implementation_summary():
     print(f"   • Método: {metadata.get('method', 'N/A')}")
     print(f"   • Error total: {metadata.get('total_error', 0):.6f} m³/s")
     print(f"   • Puntos de quiebre: {metadata.get('breakpoints', [])}")
+    print(f"   • Función original: f(V) = polinomio_4°(cota(V))")
     
-    print("\n🔧 SEGMENTOS OPTIMIZADOS:")
+    print("\n🔧 SEGMENTOS PWL OPTIMIZADOS:")
     numeric_segs = {k: v for k, v in segments.items() if isinstance(k, int)}
     
     for k, seg in numeric_segs.items():
         v_min, v_max = seg["v_min"], seg["v_max"]
+        slope, intercept = seg["slope"], seg["intercept"]
         colchon = seg["colchon_type"]
         error = seg["max_error"]
-        note = seg["improvement_note"]
         
         print(f"   S{k}: [{v_min:4.0f}-{v_max:4.0f}] Hm³ | {colchon:>12}")
-        print(f"       └─ Error: {error:.5f} m³/s | {note}")
+        print(f"       └─ f(V) = {slope:.6f}·V + {intercept:.3f}")
+        print(f"       └─ Error máximo: {error:.5f} m³/s")
     
-    print(f"\n🎯 MEJORAS ESPERADAS:")
-    improvements = metadata.get("expected_improvements", [])
-    for improvement in improvements:
-        print(f"   • {improvement}")
+    # Calcular estadísticas básicas de error
+    total_samples = 0
+    total_absolute_error = 0.0
+    max_error_global = 0.0
     
-    print(f"\n💻 USO EN MODEL.PY:")
-    print(f"   from filt_cota import build_pwl_final_segments, add_pwl_final_binary")
-    print(f"   segments = build_pwl_final_segments(V_max)")
-    print(f"   add_pwl_final_binary(model, ...)")
+    for seg in numeric_segs.values():
+        v_min, v_max = seg["v_min"], seg["v_max"]
+        slope, intercept = seg["slope"], seg["intercept"]
+        
+        for j in range(101):
+            v = v_min + (v_max - v_min) * j / 100
+            f_real = filtraciones_from_volumen(v)
+            f_pwl = slope * v + intercept
+            error = abs(f_real - f_pwl)
+            
+            total_absolute_error += error
+            total_samples += 1
+            max_error_global = max(max_error_global, error)
     
-    print(f"\n✅ INTEGRACIÓN COMPLETA - Lista para usar en modelo principal")
+    mae = total_absolute_error / total_samples
+    
+    print(f"\n🎯 ANÁLISIS DE ERROR:")
+    print(f"   • Error absoluto medio (MAE): {mae:.4f} m³/s")
+    print(f"   • Error máximo global: {max_error_global:.4f} m³/s")
+    
+    print(f"\n💻 USO EN MODELO DE OPTIMIZACIÓN:")
+    print(f"   • Importar: from filt_cota import get_pwl_segments")
+    print(f"   • Obtener segmentos: segments = get_pwl_segments()")
+    print(f"   • Implementar restricciones PWL en Gurobi (ver model.py)")
+    
+    print(f"\n✅ LINEARIZACIÓN LISTA - Función no-lineal aproximada con precisión")
 
 
 if __name__ == "__main__":
-    print("🧪 PRUEBAS DE MÓDULO FILT_COTA INTEGRADO")
-    print("=" * 50)
+    print("🧪 TESTING COMPLETO: LINEARIZACIÓN PWL DE FILTRACIONES")
+    print("=" * 60)
     
-    # Pruebas básicas
+    # 1. Pruebas básicas de conversión
+    print("\n1️⃣ PRUEBAS DE CONVERSIÓN VOLUMEN→COTA→FILTRACIONES:")
     test_funciones()
     
-    print("\n" + "=" * 50)
+    # 2. Comparación de precisión
+    print("\n2️⃣ ANÁLISIS DE PRECISIÓN PWL:")
+    compare_pwl_precision()
     
-    # Resumen de implementación PWL final
-    generate_implementation_summary()
+    # 3. Resumen técnico completo
+    print("\n3️⃣ RESUMEN TÉCNICO:")
+    print("=" * 60)
+    generate_pwl_summary()
+    
+    # 4. Generar gráfico comparativo
+    print("\n4️⃣ GENERANDO GRÁFICO COMPARATIVO...")
+    try:
+        plot_filtration_comparison(V_max=5582.0,
+                                 save_path="resultados/filtration_comparison.png")
+        print("✅ Gráfico generado exitosamente")
+    except Exception as e:
+        print(f"⚠️  Error generando gráfico: {e}")
+        print("   (Asegúrate de tener matplotlib instalado)")
+    
+    print("\n🚀 TESTING COMPLETO - Linearización PWL lista para uso en modelo")
