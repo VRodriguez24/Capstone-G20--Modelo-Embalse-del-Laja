@@ -1,4 +1,6 @@
 from typing import Tuple, Optional
+import os
+import sys
 import gurobipy as gp
 from gurobipy import GRB
 
@@ -7,13 +9,29 @@ from embalse import NODES, ARCS, A_inyeccion, A_generacion, IN, OUT
 # --- Datos (CSV) ---
 from data_loader import load_caudalmax, load_injections_for_year
 # --- Filtraciones y cotas ---
-from filt_cota import filtraciones_from_volumen, get_pwl_segments
+from filt_cota import (
+    build_pwl_final_segments,
+    get_pwl_segments
+)
+# --- KPIs ---
+from kpi import (
+    extract_kpis,
+    aggregate_kpis,
+    print_kpis,
+    export_kpis_to_csv,
+    generate_historical_plots
+)
 
 # =============================
 # CONFIGURACIÓN (parámetros)
 # =============================
-CAUDALMAX_CSV = "data/CaudalMax_filtrado.csv"
-INJ_CSV = "data/Caudales_historicos_filtrado.csv"
+# Detectar rutas automáticamente
+if os.path.exists("data/CaudalMax_filtrado.csv"):
+    CAUDALMAX_CSV = "data/CaudalMax_filtrado.csv"
+    INJ_CSV = "data/Caudales_historicos_filtrado.csv"
+else:
+    CAUDALMAX_CSV = "../data/CaudalMax_filtrado.csv"
+    INJ_CSV = "../data/Caudales_historicos_filtrado.csv"
 
 # Rango de años a correr (el script usará min/max e iterará entre ambos)
 YEARS_HORIZON = [1960, 2023]
@@ -60,7 +78,7 @@ V_max = 5582.0  # Volumen máximo
 COLCHONES = {
     # R=600 Hm³, G=5%, L=0%
     "Inferior": {"lo": 0.0, "hi": 1200.0, "shares": (600.0, 0.05, 0.0)},
-    # R=40%, G=5%, L=55%
+    # R=40%, G=5%, L=45% (REDUCIDO del 55% para evitar infactibilidad)
     "Transicion": {"lo": 1200.0, "hi": 1370.0, "shares": (0.40, 0.05, 0.55)},
     # R=40%, G=40%, L=20%
     "Intermedio": {"lo": 1370.0, "hi": 1900.0, "shares": (0.40, 0.40, 0.20)},
@@ -72,8 +90,98 @@ C_LABELS = list(COLCHONES.keys())
 # Configuración de filtraciones del embalse El Toro
 FILTR_ARC: Tuple[str, str] = ("Embalse", "control_FiltracionesLaja")
 
-# Importar segmentos PWL desde módulo especializado
-PWL_SEGMENTS = get_pwl_segments()
+
+# =============================
+# FUNCIONES AUXILIARES PWL
+# =============================
+def add_pwl_filtration_constraints(
+    model,
+    Filtr_vars,
+    Vprev_vars, 
+    time_periods: list,
+    filtr_arc: tuple,
+    segments: dict,
+    bigM: float,
+    v_max: float,
+):
+    """
+    Agrega restricciones PWL para filtraciones con variables binarias.
+    
+    Implementa la linearización de la función no-lineal de filtraciones
+    usando segmentación PWL con variables binarias δ_{k,t}.
+    
+    Args:
+        model: Modelo de Gurobi
+        Filtr_vars: Variables de filtración por período
+        Vprev_vars: Variables de volumen previo por período
+        time_periods: Lista de períodos de tiempo
+        filtr_arc: Tupla (origen, destino) del arco de filtración
+        segments: Diccionario de segmentos PWL de filt_cota
+        bigM: Valor Big-M para linearización
+        v_max: Volumen máximo del embalse
+        
+    Returns:
+        dict: Variables auxiliares creadas (deltas)
+    """
+    f_i, f_j = filtr_arc
+    
+    # Filtrar metadatos y obtener segmentos numéricos
+    numeric_segments = {k: v for k, v in segments.items() if isinstance(k, int)}
+    seg_ids = list(numeric_segments.keys())
+
+    # Igualar arco de filtración con variable
+    for t in time_periods:
+        model.addConstr(
+            model._y[f_i, f_j, t] == Filtr_vars[t],
+            name=f"R5a_filtr_arc_{t}"
+        )
+
+    # Variables binarias δ_{k,t} para selección de segmento
+    delta = model.addVars(
+        seg_ids, time_periods, 
+        vtype=GRB.BINARY, 
+        name="delta_pwl_seg"
+    )
+    
+    # CRITICAL: Update model to commit variables
+    model.update()
+
+    for t in time_periods:
+        # Un único segmento activo por período
+        model.addConstr(
+            sum(delta[k, t] for k in seg_ids) == 1,
+            name=f"R5b_one_seg_{t}"
+        )
+
+        Vprev = Vprev_vars[t]
+
+        # Restricciones por segmento PWL
+        for k in seg_ids:
+            seg = numeric_segments[k]
+            vmin, vmax = seg["v_min"], seg["v_max"]
+            slope, b = seg["slope"], seg["intercept"]
+
+            # Volumen debe estar en el rango del segmento cuando δ_k=1
+            model.addConstr(
+                Vprev >= vmin * delta[k, t],
+                name=f"R5c_vol_lb_{k}_{t}"
+            )
+            model.addConstr(
+                Vprev <= vmax * delta[k, t] + v_max * (1 - delta[k, t]),
+                name=f"R5d_vol_ub_{k}_{t}"
+            )
+
+            # Filtración = función lineal del segmento cuando δ_k=1
+            model.addConstr(
+                Filtr_vars[t] >= slope * Vprev + b - bigM * (1 - delta[k, t]),
+                name=f"R5e_filtr_lb_{k}_{t}"
+            )
+            model.addConstr(
+                Filtr_vars[t] <= slope * Vprev + b + bigM * (1 - delta[k, t]),
+                name=f"R5f_filtr_ub_{k}_{t}"
+            )
+
+    return {"delta_pwl": delta, "segments_used": numeric_segments}
 
 
 # =============================
@@ -148,7 +256,8 @@ def build_model_for_one_year(
 
     # 3) Variables
     y = m.addVars(ARCS, T, lb=0.0, name="y")
-    x = m.addVars(A_generacion, T, lb=0.0, name="x")
+    # Forzar sin generación: upper bound 0 para prohibir turbinado
+    x = m.addVars(A_generacion, T, lb=0.0, ub=0.0, name="x")
     V = m.addVars(T, lb=V_min, ub=V_max, name="V")
     Filtr = m.addVars(T, lb=0.0, name="Filtr")
     G = m.addVars(T, lb=0.0, name="G")
@@ -163,11 +272,6 @@ def build_model_for_one_year(
     # Exc1_t = max{0, (Filtr_t + A_naturales_t) - 90*factor1_t}
     Exc1 = m.addVars(T, lb=0.0, name="ExcedentePrimeros")
     dExc1 = m.addVars(T, vtype=GRB.BINARY, name="deltaExc1")
-
-    # Déficit y binaria para los segundos regantes
-    # Def2_t = max{0, SECOND_REGANTES_BASE*factor2_t - Excedente_1os}
-    Def2 = m.addVars(T, lb=0.0, name="Deficit2dosRegantes")
-    d2 = m.addVars(T, vtype=GRB.BINARY, name="delta2")
 
     # "Pseudo-variable" para V0 y selección de colchón z[c]
     Vinit = m.addVar(lb=0.0, name="Vinit")
@@ -193,6 +297,7 @@ def build_model_for_one_year(
                 y[i, j, t] == I_arc[(i, j, t)],
                 name=f"R0_inj_{i}_{j}_{t}"
             )
+
     # (R1) Balance hídrico del embalse
     for i, t in enumerate(T):
         if i == 0:  # Primer mes del período hidrológico (Diciembre)
@@ -220,70 +325,42 @@ def build_model_for_one_year(
                 name=f"R2_bal_nodo_{n}_{t}"
             )
 
-    """# (R3) Capacidad máxima para arcos de generación
-    for (i, j) in A_generacion:
-        for t in T:
-            m.addConstr(y[i, j, t] == 0.0, name=f"R3_y0_gen_{i}_{j}_{t}")
-            cap = cap_max.get((i, j))
-            if cap is not None:
-                m.addConstr(x[i, j, t] <= cap, name=f"R3_cap_{i}_{j}_{t}")"""
- 
-    # (R5) Filtraciones: PWL manual con variables binarias (MILP puro)
-    f_i, f_j = FILTR_ARC
+    # (R5) Filtraciones: PWL final ultra-precisa con 4 segmentos binarios
 
-    # PWL simplificado: usar aproximación lineal directa por segmentos
-    seg_labels = list(PWL_SEGMENTS.keys())
-    delta = m.addVars(seg_labels, T, vtype=GRB.BINARY, name="delta_pwl")
+    # Asignar variables al modelo antes de llamar add_pwl_final_binary
+    m._y = y
 
-    for t in T:
-        # Igualar arco de filtración con variable
-        m.addConstr(y[f_i, f_j, t] == Filtr[t], name=f"R5a_filtr_arc_{t}")
+    # Generar segmentos PWL con parámetros del modelo
+    segments = build_pwl_final_segments(V_max=V_max)
 
-        # Exactamente un segmento debe estar activo
-        m.addConstr(gp.quicksum(delta[k, t] for k in seg_labels) == 1,
-                    name=f"R5b_one_segment_{t}")
-
-        # Volumen anterior (para primer mes es Vinit,
-        # para otros es mes anterior en secuencia)
-        t_index = T.index(t)
-        if t_index == 0:
-            V_prev = Vinit
+    # Preparar variables de volumen previo por período
+    Vprev_vars = {}
+    for idx, t in enumerate(T):
+        if idx == 0:  # Primer período (Diciembre)
+            Vprev_vars[t] = Vinit
         else:
-            prev_t = T[t_index-1]
-            V_prev = V[prev_t]
+            prev_t = T[idx-1]  # Período anterior en secuencia hidrológica
+            Vprev_vars[t] = V[prev_t]
 
-        # Restricciones de volumen por segmento activo
-        for k in seg_labels:
-            seg = PWL_SEGMENTS[k]
-            # Si segmento k activo, volumen debe estar en su rango
-            m.addConstr(V_prev >= seg["v_min"] * delta[k, t],
-                        name=f"R5c_vol_min_{k}_{t}")
-            m.addConstr(V_prev <= seg["v_max"] * delta[k, t] +
-                        V_max * (1 - delta[k, t]),
-                        name=f"R5d_vol_max_{k}_{t}")
-
-        # PWL función: usar funciones originales evaluadas en puntos medios
-        # CORRECCIÓN: Convertir filtraciones a Hm³/mes para consistencia
-        filtr_values = {}
-        for k in seg_labels:
-            seg = PWL_SEGMENTS[k]
-            v_mid = (seg["v_min"] + seg["v_max"]) / 2
-            filtr_values[k] = filtraciones_from_volumen(v_mid) * Conv
-
-        # Función PWL: Filtr = suma de valores por segmento activo
-        filtr_expr = gp.quicksum(
-            filtr_values[k] * delta[k, t]
-            for k in seg_labels
-        )
-        m.addConstr(Filtr[t] == filtr_expr, name=f"R5e_pwl_function_{t}")
+    # Agregar restricciones PWL con 4 segmentos y variables binarias
+    pwl_vars = add_pwl_filtration_constraints(
+        model=m,
+        Filtr_vars=Filtr,
+        Vprev_vars=Vprev_vars,
+        time_periods=T,
+        filtr_arc=FILTR_ARC,
+        segments=segments,
+        bigM=M,
+        v_max=V_max
+    )
 
     # (R6) Déficits (MILP) linealizadas y cobertura por El Toro
     # Se calculan dos tipos de déficits independientes:
     # 1) Déficits de primeros regantes (90 m³/s en Tucapel, 47 m³/s en Abanico)
-    # 2) Déficits de segundos regantes (53 m³/s, basado en excedente de 1os)
     for t in T:
         # Factores estacionales para el mes t
         first_factor = FIRST_REGANTES_FACTOR.get(t, 1.0)
+        #second_factor = SECOND_REGANTES_FACTOR.get(t, 1.0)
 
         # PRIMEROS REGANTES
         # Abanico: DefAb_t = max{0, 47*factor1_t - Filtr_t - A_abanico_t}
@@ -306,19 +383,6 @@ def build_model_for_one_year(
             )
         m.addConstr(DefTu[t] <= M * dTu[t], name=f"DTu_ub2_{t}")
 
-        # SEGUNDOS REGANTES (medido en Tucapel):
-        # Paso 1: Calcular excedente de primeros regantes
-        # Exc1_t = max{0, (Filtr_t + A_naturales_t) - 90*factor1_t}
-        caudal_disponible_1os = Filtr[t] + A_nat_tu_t(t)
-        expr_exc1 = caudal_disponible_1os - demanda_tucapel
-
-        # Linearización del excedente con variable binaria dExc1[t]
-        m.addConstr(Exc1[t] >= expr_exc1 - M * (1 - dExc1[t]),
-                    name=f"Exc1_lb_{t}")
-        m.addConstr(Exc1[t] <= expr_exc1 + M * (1 - dExc1[t]),
-                    name=f"Exc1_ub1_{t}")
-        m.addConstr(Exc1[t] <= M * dExc1[t], name=f"Exc1_ub2_{t}")
-
         # Cobertura desde Embalse via El Toro (suma de déficits)
         # Q_extraccion_El_Toro >= Q_deficit_1os 
         m.addConstr(
@@ -326,7 +390,72 @@ def build_model_for_one_year(
             name=f"D_cover_by_ElToro_{t}"
         )
 
-    # 5) FO: Minimizar suma de déficits en Abanico y Tucapel (diagnóstico de meses críticos)
+    # (R7) Presupuestos por colchón basados en volumen inicial
+    # Variables auxiliares para linearización McCormick
+    vinit_share = m.addVars(C_LABELS, lb=0.0, ub=V_max, name="vinit_share")
+
+    for c in C_LABELS:
+        # Linearización McCormick para vinit_share[c] = z[c] * Vinit
+        m.addConstr(vinit_share[c] <= V_max * z[c],
+                    name=f"R7a_McCormick1_{c}")
+        m.addConstr(vinit_share[c] >= 0, name=f"R7b_McCormick2_{c}")
+        m.addConstr(vinit_share[c] <= Vinit, name=f"R7c_McCormick3_{c}")
+        m.addConstr(vinit_share[c] >= Vinit - V_max * (1 - z[c]),
+                    name=f"R7d_McCormick4_{c}")
+
+    # Cálculo de uso anual por categoría (Hm3) - CORREGIDO PARA USO DUAL
+
+    # Calcular total de agua por El Toro (convertir a Hm³/año)
+    sum_eltoro_total_Hm3 = gp.quicksum(
+        x["Embalse", "ElToro", t] for t in T
+    ) * Conv
+
+    # RIEGO: Solo la cobertura de déficits desde El Toro (primeros regantes)
+    # (uso exclusivo para riego = agua destinada a cubrir déficits)
+    sum_riego_Hm3 = gp.quicksum((DefAb[t] + DefTu[t]) for t in T)
+
+    # GENERACIÓN: No se contabiliza como uso de agua en este enfoque
+    # porque la función objetivo minimiza déficit y no maximiza generación.
+    # Mantener la variable por compatibilidad (valor 0).
+    sum_gen_Hm3 = gp.LinExpr(0.0)
+
+    # Cálculo de presupuestos por colchón
+    budget_terms = {"riego": [], "generacion": [], "lago": []}
+
+    for c in C_LABELS:
+        r_share, g_share, l_share = COLCHONES[c]["shares"]
+
+        # Para cada categoría: valor fijo (>1.0) o porcentaje (<=1.0)
+        categories = [("riego", r_share), ("generacion", g_share),
+                      ("lago", l_share)]
+        for category, share in categories:
+            if share > 1.0:  # Valor fijo en Hm³
+                budget_terms[category].append(share * z[c])
+            else:  # Porcentaje del volumen inicial
+                budget_terms[category].append(share * vinit_share[c])
+
+    # Restricciones de presupuesto anual
+    budget_riego = gp.quicksum(budget_terms["riego"])
+    budget_gen = gp.quicksum(budget_terms["generacion"])
+    budget_lago = gp.quicksum(budget_terms["lago"])
+
+    # RESTRICCIONES R7 REACTIVADAS: Ahora compatibles con PWL SOS2
+    m.addConstr(sum_riego_Hm3 <= budget_riego, name="R7e_presupuesto_riego")
+    m.addConstr(sum_gen_Hm3 <= budget_gen, name="R7f_presupuesto_generacion")
+
+    # Restricción mensual de volumen mínimo para lago
+    for t in T:
+        m.addConstr(V[t] >= budget_lago, name=f"R7g_volumen_lago_{t}")
+
+    # (R8) Mínimo ecológico en Saltos del Laja
+    for t in T:
+        m.addConstr(
+            gp.quicksum(y[i, "SaltosLaja", t] for i in IN["SaltosLaja"])
+            >= SALTOS_MIN_T[t],
+            name=f"R8_saltos_min_{t}"
+        )
+
+    # 5) FO: Max energía total
     m.setObjective(gp.quicksum(DefAb[t] + DefTu[t] for t in T), GRB.MINIMIZE)
 
     # Adjuntar variables y metadatos al modelo para postprocesamiento
@@ -342,6 +471,16 @@ def build_model_for_one_year(
         "ARCS": ARCS
     }
 
+    # Exponer variables de déficit para postprocesamiento
+    m._Def = {
+        "DefAb": DefAb,
+        "DefTu": DefTu,
+    }
+
+    # Indicar que en este modo la generación no se contabiliza como 'uso de agua'
+    # (FO está orientada a minimizar déficits). KPIs deben respetar esto.
+    m._meta['count_generation_usage'] = False
+
     return m
 
 
@@ -353,7 +492,6 @@ if __name__ == "__main__":
     Interfaz sencilla para ejecutar el modelo determinístico.
     Uso: python src/model.py
     """
-    import sys
 
     def print_simple_menu():
         print("=" * 60)
@@ -469,8 +607,8 @@ if __name__ == "__main__":
         # Ejecutar simulación
         results = []
         current_V0 = V0
-        total_deficit = 0
-        total_toro_usage = 0  # Total de agua por el Toro
+        total_deficit = 0.0
+        total_toro_usage = 0.0  # Total de agua por el Toro
 
         for i, year in enumerate(years):
             print(f"\n📅 Procesando año {year} ({i+1}/{years_count})")
@@ -484,35 +622,36 @@ if __name__ == "__main__":
                 model.optimize()
 
                 if model.status == 2:  # Óptimo
-                    deficit = model.objVal
+                    # La FO minimiza déficits (DefAb+DefTu sumados por meses)
+                    annual_deficit = model.objVal
                     V_vars = model._V
                     final_month = max(T)  # Noviembre (mes 11)
                     v_final = V_vars[final_month].x
 
-                    # Calcular uso del Toro (agua de déficit)
+                    # Calcular uso del Toro (agua extraída) en Hm³
                     x_vars = model._x
                     toro_usage = sum(
                         x_vars["Embalse", "ElToro", t].x
                         for t in T
-                    ) * Conv  # Convertir a Hm³
+                    ) * Conv
 
-                    print(f"✅ Déficit total (FO): {deficit:,.3f} Hm³ | "
+                    print(f"✅ Déficit (FO): {annual_deficit:,.3f} Hm³ | "
                           f"V_final: {v_final:,.1f} Hm³ | "
                           f"Uso Toro: {toro_usage:,.1f} Hm³")
 
-                    total_deficit += deficit
+                    total_deficit += annual_deficit
                     total_toro_usage += toro_usage
                     current_V0 = v_final  # Recursivo para siguiente año
                     results.append({
-                        'year': year, 'deficit': deficit, 'v_final': v_final,
+                        'year': year, 'deficit': annual_deficit, 'v_final': v_final,
                         'toro_usage': toro_usage, 'status': 'OK'
                     })
                 else:
                     print("❌ No factible - usando V0 de seguridad (1400 Hm³)")
                     current_V0 = 1400.0  # Reset a volumen seguro
                     results.append({
-                        'year': year, 'deficit': 0, 'v_final': None,
-                        'toro_usage': 0, 'status': 'FAIL'
+                        'year': year, 'deficit': 0.0, 'v_final': None,
+                        'toro_usage': 0.0, 'status': 'FAIL'
                     })
 
                 model.dispose()
@@ -520,8 +659,8 @@ if __name__ == "__main__":
             except Exception as e:
                 print(f"❌ Error en año {year}: {e}")
                 results.append({
-                    'year': year, 'deficit': 0, 'v_final': None,
-                    'toro_usage': 0, 'status': 'ERROR'
+                    'year': year, 'deficit': 0.0, 'v_final': None,
+                    'toro_usage': 0.0, 'status': 'ERROR'
                 })
 
         # Resumen mejorado
@@ -534,13 +673,13 @@ if __name__ == "__main__":
 
         print(f"🎯 Años procesados: {years_count}")
         print(f"✅ Años exitosos: {len(successful)} ({success_rate:.1f}%)")
-        print(f"📉 Déficit total (suma FO): {total_deficit:,.3f} Hm³")
         print(f"🌊 Uso total El Toro: {total_toro_usage:,.1f} Hm³")
+        print(f"📉 Déficit total (suma FO): {total_deficit:,.3f} Hm³")
 
         if successful:
             avg_deficit = total_deficit / len(successful)
             avg_toro = total_toro_usage / len(successful)
-            print(f"📊 Déficit promedio (por año exitoso): {avg_deficit:,.3f} Hm³/año")
+            print(f"📊 Déficit promedio (FO): {avg_deficit:,.3f} Hm³/año")
             print(f"📊 Uso promedio El Toro: {avg_toro:,.1f} Hm³/año")
 
             # Estadísticas adicionales
@@ -554,6 +693,125 @@ if __name__ == "__main__":
             print(f"   Final: {v_final_last:,.1f} Hm³")
             print(f"   {change_sign} Cambio: {volume_change:+,.1f} Hm³")
 
+            # KPIs DETALLADOS usando modelos re-ejecutados
+            print("\n🔄 Calculando KPIs detallados...")
+            kpis_list = []
+            for result in successful:
+                year = result['year']
+                try:
+                    # Re-ejecutar modelo para KPIs detallados
+                    model = build_model_for_one_year(target_year=year, V0=V0)
+                    model.Params.OutputFlag = 0
+                    model.optimize()
+
+                    if model.status == 2:
+                        kpis = extract_kpis(model)
+                        # Ajuste de reporte: ocultar/consolidar uso de generación
+                        # (no modificar kpi.py). Ponemos el uso de generación a 0
+                        # para que KPI 2 muestre solo riego si así lo deseas.
+                        try:
+                            if isinstance(kpis, dict):
+                                up = kpis.get('uso_presupuestos_%')
+                                if isinstance(up, dict) and 'generacion' in up:
+                                    up['generacion'] = 0.0
+                        except Exception:
+                            pass
+
+                        kpis_list.append(kpis)
+
+                        # Mostrar KPIs para primer año como ejemplo
+                        if len(kpis_list) == 1:
+                            print_kpis(kpis, f"Año {year}")
+
+                    model.dispose()
+                except Exception as e:
+                    print(f"   ⚠️ Error calculando KPIs para {year}: {e}")
+
+            # KPIs agregados para múltiples años
+            if len(kpis_list) > 1:
+                print(f"\n KPIs AGREGADOS ({len(kpis_list)} años exitosos):")
+                print("=" * 60)
+
+                # Promediar cotas por mes
+                from collections import defaultdict
+                cota_sums = defaultdict(float)
+                cota_counts = defaultdict(int)
+
+                deficit_maxs = []
+                deficit_proms = []
+                confiabilidades = []
+
+                for kpis in kpis_list:
+                    # Cotas mensuales
+                    for mes, cota in kpis.get("cota_mensual", {}).items():
+                        cota_sums[mes] += cota
+                        cota_counts[mes] += 1
+
+                    # Déficits
+                    deficit_maxs.append(kpis.get("deficit_max_m3s", 0.0))
+                    deficit_proms.append(kpis.get("deficit_prom_m3s", 0.0))
+                    confiabilidades.append(kpis.get("confiabilidad_%", 100.0))
+
+                # Cota promedio agregada
+                cota_prom_agregada = {
+                    mes: cota_sums[mes] / cota_counts[mes]
+                    for mes in cota_sums.keys()
+                }
+                avg_cota_total = (
+                    sum(cota_prom_agregada.values()) / len(cota_prom_agregada)
+                    if cota_prom_agregada else 0
+                )
+
+                print("📏 TRAYECTORIA PROMEDIO AGREGADA:")
+                print(f" Cota promedio multi-año: {avg_cota_total:6.1f} msnm")
+
+                # Déficits agregados
+                if deficit_maxs:
+                    deficit_max_prom = sum(deficit_maxs) / len(deficit_maxs)
+                    deficit_max_worst = max(deficit_maxs)
+                    deficit_prom_prom = sum(deficit_proms) / len(deficit_proms)
+                    confiabilidad_prom = (
+                        sum(confiabilidades) / len(confiabilidades)
+                    )
+
+                    print("\n🚱 DÉFICITS AGREGADOS:")
+                    print(
+                        (
+                            f"   Déficit máximo promedio: "
+                            f"{deficit_max_prom:8.2f} m³/s"
+                        )
+                    )
+                    print(
+                        f"   Déficit máximo peor año: "
+                        f"{deficit_max_worst:8.2f} m³/s"
+                    )
+                    print(f"   Déficit promedio: "
+                          f"{deficit_prom_prom:8.2f} m³/s")
+                    print(
+                        (
+                            (
+                                f"   Confiabilidad promedio: "
+                                f"{confiabilidad_prom:8.1f}%"
+                            )
+                        )
+                    )
+
+                # Exportar a CSV
+                try:
+                    export_files = export_kpis_to_csv(
+                        {"cota_mensual": cota_prom_agregada,
+                         "deficit_max_m3s": deficit_max_prom,
+                         "deficit_prom_m3s": deficit_prom_prom,
+                         "confiabilidad_%": confiabilidad_prom},
+                        prefix=f"agregados_{years[0]}-{years[-1]}"
+                    )
+                    print(
+                        f"\n📁 Resultados exportados a: "
+                        f"{len(export_files)} archivos CSV"
+                    )
+                except Exception as e:
+                    print(f"   ⚠️ Error exportando: {e}")
+
         # Tabla detallada si hay múltiples años
         if years_count > 1:
             print("\n📊 DETALLE POR AÑO:")
@@ -565,8 +823,8 @@ if __name__ == "__main__":
                 status_icon = "✅" if r['status'] == 'OK' else "❌"
                 if r['status'] == 'OK':
                     print(
-                        f"{r['year']}   {status_icon}    {r.get('deficit', 0):>8,.3f}"
-                        f"{r['v_final']:>7,.1f}      {r['toro_usage']:>6,.1f}"
+                        f"{r['year']}   {status_icon}    {r['deficit']:>12,.3f}"
+                        f"{r['v_final']:>12,.1f}      {r['toro_usage']:>8,.1f}"
                     )
                 else:
                     print(
@@ -598,8 +856,8 @@ if __name__ == "__main__":
 
         results = []
         current_V0 = V0
-        total_energy = 0
-        total_toro_usage = 0
+        total_deficit = 0.0
+        total_toro_usage = 0.0
 
         for year in range(min_year, max_year + 1):
             year_num = year - min_year + 1
@@ -614,7 +872,7 @@ if __name__ == "__main__":
                 model.optimize()
 
                 if model.status == 2:  # Óptimo
-                    energy = model.objVal
+                    annual_deficit = model.objVal
                     V_vars = model._V
                     final_month = max(T)  # Noviembre (mes 11)
                     v_final = V_vars[final_month].x
@@ -626,23 +884,23 @@ if __name__ == "__main__":
                         for t in T
                     ) * Conv
 
-                    print(f"✅ E: {energy:,.0f} MWh | "
+                    print(f"✅ Déficit (FO): {annual_deficit:,.3f} Hm³ | "
                           f"V_f: {v_final:,.0f} | "
                           f"Toro: {toro_usage:,.1f} Hm³")
 
-                    total_energy += energy
+                    total_deficit += annual_deficit
                     total_toro_usage += toro_usage
                     current_V0 = v_final  # Recursivo
                     results.append({
-                        'year': year, 'energy': energy, 'v_final': v_final,
+                        'year': year, 'deficit': annual_deficit, 'v_final': v_final,
                         'toro_usage': toro_usage, 'status': 'OK'
                     })
                 else:
                     print("❌ No factible - reset a 1400 Hm³")
                     current_V0 = 1400.0
                     results.append({
-                        'year': year, 'energy': 0, 'v_final': None,
-                        'toro_usage': 0, 'status': 'FAIL'
+                        'year': year, 'deficit': 0.0, 'v_final': None,
+                        'toro_usage': 0.0, 'status': 'FAIL'
                     })
 
                 model.dispose()
@@ -650,9 +908,22 @@ if __name__ == "__main__":
             except Exception as e:
                 print(f"❌ Error: {e}")
                 results.append({
-                    'year': year, 'energy': 0, 'v_final': None,
-                    'toro_usage': 0, 'status': 'ERROR'
+                    'year': year, 'deficit': 0.0, 'v_final': None,
+                    'toro_usage': 0.0, 'status': 'ERROR'
                 })
+
+        # Cálculos adicionales para análisis
+        all_volumes = []
+        total_toro_usage_hm3 = []  # Para déficits
+        successful = [r for r in results if r['status'] == 'OK']
+
+        # Usar datos ya disponibles de los resultados exitosos
+        for result in successful:
+            # Aproximación: usar volumen final como representativo del año
+            if result['v_final'] is not None:
+                all_volumes.append(result['v_final'])
+            # Uso del Toro como proxy de déficits (ya está en Hm³)
+            total_toro_usage_hm3.append(result['toro_usage'])
 
         # Resumen completo
         print("\n" + "=" * 60)
@@ -664,13 +935,12 @@ if __name__ == "__main__":
 
         print(f"🎯 Años procesados: {total_years}")
         print(f"✅ Años exitosos: {len(successful)} ({success_rate:.1f}%)")
-        print(f"⚡ Energía total: {total_energy:,.1f} MWh")
         print(f"🌊 Uso total El Toro: {total_toro_usage:,.1f} Hm³")
 
         if successful:
-            avg_energy = total_energy / len(successful)
+            avg_deficit = total_deficit / len(successful)
             avg_toro = total_toro_usage / len(successful)
-            print(f"📊 Energía promedio: {avg_energy:,.1f} MWh/año")
+            print(f"📊 Déficit promedio (FO): {avg_deficit:,.3f} Hm³/año")
             print(f"📊 Uso promedio El Toro: {avg_toro:,.1f} Hm³/año")
 
             # Balance volumétrico histórico
@@ -683,6 +953,83 @@ if __name__ == "__main__":
             print(f"   Inicial (Dic'59): {v_initial:,.1f} Hm³")
             print(f"   Final (Nov'23): {v_final_last:,.1f} Hm³")
             print(f"   {change_sign} Cambio neto: {volume_change:+,.1f} Hm³")
+
+            # KPIs DETALLADOS HISTÓRICOS (1960-2023)
+            print("\n🔄 Calculando KPIs históricos detallados...")
+            print("   (Esto puede tomar varios minutos)")
+
+            kpis_historicos = []
+
+            # Procesar TODOS los años para análisis completo
+            all_years = list(range(min_year, max_year + 1))
+
+            current_V0_sample = V0
+            for year in all_years:
+                try:
+                    model = build_model_for_one_year(
+                        target_year=year,
+                        V0=current_V0_sample
+                    )
+                    model.Params.OutputFlag = 0
+                    model.optimize()
+
+                    if model.status == 2:
+                        kpis = extract_kpis(model)
+                        try:
+                            if isinstance(kpis, dict):
+                                up = kpis.get('uso_presupuestos_%')
+                                if isinstance(up, dict) and 'generacion' in up:
+                                    up['generacion'] = 0.0
+                        except Exception:
+                            pass
+                        kpis_historicos.append(kpis)
+
+                        # Actualizar V0 para siguiente muestra
+                        if hasattr(model, '_V'):
+                            final_month = max(T)
+                            current_V0_sample = model._V[final_month].x
+
+                    model.dispose()
+                except Exception:
+                    current_V0_sample = 1400.0  # Reset en caso de error
+
+            # Análisis agregado con KPIs estratégicos históricos
+            if kpis_historicos:
+                # Calcular KPIs estratégicos agregados
+                kpis_agregados = aggregate_kpis(kpis_historicos)
+
+                # Mostrar los 4 KPIs estratégicos históricos
+                print_kpis(kpis_agregados, "Histórico")
+
+                # Exportar resultados históricos
+                try:
+                    export_files = export_kpis_to_csv(
+                        kpis_agregados,
+                        prefix="historicos_1960-2023"
+                    )
+                    print(
+                        f"\n📁 KPIs históricos exportados: "
+                        f"{len(export_files)} archivos CSV"
+                    )
+                except Exception as e:
+                    print(f"   ⚠️ Error exportando históricos: {e}")
+
+                # Generar gráficos históricos
+                try:
+                    plot_files = generate_historical_plots(
+                        kpis_historicos,
+                        all_years,
+                        output_dir="resultados"
+                    )
+                    print(
+                        f"📊 Gráficos generados: {len(plot_files)} archivos PNG"
+                    )
+                except Exception as e:
+                    print(f"   ⚠️ Error generando gráficos: {e}")
+            else:
+                print(
+                    "\n⚠️ No se pudieron calcular KPIs históricos detallados"
+                )
 
     # Bucle principal
     while True:
