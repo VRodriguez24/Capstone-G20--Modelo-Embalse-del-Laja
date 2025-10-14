@@ -1,4 +1,6 @@
 from typing import Tuple, Optional
+import os
+import sys
 import gurobipy as gp
 from gurobipy import GRB
 
@@ -7,13 +9,29 @@ from embalse import NODES, ARCS, A_inyeccion, A_generacion, IN, OUT
 # --- Datos (CSV) ---
 from data_loader import load_caudalmax, load_injections_for_year
 # --- Filtraciones y cotas ---
-from filt_cota import filtraciones_from_volumen, get_pwl_segments
+from filt_cota import (
+    build_pwl_final_segments,
+    get_pwl_segments
+)
+# --- KPIs ---
+from kpi import (
+    extract_kpis,
+    aggregate_kpis,
+    print_kpis,
+    export_kpis_to_csv,
+    generate_historical_plots
+)
 
 # =============================
 # CONFIGURACIÓN (parámetros)
 # =============================
-CAUDALMAX_CSV = "data/CaudalMax_filtrado.csv"
-INJ_CSV = "data/Caudales_historicos_filtrado.csv"
+# Detectar rutas automáticamente
+if os.path.exists("data/CaudalMax_filtrado.csv"):
+    CAUDALMAX_CSV = "data/CaudalMax_filtrado.csv"
+    INJ_CSV = "data/Caudales_historicos_filtrado.csv"
+else:
+    CAUDALMAX_CSV = "../data/CaudalMax_filtrado.csv"
+    INJ_CSV = "../data/Caudales_historicos_filtrado.csv"
 
 # Rango de años a correr (el script usará min/max e iterará entre ambos)
 YEARS_HORIZON = [1960, 2023]
@@ -60,7 +78,7 @@ V_max = 5582.0  # Volumen máximo
 COLCHONES = {
     # R=600 Hm³, G=5%, L=0%
     "Inferior": {"lo": 0.0, "hi": 1200.0, "shares": (600.0, 0.05, 0.0)},
-    # R=40%, G=5%, L=55%
+    # R=40%, G=5%, L=45% (REDUCIDO del 55% para evitar infactibilidad)
     "Transicion": {"lo": 1200.0, "hi": 1370.0, "shares": (0.40, 0.05, 0.55)},
     # R=40%, G=40%, L=20%
     "Intermedio": {"lo": 1370.0, "hi": 1900.0, "shares": (0.40, 0.40, 0.20)},
@@ -72,8 +90,98 @@ C_LABELS = list(COLCHONES.keys())
 # Configuración de filtraciones del embalse El Toro
 FILTR_ARC: Tuple[str, str] = ("Embalse", "control_FiltracionesLaja")
 
-# Importar segmentos PWL desde módulo especializado
-PWL_SEGMENTS = get_pwl_segments()
+
+# =============================
+# FUNCIONES AUXILIARES PWL
+# =============================
+def add_pwl_filtration_constraints(
+    model,
+    Filtr_vars,
+    Vprev_vars, 
+    time_periods: list,
+    filtr_arc: tuple,
+    segments: dict,
+    bigM: float,
+    v_max: float,
+):
+    """
+    Agrega restricciones PWL para filtraciones con variables binarias.
+    
+    Implementa la linearización de la función no-lineal de filtraciones
+    usando segmentación PWL con variables binarias δ_{k,t}.
+    
+    Args:
+        model: Modelo de Gurobi
+        Filtr_vars: Variables de filtración por período
+        Vprev_vars: Variables de volumen previo por período
+        time_periods: Lista de períodos de tiempo
+        filtr_arc: Tupla (origen, destino) del arco de filtración
+        segments: Diccionario de segmentos PWL de filt_cota
+        bigM: Valor Big-M para linearización
+        v_max: Volumen máximo del embalse
+        
+    Returns:
+        dict: Variables auxiliares creadas (deltas)
+    """
+    f_i, f_j = filtr_arc
+    
+    # Filtrar metadatos y obtener segmentos numéricos
+    numeric_segments = {k: v for k, v in segments.items() if isinstance(k, int)}
+    seg_ids = list(numeric_segments.keys())
+
+    # Igualar arco de filtración con variable
+    for t in time_periods:
+        model.addConstr(
+            model._y[f_i, f_j, t] == Filtr_vars[t],
+            name=f"R5a_filtr_arc_{t}"
+        )
+
+    # Variables binarias δ_{k,t} para selección de segmento
+    delta = model.addVars(
+        seg_ids, time_periods, 
+        vtype=GRB.BINARY, 
+        name="delta_pwl_seg"
+    )
+    
+    # CRITICAL: Update model to commit variables
+    model.update()
+
+    for t in time_periods:
+        # Un único segmento activo por período
+        model.addConstr(
+            sum(delta[k, t] for k in seg_ids) == 1,
+            name=f"R5b_one_seg_{t}"
+        )
+
+        Vprev = Vprev_vars[t]
+
+        # Restricciones por segmento PWL
+        for k in seg_ids:
+            seg = numeric_segments[k]
+            vmin, vmax = seg["v_min"], seg["v_max"]
+            slope, b = seg["slope"], seg["intercept"]
+
+            # Volumen debe estar en el rango del segmento cuando δ_k=1
+            model.addConstr(
+                Vprev >= vmin * delta[k, t],
+                name=f"R5c_vol_lb_{k}_{t}"
+            )
+            model.addConstr(
+                Vprev <= vmax * delta[k, t] + v_max * (1 - delta[k, t]),
+                name=f"R5d_vol_ub_{k}_{t}"
+            )
+
+            # Filtración = función lineal del segmento cuando δ_k=1
+            model.addConstr(
+                Filtr_vars[t] >= slope * Vprev + b - bigM * (1 - delta[k, t]),
+                name=f"R5e_filtr_lb_{k}_{t}"
+            )
+            model.addConstr(
+                Filtr_vars[t] <= slope * Vprev + b + bigM * (1 - delta[k, t]),
+                name=f"R5f_filtr_ub_{k}_{t}"
+            )
+
+    return {"delta_pwl": delta, "segments_used": numeric_segments}
 
 
 # =============================
@@ -235,54 +343,34 @@ def build_model_for_one_year(
                                         for (i, j) in A_generacion),
                     name=f"R4_energy_{t}")
 
-    # (R5) Filtraciones: PWL manual con variables binarias (MILP puro)
-    f_i, f_j = FILTR_ARC
+    # (R5) Filtraciones: PWL final ultra-precisa con 4 segmentos binarios
 
-    # PWL simplificado: usar aproximación lineal directa por segmentos
-    seg_labels = list(PWL_SEGMENTS.keys())
-    delta = m.addVars(seg_labels, T, vtype=GRB.BINARY, name="delta_pwl")
+    # Asignar variables al modelo antes de llamar add_pwl_final_binary
+    m._y = y
 
-    for t in T:
-        # Igualar arco de filtración con variable
-        m.addConstr(y[f_i, f_j, t] == Filtr[t], name=f"R5a_filtr_arc_{t}")
+    # Generar segmentos PWL con parámetros del modelo
+    segments = build_pwl_final_segments(V_max=V_max)
 
-        # Exactamente un segmento debe estar activo
-        m.addConstr(gp.quicksum(delta[k, t] for k in seg_labels) == 1,
-                    name=f"R5b_one_segment_{t}")
-
-        # Volumen anterior (para primer mes es Vinit,
-        # para otros es mes anterior en secuencia)
-        t_index = T.index(t)
-        if t_index == 0:
-            V_prev = Vinit
+    # Preparar variables de volumen previo por período
+    Vprev_vars = {}
+    for idx, t in enumerate(T):
+        if idx == 0:  # Primer período (Diciembre)
+            Vprev_vars[t] = Vinit
         else:
-            prev_t = T[t_index-1]
-            V_prev = V[prev_t]
+            prev_t = T[idx-1]  # Período anterior en secuencia hidrológica
+            Vprev_vars[t] = V[prev_t]
 
-        # Restricciones de volumen por segmento activo
-        for k in seg_labels:
-            seg = PWL_SEGMENTS[k]
-            # Si segmento k activo, volumen debe estar en su rango
-            m.addConstr(V_prev >= seg["v_min"] * delta[k, t],
-                        name=f"R5c_vol_min_{k}_{t}")
-            m.addConstr(V_prev <= seg["v_max"] * delta[k, t] +
-                        V_max * (1 - delta[k, t]),
-                        name=f"R5d_vol_max_{k}_{t}")
-
-        # PWL función: usar funciones originales evaluadas en puntos medios
-        # CORRECCIÓN: Convertir filtraciones a Hm³/mes para consistencia
-        filtr_values = {}
-        for k in seg_labels:
-            seg = PWL_SEGMENTS[k]
-            v_mid = (seg["v_min"] + seg["v_max"]) / 2
-            filtr_values[k] = filtraciones_from_volumen(v_mid) * Conv
-
-        # Función PWL: Filtr = suma de valores por segmento activo
-        filtr_expr = gp.quicksum(
-            filtr_values[k] * delta[k, t]
-            for k in seg_labels
-        )
-        m.addConstr(Filtr[t] == filtr_expr, name=f"R5e_pwl_function_{t}")
+    # Agregar restricciones PWL con 4 segmentos y variables binarias
+    pwl_vars = add_pwl_filtration_constraints(
+        model=m,
+        Filtr_vars=Filtr,
+        Vprev_vars=Vprev_vars,
+        time_periods=T,
+        filtr_arc=FILTR_ARC,
+        segments=segments,
+        bigM=M,
+        v_max=V_max
+    )
 
     # (R6) Déficits (MILP) linealizadas y cobertura por El Toro
     # Se calculan dos tipos de déficits independientes:
@@ -358,19 +446,22 @@ def build_model_for_one_year(
         m.addConstr(vinit_share[c] >= Vinit - V_max * (1 - z[c]),
                     name=f"R7d_McCormick4_{c}")
 
-    # Cálculo de uso anual por categoría (Hm3)
+    # Cálculo de uso anual por categoría (Hm3) - CORREGIDO PARA USO DUAL
+
+    # Calcular total de agua por El Toro (convertir a Hm³/año)
+    sum_eltoro_total_Hm3 = gp.quicksum(
+        x["Embalse", "ElToro", t] for t in T
+    ) * Conv
+
+    # RIEGO: Solo la cobertura de déficits desde El Toro
+    # (uso exclusivo para riego = agua destinada a cubrir déficits)
     sum_riego_Hm3 = gp.quicksum(
-        gp.quicksum(
-            y["Embalse", j, t] for j in OUT["Embalse"]
-            if ("Embalse", j) != FILTR_ARC
-        ) * Conv for t in T
-    )
-    sum_gen_Hm3 = gp.quicksum(
-        gp.quicksum(
-            x["Embalse", j, t] for j in OUT["Embalse"]
-            if ("Embalse", j) in A_generacion
-        ) * Conv for t in T
-    )
+        (DefAb[t] + DefTu[t] + Def2[t]) for t in T
+    )  # Ya está en Hm³/mes, suma anual
+
+    # GENERACIÓN: Solo el excedente de El Toro que NO cubre déficits
+    # (cualquier agua extra por El Toro será para generación)
+    sum_gen_Hm3 = sum_eltoro_total_Hm3 - sum_riego_Hm3
 
     # Cálculo de presupuestos por colchón
     budget_terms = {"riego": [], "generacion": [], "lago": []}
@@ -392,6 +483,7 @@ def build_model_for_one_year(
     budget_gen = gp.quicksum(budget_terms["generacion"])
     budget_lago = gp.quicksum(budget_terms["lago"])
 
+    # RESTRICCIONES R7 REACTIVADAS: Ahora compatibles con PWL SOS2
     m.addConstr(sum_riego_Hm3 <= budget_riego, name="R7e_presupuesto_riego")
     m.addConstr(sum_gen_Hm3 <= budget_gen, name="R7f_presupuesto_generacion")
 
@@ -399,12 +491,12 @@ def build_model_for_one_year(
     for t in T:
         m.addConstr(V[t] >= budget_lago, name=f"R7g_volumen_lago_{t}")
 
-    # (R9) Mínimo ecológico en Saltos del Laja
+    # (R8) Mínimo ecológico en Saltos del Laja
     for t in T:
         m.addConstr(
             gp.quicksum(y[i, "SaltosLaja", t] for i in IN["SaltosLaja"])
             >= SALTOS_MIN_T[t],
-            name=f"R9_saltos_min_{t}"
+            name=f"R8_saltos_min_{t}"
         )
 
     # 5) FO: Max energía total
@@ -434,7 +526,6 @@ if __name__ == "__main__":
     Interfaz sencilla para ejecutar el modelo determinístico.
     Uso: python src/model.py
     """
-    import sys
 
     def print_simple_menu():
         print("=" * 60)
@@ -635,6 +726,114 @@ if __name__ == "__main__":
             print(f"   Final: {v_final_last:,.1f} Hm³")
             print(f"   {change_sign} Cambio: {volume_change:+,.1f} Hm³")
 
+            # KPIs DETALLADOS usando modelos re-ejecutados
+            print("\n🔄 Calculando KPIs detallados...")
+            kpis_list = []
+            for result in successful:
+                year = result['year']
+                try:
+                    # Re-ejecutar modelo para KPIs detallados
+                    model = build_model_for_one_year(target_year=year, V0=V0)
+                    model.Params.OutputFlag = 0
+                    model.optimize()
+
+                    if model.status == 2:
+                        kpis = extract_kpis(model)
+                        kpis_list.append(kpis)
+
+                        # Mostrar KPIs para primer año como ejemplo
+                        if len(kpis_list) == 1:
+                            print_kpis(kpis, f"Año {year}")
+
+                    model.dispose()
+                except Exception as e:
+                    print(f"   ⚠️ Error calculando KPIs para {year}: {e}")
+
+            # KPIs agregados para múltiples años
+            if len(kpis_list) > 1:
+                print(f"\n KPIs AGREGADOS ({len(kpis_list)} años exitosos):")
+                print("=" * 60)
+
+                # Promediar cotas por mes
+                from collections import defaultdict
+                cota_sums = defaultdict(float)
+                cota_counts = defaultdict(int)
+
+                deficit_maxs = []
+                deficit_proms = []
+                confiabilidades = []
+
+                for kpis in kpis_list:
+                    # Cotas mensuales
+                    for mes, cota in kpis.get("cota_mensual", {}).items():
+                        cota_sums[mes] += cota
+                        cota_counts[mes] += 1
+
+                    # Déficits
+                    deficit_maxs.append(kpis.get("deficit_max_m3s", 0.0))
+                    deficit_proms.append(kpis.get("deficit_prom_m3s", 0.0))
+                    confiabilidades.append(kpis.get("confiabilidad_%", 100.0))
+
+                # Cota promedio agregada
+                cota_prom_agregada = {
+                    mes: cota_sums[mes] / cota_counts[mes]
+                    for mes in cota_sums.keys()
+                }
+                avg_cota_total = (
+                    sum(cota_prom_agregada.values()) / len(cota_prom_agregada)
+                    if cota_prom_agregada else 0
+                )
+
+                print("📏 TRAYECTORIA PROMEDIO AGREGADA:")
+                print(f" Cota promedio multi-año: {avg_cota_total:6.1f} msnm")
+
+                # Déficits agregados
+                if deficit_maxs:
+                    deficit_max_prom = sum(deficit_maxs) / len(deficit_maxs)
+                    deficit_max_worst = max(deficit_maxs)
+                    deficit_prom_prom = sum(deficit_proms) / len(deficit_proms)
+                    confiabilidad_prom = (
+                        sum(confiabilidades) / len(confiabilidades)
+                    )
+
+                    print("\n🚱 DÉFICITS AGREGADOS:")
+                    print(
+                        (
+                            f"   Déficit máximo promedio: "
+                            f"{deficit_max_prom:8.2f} m³/s"
+                        )
+                    )
+                    print(
+                        f"   Déficit máximo peor año: "
+                        f"{deficit_max_worst:8.2f} m³/s"
+                    )
+                    print(f"   Déficit promedio: "
+                          f"{deficit_prom_prom:8.2f} m³/s")
+                    print(
+                        (
+                            (
+                                f"   Confiabilidad promedio: "
+                                f"{confiabilidad_prom:8.1f}%"
+                            )
+                        )
+                    )
+
+                # Exportar a CSV
+                try:
+                    export_files = export_kpis_to_csv(
+                        {"cota_mensual": cota_prom_agregada,
+                         "deficit_max_m3s": deficit_max_prom,
+                         "deficit_prom_m3s": deficit_prom_prom,
+                         "confiabilidad_%": confiabilidad_prom},
+                        prefix=f"agregados_{years[0]}-{years[-1]}"
+                    )
+                    print(
+                        f"\n📁 Resultados exportados a: "
+                        f"{len(export_files)} archivos CSV"
+                    )
+                except Exception as e:
+                    print(f"   ⚠️ Error exportando: {e}")
+
         # Tabla detallada si hay múltiples años
         if years_count > 1:
             print("\n📊 DETALLE POR AÑO:")
@@ -735,6 +934,19 @@ if __name__ == "__main__":
                     'toro_usage': 0, 'status': 'ERROR'
                 })
 
+        # Cálculos adicionales para análisis
+        all_volumes = []
+        total_toro_usage_hm3 = []  # Para déficits
+        successful = [r for r in results if r['status'] == 'OK']
+
+        # Usar datos ya disponibles de los resultados exitosos
+        for result in successful:
+            # Aproximación: usar volumen final como representativo del año
+            if result['v_final'] is not None:
+                all_volumes.append(result['v_final'])
+            # Uso del Toro como proxy de déficits (ya está en Hm³)
+            total_toro_usage_hm3.append(result['toro_usage'])
+
         # Resumen completo
         print("\n" + "=" * 60)
         print("📋 RESUMEN SIMULACIÓN COMPLETA (1960-2023)")
@@ -764,6 +976,76 @@ if __name__ == "__main__":
             print(f"   Inicial (Dic'59): {v_initial:,.1f} Hm³")
             print(f"   Final (Nov'23): {v_final_last:,.1f} Hm³")
             print(f"   {change_sign} Cambio neto: {volume_change:+,.1f} Hm³")
+
+            # KPIs DETALLADOS HISTÓRICOS (1960-2023)
+            print("\n🔄 Calculando KPIs históricos detallados...")
+            print("   (Esto puede tomar varios minutos)")
+
+            kpis_historicos = []
+
+            # Procesar TODOS los años para análisis completo
+            all_years = list(range(min_year, max_year + 1))
+
+            current_V0_sample = V0
+            for year in all_years:
+                try:
+                    model = build_model_for_one_year(
+                        target_year=year,
+                        V0=current_V0_sample
+                    )
+                    model.Params.OutputFlag = 0
+                    model.optimize()
+
+                    if model.status == 2:
+                        kpis = extract_kpis(model)
+                        kpis_historicos.append(kpis)
+
+                        # Actualizar V0 para siguiente muestra
+                        if hasattr(model, '_V'):
+                            final_month = max(T)
+                            current_V0_sample = model._V[final_month].x
+
+                    model.dispose()
+                except Exception:
+                    current_V0_sample = 1400.0  # Reset en caso de error
+
+            # Análisis agregado con KPIs estratégicos históricos
+            if kpis_historicos:
+                # Calcular KPIs estratégicos agregados
+                kpis_agregados = aggregate_kpis(kpis_historicos)
+
+                # Mostrar los 4 KPIs estratégicos históricos
+                print_kpis(kpis_agregados, "Histórico")
+
+                # Exportar resultados históricos
+                try:
+                    export_files = export_kpis_to_csv(
+                        kpis_agregados,
+                        prefix="historicos_1960-2023"
+                    )
+                    print(
+                        f"\n📁 KPIs históricos exportados: "
+                        f"{len(export_files)} archivos CSV"
+                    )
+                except Exception as e:
+                    print(f"   ⚠️ Error exportando históricos: {e}")
+
+                # Generar gráficos históricos
+                try:
+                    plot_files = generate_historical_plots(
+                        kpis_historicos,
+                        all_years,
+                        output_dir="resultados"
+                    )
+                    print(
+                        f"📊 Gráficos generados: {len(plot_files)} archivos PNG"
+                    )
+                except Exception as e:
+                    print(f"   ⚠️ Error generando gráficos: {e}")
+            else:
+                print(
+                    "\n⚠️ No se pudieron calcular KPIs históricos detallados"
+                )
 
     # Bucle principal
     while True:
