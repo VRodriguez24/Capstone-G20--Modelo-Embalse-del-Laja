@@ -1,7 +1,10 @@
 from typing import Tuple, Optional
 import os
 import sys
+import time
+import psutil
 import gurobipy as gp
+from datetime import datetime
 from gurobipy import GRB
 
 # --- Conjuntos/red ---
@@ -9,10 +12,7 @@ from embalse import NODES, ARCS, A_inyeccion, A_generacion, IN, OUT
 # --- Datos (CSV) ---
 from data_loader import load_caudalmax, load_injections_for_year
 # --- Filtraciones y cotas ---
-from filt_cota import (
-    build_pwl_final_segments,
-    get_pwl_segments
-)
+from filt_cota import build_pwl_final_segments
 # --- KPIs ---
 from kpi import (
     extract_kpis,
@@ -92,6 +92,88 @@ FILTR_ARC: Tuple[str, str] = ("Embalse", "control_FiltracionesLaja")
 
 
 # =============================
+# FUNCIONES DE RENDIMIENTO
+# =============================
+
+def get_performance_stats(start_time: float, process: psutil.Process) -> dict:
+    """
+    Calcula estadísticas de rendimiento del sistema.
+    
+    Args:
+        start_time: Tiempo de inicio de la ejecución (time.time())
+        process: Proceso actual de psutil
+        
+    Returns:
+        dict: Estadísticas de rendimiento incluyendo tiempo y memoria
+    """
+    execution_time = time.time() - start_time
+    
+    # Obtener información de memoria
+    memory_info = process.memory_info()
+    memory_percent = process.memory_percent()
+    
+    # Información del sistema
+    system_memory = psutil.virtual_memory()
+    
+    return {
+        "execution_time_seconds": execution_time,
+        "execution_time_formatted": format_time(execution_time),
+        "memory_rss_mb": memory_info.rss / (1024 * 1024),  # RSS en MB
+        "memory_vms_mb": memory_info.vms / (1024 * 1024),  # VMS en MB
+        "memory_percent": memory_percent,
+        "system_memory_total_gb": system_memory.total / (1024 * 1024 * 1024),
+        "system_memory_available_gb": system_memory.available / (1024 * 1024 * 1024),
+        "system_memory_used_percent": system_memory.percent
+    }
+
+
+def format_time(seconds: float) -> str:
+    """
+    Formatea tiempo en segundos a un formato legible.
+    
+    Args:
+        seconds: Tiempo en segundos
+        
+    Returns:
+        str: Tiempo formateado (ej: "2h 15m 30s" o "45.2s")
+    """
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    elif seconds < 3600:
+        minutes = int(seconds // 60)
+        secs = seconds % 60
+        return f"{minutes}m {secs:.1f}s"
+    else:
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = seconds % 60
+        return f"{hours}h {minutes}m {secs:.1f}s"
+
+
+def print_performance_stats(stats: dict, context: str = ""):
+    """
+    Imprime estadísticas de rendimiento en formato legible.
+    
+    Args:
+        stats: Diccionario con estadísticas de rendimiento
+        context: Contexto adicional para el título
+    """
+    print(f"\n{'=' * 60}")
+    print(f"⚡ ESTADÍSTICAS TÉCNICAS DE RENDIMIENTO {context}")
+    print(f"{'=' * 60}")
+    print(f"🕒 Tiempo de ejecución: {stats['execution_time_formatted']}")
+    print("💾 Memoria RAM utilizada:")
+    print(f"   • RSS (Resident Set Size): {stats['memory_rss_mb']:.1f} MB")
+    print(f"   • VMS (Virtual Memory Size): {stats['memory_vms_mb']:.1f} MB")
+    print(f"   • Porcentaje del sistema: {stats['memory_percent']:.2f}%")
+    print("🖥️  Memoria del sistema:")
+    print(f"   • Total: {stats['system_memory_total_gb']:.1f} GB")
+    print(f"   • Disponible: {stats['system_memory_available_gb']:.1f} GB")
+    print(f"   • Uso del sistema: {stats['system_memory_used_percent']:.1f}%")
+    print(f"{'=' * 60}")
+
+
+# =============================
 # FUNCIONES AUXILIARES PWL
 # =============================
 def add_pwl_filtration_constraints(
@@ -106,10 +188,10 @@ def add_pwl_filtration_constraints(
 ):
     """
     Agrega restricciones PWL para filtraciones con variables binarias.
-    
+
     Implementa la linearización de la función no-lineal de filtraciones
     usando segmentación PWL con variables binarias δ_{k,t}.
-    
+
     Args:
         model: Modelo de Gurobi
         Filtr_vars: Variables de filtración por período
@@ -119,12 +201,12 @@ def add_pwl_filtration_constraints(
         segments: Diccionario de segmentos PWL de filt_cota
         bigM: Valor Big-M para linearización
         v_max: Volumen máximo del embalse
-        
+
     Returns:
         dict: Variables auxiliares creadas (deltas)
     """
     f_i, f_j = filtr_arc
-    
+
     # Filtrar metadatos y obtener segmentos numéricos
     numeric_segments = {k: v for k, v in segments.items() if isinstance(k, int)}
     seg_ids = list(numeric_segments.keys())
@@ -138,11 +220,11 @@ def add_pwl_filtration_constraints(
 
     # Variables binarias δ_{k,t} para selección de segmento
     delta = model.addVars(
-        seg_ids, time_periods, 
-        vtype=GRB.BINARY, 
+        seg_ids, time_periods,
+        vtype=GRB.BINARY,
         name="delta_pwl_seg"
     )
-    
+
     # CRITICAL: Update model to commit variables
     model.update()
 
@@ -638,6 +720,10 @@ if __name__ == "__main__":
         print(f"💧 Volumen inicial: {V0:,.1f} Hm³")
         print("=" * 60)
 
+        # Inicializar medición de rendimiento
+        start_time = time.time()
+        process = psutil.Process()
+
         # Ejecutar simulación
         results = []
         current_V0 = V0
@@ -818,14 +904,16 @@ if __name__ == "__main__":
                         )
                     )
 
-                # Exportar a CSV
+                # Exportar a CSV con timestamp para evitar sobreescritura
                 try:
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                     export_files = export_kpis_to_csv(
                         {"cota_mensual": cota_prom_agregada,
                          "deficit_max_m3s": deficit_max_prom,
                          "deficit_prom_m3s": deficit_prom_prom,
                          "confiabilidad_%": confiabilidad_prom},
-                        prefix=f"agregados_{years[0]}-{years[-1]}"
+                        prefix=f"agregados_{years[0]}-{years[-1]}",
+                        suffix=timestamp
                     )
                     print(
                         f"\n📁 Resultados exportados a: "
@@ -855,6 +943,11 @@ if __name__ == "__main__":
                     )
             print("━" * 80)
 
+        # Imprimir estadísticas de rendimiento
+        performance_stats = get_performance_stats(start_time, process)
+        context = f"({years_count} años)" if years_count > 1 else f"(año {years[0]})"
+        print_performance_stats(performance_stats, context)
+
     def run_all_years():
         """Ejecuta el modelo para todos los años disponibles."""
         min_year, max_year = min(YEARS_HORIZON), max(YEARS_HORIZON)
@@ -875,6 +968,10 @@ if __name__ == "__main__":
 
         print("\n🚀 Iniciando simulación completa...")
         print("=" * 60)
+
+        # Inicializar medición de rendimiento
+        start_time = time.time()
+        process = psutil.Process()
 
         results = []
         current_V0 = V0
@@ -1017,11 +1114,13 @@ if __name__ == "__main__":
                 # Mostrar los 4 KPIs estratégicos históricos
                 print_kpis(kpis_agregados, "Histórico")
 
-                # Exportar resultados históricos
+                # Exportar resultados históricos con timestamp
                 try:
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                     export_files = export_kpis_to_csv(
                         kpis_agregados,
-                        prefix="historicos_1960-2023"
+                        prefix="historicos_1960-2023",
+                        suffix=timestamp
                     )
                     print(
                         f"\n📁 KPIs históricos exportados: "
@@ -1030,12 +1129,14 @@ if __name__ == "__main__":
                 except Exception as e:
                     print(f"   ⚠️ Error exportando históricos: {e}")
 
-                # Generar gráficos históricos
+                # Generar gráficos históricos con timestamp
                 try:
+                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                     plot_files = generate_historical_plots(
                         kpis_historicos,
                         all_years,
-                        output_dir="resultados"
+                        output_dir="resultados",
+                        suffix=timestamp
                     )
                     print(
                         f"📊 Gráficos generados: {len(plot_files)} archivos PNG"
@@ -1046,6 +1147,10 @@ if __name__ == "__main__":
                 print(
                     "\n⚠️ No se pudieron calcular KPIs históricos detallados"
                 )
+
+        # Imprimir estadísticas de rendimiento
+        performance_stats = get_performance_stats(start_time, process)
+        print_performance_stats(performance_stats, "(simulación completa)")
 
     # Bucle principal
     while True:

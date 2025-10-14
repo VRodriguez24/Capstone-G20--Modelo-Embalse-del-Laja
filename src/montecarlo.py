@@ -17,6 +17,8 @@ Uso: python src/montecarlo.py
 from __future__ import annotations
 
 import os
+import time
+import psutil
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -642,6 +644,84 @@ def validate_year(year):
     return year
 
 
+def get_performance_stats(start_time: float, process: psutil.Process) -> dict:
+    """
+    Calcula estadísticas de rendimiento del sistema.
+    
+    Args:
+        start_time: Tiempo de inicio de la ejecución (time.time())
+        process: Proceso actual de psutil
+        
+    Returns:
+        dict: Estadísticas de rendimiento incluyendo tiempo y memoria
+    """
+    execution_time = time.time() - start_time
+    
+    # Obtener información de memoria
+    memory_info = process.memory_info()
+    memory_percent = process.memory_percent()
+    
+    # Información del sistema
+    system_memory = psutil.virtual_memory()
+    
+    return {
+        "execution_time_seconds": execution_time,
+        "execution_time_formatted": format_time(execution_time),
+        "memory_rss_mb": memory_info.rss / (1024 * 1024),  # RSS en MB
+        "memory_vms_mb": memory_info.vms / (1024 * 1024),  # VMS en MB
+        "memory_percent": memory_percent,
+        "system_memory_total_gb": system_memory.total / (1024 * 1024 * 1024),
+        "system_memory_available_gb": system_memory.available / (1024 * 1024 * 1024),
+        "system_memory_used_percent": system_memory.percent
+    }
+
+
+def format_time(seconds: float) -> str:
+    """
+    Formatea tiempo en segundos a un formato legible.
+    
+    Args:
+        seconds: Tiempo en segundos
+        
+    Returns:
+        str: Tiempo formateado (ej: "2h 15m 30s" o "45.2s")
+    """
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    elif seconds < 3600:
+        minutes = int(seconds // 60)
+        secs = seconds % 60
+        return f"{minutes}m {secs:.1f}s"
+    else:
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = seconds % 60
+        return f"{hours}h {minutes}m {secs:.1f}s"
+
+
+def print_performance_stats(stats: dict, context: str = ""):
+    """
+    Imprime estadísticas de rendimiento en formato legible.
+    
+    Args:
+        stats: Diccionario con estadísticas de rendimiento
+        context: Contexto adicional para el título
+    """
+    print(f"\n{'=' * 60}")
+    print(f"⚡ ESTADÍSTICAS TÉCNICAS DE RENDIMIENTO {context}")
+    print(f"{'=' * 60}")
+    print(f"🕒 Tiempo de ejecución: {stats['execution_time_formatted']}")
+    print("💾 Memoria RAM utilizada:")
+    print(f"   • RSS (Resident Set Size): {stats['memory_rss_mb']:.1f} MB")
+    print(f"   • VMS (Virtual Memory Size): {stats['memory_vms_mb']:.1f} MB")
+    print(f"   • Porcentaje del sistema: {stats['memory_percent']:.2f}%")
+    print("🖥️  Memoria del sistema:")
+    print(f"   • Total: {stats['system_memory_total_gb']:.1f} GB")
+    print(f"   • Disponible: {stats['system_memory_available_gb']:.1f} GB")
+    print(f"   • Uso del sistema: {stats['system_memory_used_percent']:.1f}%")
+    print(f"{'=' * 60}")
+
+
 def main():
     """Función principal - interfaz interactiva."""
 
@@ -694,6 +774,10 @@ def main():
         print("   ✅ Usando bootstrap puro - sin ruido estocástico")
 
         print("\n🚀 Iniciando simulación híbrida...")
+
+        # Inicializar medición de rendimiento
+        start_time = time.time()
+        process = psutil.Process()
 
         simulator = HybridSimulator()
         results = simulator.run_simulation(
@@ -813,6 +897,10 @@ def main():
         print("   ✅ KPIs consistentes con análisis histórico")
         print(f"   ✅ Alta tasa de éxito: {results['success_rate']:.1f}%")
         print("   ✅ Resultados comparables y reproducibles")
+
+        # Imprimir estadísticas de rendimiento
+        performance_stats = get_performance_stats(start_time, process)
+        print_performance_stats(performance_stats, "(Monte Carlo)")
 
     except KeyboardInterrupt:
         print("\n\n👋 Saliendo del programa...")
