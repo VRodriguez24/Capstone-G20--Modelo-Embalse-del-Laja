@@ -4,7 +4,7 @@ import sys
 import time
 import psutil
 import gurobipy as gp
-from datetime import datetime
+from pathlib import Path
 from gurobipy import GRB
 
 # --- Conjuntos/red ---
@@ -18,7 +18,6 @@ from kpi import (
     extract_kpis,
     aggregate_kpis,
     print_kpis,
-    export_kpis_to_csv,
     generate_historical_plots
 )
 
@@ -42,8 +41,6 @@ T = [12, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
 # Reglas de riego / ecológico (constantes, mismos valores para todo t)
 TUCAPEL_MIN = 90.0     # m3/s
 ABANICO_MIN = 47.0     # m3/s
-# SALTOS_MIN = 7.0       # m3/s
-# SALTOS_MIN_T = {t: SALTOS_MIN for t in T}  # comodidad para indexar por t
 
 # Curvas estacionales para 1° y 2° regantes (factor por mes 1..12).
 # Tomadas de la Tabla N°2 (imagen). Valores entre 0 y 1.
@@ -128,25 +125,19 @@ def format_time(seconds: float) -> str:
 
 def print_performance_stats(stats: dict, context: str = ""):
     """
-    Imprime estadísticas de rendimiento en formato legible.
+    Imprime estadísticas de rendimiento simplificadas.
     
     Args:
         stats: Diccionario con estadísticas de rendimiento
         context: Contexto adicional para el título
     """
-    print(f"\n{'=' * 60}")
-    print(f"⚡ ESTADÍSTICAS TÉCNICAS DE RENDIMIENTO {context}")
-    print(f"{'=' * 60}")
+    print(f"\n{'=' * 50}")
+    print(f"⚡ RENDIMIENTO {context}")
+    print(f"{'=' * 50}")
     print(f"🕒 Tiempo de ejecución: {stats['execution_time_formatted']}")
-    print(f"💾 Memoria RAM utilizada:")
-    print(f"   • RSS (Resident Set Size): {stats['memory_rss_mb']:.1f} MB")
-    print(f"   • VMS (Virtual Memory Size): {stats['memory_vms_mb']:.1f} MB")
-    print(f"   • Porcentaje del sistema: {stats['memory_percent']:.2f}%")
-    print(f"🖥️  Memoria del sistema:")
-    print(f"   • Total: {stats['system_memory_total_gb']:.1f} GB")
-    print(f"   • Disponible: {stats['system_memory_available_gb']:.1f} GB")
-    print(f"   • Uso del sistema: {stats['system_memory_used_percent']:.1f}%")
-    print(f"{'=' * 60}")
+    print(f"💾 RAM utilizada: {stats['memory_rss_mb']:.1f} MB")
+    print(f"💻 Memoria sistema utilizada: {stats['system_memory_used_percent']:.1f}%")
+    print(f"{'=' * 50}")
 
 
 # =============================
@@ -425,14 +416,6 @@ def build_model_for_one_year(
             y["Embalse", "ElToro", t] >= DefAb[t] + DefTu[t],
             name=f"D_cover_by_ElToro_{t}"
         )
-
-    # # (R8) Mínimo ecológico en Saltos del Laja
-    # for t in T:
-    #     m.addConstr(
-    #         gp.quicksum(y[i, "SaltosLaja", t] for i in IN["SaltosLaja"])
-    #         >= SALTOS_MIN_T[t],
-    #         name=f"R8_saltos_min_{t}"
-    #     )
 
     # 5) FO: Mín déficit total
     m.setObjective(gp.quicksum(DefAb[t] + DefTu[t] for t in T), GRB.MINIMIZE)
@@ -777,23 +760,24 @@ if __name__ == "__main__":
                         )
                     )
 
-                # Exportar a CSV con timestamp para evitar sobreescritura
+                # Generar gráfico específico
                 try:
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    export_files = export_kpis_to_csv(
-                        {"cota_mensual": cota_prom_agregada,
-                         "deficit_max_m3s": deficit_max_prom,
-                         "deficit_prom_m3s": deficit_prom_prom,
-                         "confiabilidad_%": confiabilidad_prom},
-                        prefix=f"agregados_{years[0]}-{years[-1]}",
-                        suffix=timestamp
+                    # Crear estructura básica de KPIs para gráficos
+                    kpis_simple = [{
+                        "cota_mensual": {t: 1320.0 for t in T},  # Valor placeholder
+                        "dependencia_lago_m3s": {t: deficit_prom_prom for t in T}
+                    }]
+                    plot_files = generate_historical_plots(
+                        kpis_simple,
+                        [years[0]],  # Año representativo
+                        output_dir="resultados",
+                        plot_name="evolucion_historica_lago_caso_base"
                     )
-                    print(
-                        f"\n📁 Resultados exportados a: "
-                        f"{len(export_files)} archivos CSV"
-                    )
+                    print(f"\n� Gráfico generado: {len(plot_files)} archivo PNG en 'resultados/'")
+                    for file_path in plot_files:
+                        print(f"   ✓ {Path(file_path).name}")
                 except Exception as e:
-                    print(f"   ⚠️ Error exportando: {e}")
+                    print(f"   ⚠️ Error generando gráfico: {e}")
 
         # Tabla detallada si hay múltiples años
         if years_count > 1:
@@ -993,33 +977,17 @@ if __name__ == "__main__":
                 # Mostrar los 4 KPIs estratégicos históricos
                 print_kpis(kpis_agregados, "Histórico")
 
-                # Exportar resultados históricos con timestamp
+                # Generar gráficos históricos con nombre específico
                 try:
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-                    export_files = export_kpis_to_csv(
-                        kpis_agregados,
-                        prefix="historicos_1960-2023",
-                        suffix=timestamp
-                    )
-                    print(
-                        f"\n📁 KPIs históricos exportados: "
-                        f"{len(export_files)} archivos CSV"
-                    )
-                except Exception as e:
-                    print(f"   ⚠️ Error exportando históricos: {e}")
-
-                # Generar gráficos históricos con timestamp
-                try:
-                    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
                     plot_files = generate_historical_plots(
                         kpis_historicos,
                         all_years,
                         output_dir="resultados",
-                        suffix=timestamp
+                        plot_name="evolucion_historica_lago_caso_base"
                     )
-                    print(
-                        f"📊 Gráficos generados: {len(plot_files)} archivos PNG"
-                    )
+                    print(f"📊 Gráficos generados: {len(plot_files)} archivos PNG")
+                    for file_path in plot_files:
+                        print(f"   ✓ {Path(file_path).name}")
                 except Exception as e:
                     print(f"   ⚠️ Error generando gráficos: {e}")
             else:

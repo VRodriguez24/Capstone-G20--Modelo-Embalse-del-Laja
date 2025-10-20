@@ -798,7 +798,7 @@ def export_kpis_to_csv(kpis: Dict[str, Any],
 def generate_historical_plots(kpis_historicos: List[Dict[str, Any]],
                              years: List[int],
                              output_dir: str = "resultados",
-                             suffix: str = "") -> List[str]:
+                             plot_name: str = "evolucion_historica_lago") -> List[str]:
     """
     Genera gráficos de evolución histórica para análisis visual de tendencias.
     
@@ -822,7 +822,7 @@ def generate_historical_plots(kpis_historicos: List[Dict[str, Any]],
         kpis_historicos: Lista de KPIs calculados por año histórico
         years: Lista de años correspondientes (misma longitud que kpis_historicos)
         output_dir: Directorio donde guardar los gráficos PNG
-        suffix: Sufijo adicional para evitar sobreescribir archivos
+        plot_name: Nombre específico para el archivo de gráfico (sin extensión)
 
     Returns:
         List[str]: Lista de rutas completas de archivos PNG generados
@@ -879,12 +879,8 @@ def generate_historical_plots(kpis_historicos: List[Dict[str, Any]],
 
     plt.tight_layout()
 
-    # Guardar gráfico con sufijo si se proporciona
-    base_name = "evolucion_historica_lago"
-    if suffix:
-        plot_file = output_path / f"{base_name}_{suffix}.png"
-    else:
-        plot_file = output_path / f"{base_name}.png"
+    # Guardar gráfico con nombre específico
+    plot_file = output_path / f"{plot_name}.png"
     plt.savefig(plot_file, dpi=300, bbox_inches='tight')
     plt.close()
     files_created.append(str(plot_file))
