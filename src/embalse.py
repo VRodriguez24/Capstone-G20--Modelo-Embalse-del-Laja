@@ -25,7 +25,7 @@ NODES = [
     "control_ElDiuto", "control_Laja_I",
 
     # afluentes (nodos fuente de inyección en arco)
-    "afluente_AltoPolc", "afluente_Abanico", "afluente_Antuco",
+    "afluente_Embalse", "afluente_Abanico", "afluente_Antuco",
     "afluente_Canecol", "afluente_Tucapel", "afluente_Laja_I",
 ]
 
@@ -33,7 +33,7 @@ NODES = [
 
 # Inyección (afluentes)
 A_inyeccion = [
-    ("afluente_AltoPolc", "AltoPolc"),
+    ("afluente_Embalse", "Embalse"),
     ("afluente_Abanico",  "control_Abanico"),
     ("afluente_Antuco",   "control_Antuco"),
     ("afluente_Canecol",  "control_Canecol"),

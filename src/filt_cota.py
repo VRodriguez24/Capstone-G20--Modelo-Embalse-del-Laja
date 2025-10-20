@@ -1,14 +1,17 @@
 """
-Módulo para cálculo de filtraciones y conversión volumen-cota
-para el Embalse El Toro.
+Módulo para cálculo de filtraciones y linearización PWL para el Embalse El Toro.
 
-Este módulo contiene:
-- Tabla de conversión volumen-cota original (71 puntos)
-- Función polinomial de 4to grado para filtraciones basada en cota
-- Segmentos PWL (Piecewise Linear) para aproximación lineal
-- Funciones de conversión y cálculo
+OBJETIVO: Linearizar la función no-lineal de filtraciones f(V) = polinomio(cota(V))
+usando segmentación PWL optimizada para minimizar error de aproximación.
+
+Funciones principales:
+- cota_from_volumen(): Convierte volumen a cota
+- filtraciones_from_volumen(): Calcula filtraciones desde volumen  
+- build_pwl_final_segments(): Genera segmentos PWL optimizados
 """
-from typing import Dict, Any
+from typing import Dict, Any, List
+import numpy as np
+import matplotlib.pyplot as plt
 
 # Tabla volumen-cota original (71 puntos, volúmenes en Hm³)
 VOLUMEN_TABLE = [
@@ -72,9 +75,9 @@ def filtraciones_from_cota(cota: float) -> float:
 def filtraciones_from_volumen(volumen: float) -> float:
     """
     Calcula filtraciones (m³/s) basado en volumen (Hm³).
-    Combina la conversión volumen->cota->filtraciones.
+
     Args:
-        volumen: Volumen del embalse en Hm3
+        volumen: Volumen del embalse en Hm³
     Returns:
         Filtraciones en m³/s
     """
@@ -82,89 +85,344 @@ def filtraciones_from_volumen(volumen: float) -> float:
     return filtraciones_from_cota(cota)
 
 
-def calculate_pwl_segments() -> Dict[int, Dict[str, Any]]:
+def _calculate_segment_error(v_start: float, v_end: float) -> float:
+    """Calcula error máximo de aproximación lineal en un segmento."""
+    f1 = filtraciones_from_volumen(v_start)
+    f2 = filtraciones_from_volumen(v_end)
+    slope = (f2 - f1) / (v_end - v_start)
+    intercept = f1 - slope * v_start
+
+    max_error = 0.0
+    test_points = np.linspace(v_start, v_end, 50)
+    for v in test_points:
+        f_real = filtraciones_from_volumen(v)
+        f_pwl = slope * v + intercept
+        error = abs(f_real - f_pwl)
+        max_error = max(max_error, error)
+
+    return max_error
+
+
+def _subdivide_segment(v_start: float, v_end: float,
+                       target_error: float) -> List[float]:
     """
-    Calcula segmentos PWL basados en rango operativo (1200-3628 Hm3).
+    Subdivide un segmento si el error excede la tolerancia.
+    
+    Proceso de selección de segmentos:
+    1. Evalúa error de aproximación lineal
+    2. Si error > target_error → busca mejor punto de división
+    3. Subdivide recursivamente hasta cumplir tolerancia
+    """
+    current_error = _calculate_segment_error(v_start, v_end)
+    
+    if current_error <= target_error or (v_end - v_start) < 100:
+        return [v_start, v_end]
+    
+    # Buscar mejor punto de división
+    best_split = None
+    min_max_error = float('inf')
+    n_candidates = min(10, int((v_end - v_start) / 100))
+    
+    for i in range(1, n_candidates):
+        split_point = v_start + (v_end - v_start) * i / n_candidates
+        error1 = _calculate_segment_error(v_start, split_point)
+        error2 = _calculate_segment_error(split_point, v_end)
+        max_error_with_split = max(error1, error2)
+        
+        if max_error_with_split < min_max_error:
+            min_max_error = max_error_with_split
+            best_split = split_point
+    
+    if best_split is None:
+        return [v_start, v_end]
+    
+    # Subdivisión recursiva
+    left_breaks = _subdivide_segment(v_start, best_split, target_error)
+    right_breaks = _subdivide_segment(best_split, v_end, target_error)
+    
+    return left_breaks + right_breaks[1:]  # Evitar duplicar punto medio
 
-    Divide el rango operativo en 4 segmentos alineados con colchones:
-    1. Inferior: 1200-1370 Hm3
-    2. Transición: 1370-1730 Hm3
-    3. Intermedio: 1730-1900 Hm3
-    4. Superior: 1900-3628 Hm3
 
+def _generate_breakpoints(V_max: float, target_error: float) -> List[float]:
+    """
+    Genera breakpoints optimizados usando análisis de curvatura.
+    
+    Estrategia de selección:
+    - Puntos base en límites de colchones operativos
+    - Análisis adaptativo de curvatura para subdivisión
+    - Minimización de error de aproximación lineal
+    """
+    # Puntos estratégicos base (límites de colchones)
+    strategic_points = [0.0, 1200.0, 1370.0, 1900.0, V_max]
+    
+    final_breaks = [0.0]
+    for i in range(len(strategic_points) - 1):
+        start, end = strategic_points[i], strategic_points[i + 1]
+        segment_breaks = _subdivide_segment(start, end, target_error)
+        
+        # Agregar puntos intermedios
+        for bp in segment_breaks[1:]:
+            if bp not in final_breaks:
+                final_breaks.append(bp)
+    
+    return sorted(final_breaks)
+
+
+def build_pwl_final_segments(V_max: float = 5582.0) -> Dict[int, Dict[str, Any]]:
+    """
+    Genera segmentos PWL optimizados para linearizar función de filtraciones.
+    
+    Args:
+        V_max: Volumen máximo del embalse (Hm³)
+        
     Returns:
-        Diccionario con segmentos PWL, cada uno conteniendo:
-        - v_min, v_max: rango de volumen del segmento
-        - slope: pendiente de la línea en el segmento
-        - intercept: intercepto de la línea en el segmento
+        Dict con segmentos {k: {v_min, v_max, slope, intercept, ...}}
+        
+    Proceso:
+    1. Genera breakpoints usando análisis adaptativo de curvatura
+    2. Calcula parámetros lineales (pendiente, intercepto) por segmento
+    3. Evalúa error de aproximación para validación
     """
-    segments = {}
-
-    # Puntos de ruptura alineados con colchones operativos
-    breakpoints = [1200, 1370, 1730, 1900, 3628]
-
-    for i in range(len(breakpoints) - 1):
-        v_min, v_max = breakpoints[i], breakpoints[i + 1]
-
-        # Calcular filtraciones en los extremos del segmento
-        filtr_min = filtraciones_from_volumen(v_min)
-        filtr_max = filtraciones_from_volumen(v_max)
-
-        # Calcular pendiente e intercepto
-        if v_max > v_min:
-            slope = (filtr_max - filtr_min) / (v_max - v_min)
-            intercept = filtr_min - slope * v_min
+    # Generar breakpoints optimizados
+    breaks = _generate_breakpoints(V_max, target_error=0.05)
+    n_segments = len(breaks) - 1
+    
+    segments: Dict[int, Dict[str, Any]] = {}
+    total_error = 0.0
+    
+    for i in range(n_segments):
+        v1, v2 = breaks[i], breaks[i + 1]
+        
+        # Calcular parámetros del segmento lineal
+        f1 = filtraciones_from_volumen(v1)
+        f2 = filtraciones_from_volumen(v2)
+        slope = (f2 - f1) / (v2 - v1)
+        intercept = f1 - slope * v1
+        
+        # Calcular error máximo del segmento
+        max_error = _calculate_segment_error(v1, v2)
+        total_error += max_error
+        
+        # Tipo de colchón operativo
+        if v1 < 1200:
+            colchon_type = "Inferior"
+        elif v1 < 1370:
+            colchon_type = "Transición"
+        elif v1 < 1900:
+            colchon_type = "Intermedio"
         else:
-            slope = 0.0
-            intercept = filtr_min
-
+            colchon_type = "Superior"
+        
         segments[i + 1] = {
-            "v_min": v_min,
-            "v_max": v_max,
+            "v_min": v1,
+            "v_max": v2,
             "slope": slope,
-            "intercept": intercept
+            "intercept": intercept,
+            "max_error": max_error,
+            "colchon_type": colchon_type
         }
+    
+    # Metadatos
+    segments["_metadata"] = {
+        "total_error": total_error,
+        "method": "adaptive_curvature_analysis",
+        "breakpoints": breaks,
+        "n_segments": n_segments
+    }
 
     return segments
 
 
-# Generar los segmentos PWL al importar el módulo
-PWL_SEGMENTS = calculate_pwl_segments()
+def eval_pwl_final(vol: float, segments: Dict[int, Dict[str, Any]]) -> float:
+    """
+    Evalúa la función PWL en un volumen dado.
+    
+    Args:
+        vol: Volumen en Hm³
+        segments: Segmentos PWL
+        
+    Returns:
+        Valor de filtración aproximado (m³/s)
+    """
+    # Filtrar metadatos
+    numeric_segs = {k: v for k, v in segments.items() if isinstance(k, int)}
+    
+    # Buscar segmento que contiene el volumen
+    for seg in numeric_segs.values():
+        if seg["v_min"] <= vol <= seg["v_max"]:
+            return seg["slope"] * vol + seg["intercept"]
+    
+    # Extrapolación fuera del rango
+    if vol < 0:
+        seg = numeric_segs[1]  # Primer segmento
+    else:
+        seg = numeric_segs[max(numeric_segs.keys())]  # Último segmento
+    
+    return seg["slope"] * vol + seg["intercept"]
+
+
+# Generar segmentos PWL al importar el módulo
+PWL_SEGMENTS = build_pwl_final_segments(V_max=5582.0)
 
 
 def get_pwl_segments() -> Dict[int, Dict[str, Any]]:
     """
     Obtiene los segmentos PWL precalculados.
-
+    
     Returns:
-        Diccionario con los segmentos PWL
+        Diccionario con los segmentos PWL optimizados
     """
     return PWL_SEGMENTS
 
 
+# =============================
+# FUNCIONES DE TESTING (OPCIONALES)
+# =============================
 def test_funciones():
-    """
-    Función de prueba para verificar el funcionamiento de las conversiones.
-    """
-    print("🧪 Pruebas de funciones de filtración y cota:")
-
-    volumenes_prueba = [0, 500, 1000, 1500, 2000, 2500, 3000, 3628]
-
+    """Prueba las funciones básicas de conversión."""
+    print("🧪 Pruebas de funciones de filtración:")
+    
+    volumenes_prueba = [0, 500, 1000, 1500, 2000, 3000, 5582]
+    
     for vol in volumenes_prueba:
         cota = cota_from_volumen(vol)
         filtr = filtraciones_from_volumen(vol)
-        print(
-            (
-                f"V={vol:4.0f} Hm³ -> Cota={cota:6.1f} m "
-                f"-> Filtr={filtr:6.2f} m3/s"
-            )
-        )
+        print(f"V={vol:4.0f} Hm³ -> Cota={cota:6.1f} m -> "
+              f"Filtr={filtr:6.2f} m³/s")
 
-    print(f"\n📊 Segmentos PWL generados: {len(PWL_SEGMENTS)}")
-    for k, seg in PWL_SEGMENTS.items():
-        print(f"  Segmento {k}: V=[{seg['v_min']:4.0f}, {seg['v_max']:4.0f}] "
-              f"-> slope={seg['slope']:.6f}, intercept={seg['intercept']:.2f}")
+    # Info de segmentos
+    numeric_segments = {k: v for k, v in PWL_SEGMENTS.items()
+                        if isinstance(k, int)}
+    print(f"\n📊 Segmentos PWL generados: {len(numeric_segments)}")
+
+    for k, seg in numeric_segments.items():
+        print(f"  S{k}: V=[{seg['v_min']:4.0f}, {seg['v_max']:4.0f}] Hm³ | "
+              f"Colchón: {seg['colchon_type']} | "
+              f"Error: {seg['max_error']:.4f} m³/s")
+
+
+def plot_filtration_comparison(
+        V_max: float = 5582.0,
+        save_path: str = "resultados/filtration_comparison_005.png"
+):
+    """
+    Genera gráfico comparativo de función original vs PWL linearizada.
+
+    Args:
+        V_max: Volumen máximo para el gráfico (Hm³)
+        save_path: Ruta para guardar el gráfico
+    """
+    # Rango de volúmenes para evaluar
+    volumes = np.linspace(0, V_max, 2000)
+    
+    # Función original
+    filtr_original = [filtraciones_from_volumen(v) for v in volumes]
+    
+    # Función PWL
+    filtr_pwl = [eval_pwl_final(v, PWL_SEGMENTS) for v in volumes]
+    
+    # Crear gráfico
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 8))
+    
+    # Plot principal
+    ax1.plot(volumes, filtr_original, 'b-', linewidth=2, 
+             label='Función Original f(V)', alpha=0.8)
+    ax1.plot(volumes, filtr_pwl, 'r--', linewidth=2, 
+             label='PWL Linearizada', alpha=0.8)
+    
+    # Marcar breakpoints
+    numeric_segs = {k: v for k, v in PWL_SEGMENTS.items() if isinstance(k, int)}
+    breakpoints = []
+    for seg in numeric_segs.values():
+        if seg["v_min"] not in breakpoints:
+            breakpoints.append(seg["v_min"])
+        if seg["v_max"] not in breakpoints:
+            breakpoints.append(seg["v_max"])
+    
+    for bp in sorted(set(breakpoints)):
+        if bp <= V_max:
+            f_val = filtraciones_from_volumen(bp)
+            ax1.axvline(x=bp, color='gray', linestyle=':', alpha=0.6)
+            ax1.plot(bp, f_val, 'go', markersize=6, alpha=0.8)
+    
+    ax1.set_xlabel('Volumen (Hm³)')
+    ax1.set_ylabel('Filtraciones (m³/s)')
+    ax1.set_title('Comparación: Función Original vs PWL Linearizada')
+    ax1.legend()
+    ax1.grid(True, alpha=0.3)
+    ax1.set_xlim(0, V_max)
+    
+    # Plot de error
+    errors = [abs(fo - fp) for fo, fp in zip(filtr_original, filtr_pwl)]
+    ax2.plot(volumes, errors, 'r-', linewidth=1.5, label='Error Absoluto')
+    ax2.set_xlabel('Volumen (Hm³)')
+    ax2.set_ylabel('Error (m³/s)')
+    ax2.set_title('Error de Aproximación PWL')
+    ax2.legend()
+    ax2.grid(True, alpha=0.3)
+    ax2.set_xlim(0, V_max)
+    
+    # Estadísticas del error
+    max_error = max(errors)
+    mean_error = np.mean(errors)
+    ax2.text(0.02, 0.95, f'Error máximo: {max_error:.4f} m³/s\n'
+                         f'Error medio: {mean_error:.4f} m³/s', 
+             transform=ax2.transAxes, 
+             verticalalignment='top',
+             bbox=dict(boxstyle='round', facecolor='wheat', alpha=0.8))
+    
+    plt.tight_layout()
+    
+    # Guardar gráfico
+    plt.savefig(save_path, dpi=300, bbox_inches='tight')
+    print(f"📊 Gráfico guardado en: {save_path}")
+    plt.show()
+    
+    return max_error, mean_error
+
+
+def generate_summary():
+    """Genera resumen técnico de la linearización PWL."""
+    print("🎯 LINEARIZACIÓN PWL - RESUMEN TÉCNICO")
+    print("=" * 50)
+    
+    metadata = PWL_SEGMENTS.get("_metadata", {})
+    
+    print("📊 ESPECIFICACIONES:")
+    print(f"   • Método: {metadata.get('method', 'N/A')}")
+    print(f"   • Número de segmentos: {metadata.get('n_segments', 0)}")
+    print(f"   • Error total: {metadata.get('total_error', 0):.4f} m³/s")
+    print(f"   • Breakpoints: {len(metadata.get('breakpoints', []))} puntos")
+    
+    print("🔧 CRITERIOS DE SELECCIÓN DE SEGMENTOS:")
+    print("   1. Puntos base en límites de colchones "
+          "(0, 1200, 1370, 1900, 5582)")
+    print("   2. Análisis adaptativo de curvatura")
+    print("   3. Subdivisión si error > 0.05 m³/s")
+    print("   4. Optimización recursiva hasta tolerancia")
+    
+    print("\n💻 USO EN MODELO:")
+    print("   from filt_cota import build_pwl_final_segments")
+    print("   segments = build_pwl_final_segments()")
 
 
 if __name__ == "__main__":
+    print("🧪 TESTING: LINEARIZACIÓN PWL DE FILTRACIONES")
+    print("=" * 45)
+    
+    # Pruebas básicas
     test_funciones()
+    
+    print("\n" + "=" * 45)
+    generate_summary()
+    
+    # Generar gráfico comparativo
+    print("\n📊 GENERANDO GRÁFICO COMPARATIVO...")
+    try:
+        max_err, mean_err = plot_filtration_comparison()
+        print(f"✅ Gráfico generado con error máx: {max_err:.4f} m³/s")
+    except Exception as e:
+        print(f"⚠️ Error generando gráfico: {e}")
+        print("   (Asegúrate de tener matplotlib instalado)")
+    
+    print("\n✅ Archivo optimizado - Linearización PWL con mayor precisión")
