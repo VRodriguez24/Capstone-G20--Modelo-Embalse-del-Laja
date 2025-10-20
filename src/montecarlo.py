@@ -17,6 +17,8 @@ Uso: python src/montecarlo.py
 from __future__ import annotations
 
 import os
+import time
+import psutil
 import numpy as np
 import pandas as pd
 import matplotlib.pyplot as plt
@@ -27,7 +29,7 @@ from typing import Dict, Tuple, List, Optional
 from data_loader import CENTRAL_TO_INJ_ARC
 from embalse import A_inyeccion
 from model import build_model_for_one_year, T, YEARS_HORIZON, Conv
-# from kpi import export_kpis_to_csv  # Remoción temporal
+from kpi import extract_kpis, aggregate_kpis, print_kpis
 
 
 def find_data_path() -> str:
@@ -400,11 +402,15 @@ class HybridSimulator:
                         for t in T
                     ) * Conv  # Convertir a Hm³
 
+                    # Extraer KPIs del modelo
+                    kpis = extract_kpis(model)
+
                     results.append({
                         "year": year,
                         "energy": energy,
                         "v_final": v_final,
                         "toro_usage": toro_usage,
+                        "kpis": kpis,  # Agregar KPIs
                         "status": "OK"
                     })
 
@@ -642,6 +648,78 @@ def validate_year(year):
     return year
 
 
+def get_performance_stats(start_time: float, process: psutil.Process) -> dict:
+    """
+    Calcula estadísticas de rendimiento del sistema.
+    
+    Args:
+        start_time: Tiempo de inicio de la ejecución (time.time())
+        process: Proceso actual de psutil
+        
+    Returns:
+        dict: Estadísticas de rendimiento incluyendo tiempo y memoria
+    """
+    execution_time = time.time() - start_time
+    
+    # Obtener información de memoria
+    memory_info = process.memory_info()
+    memory_percent = process.memory_percent()
+    
+    # Información del sistema
+    system_memory = psutil.virtual_memory()
+    
+    return {
+        "execution_time_seconds": execution_time,
+        "execution_time_formatted": format_time(execution_time),
+        "memory_rss_mb": memory_info.rss / (1024 * 1024),  # RSS en MB
+        "memory_vms_mb": memory_info.vms / (1024 * 1024),  # VMS en MB
+        "memory_percent": memory_percent,
+        "system_memory_total_gb": system_memory.total / (1024 * 1024 * 1024),
+        "system_memory_available_gb": system_memory.available / (1024 * 1024 * 1024),
+        "system_memory_used_percent": system_memory.percent
+    }
+
+
+def format_time(seconds: float) -> str:
+    """
+    Formatea tiempo en segundos a un formato legible.
+    
+    Args:
+        seconds: Tiempo en segundos
+        
+    Returns:
+        str: Tiempo formateado (ej: "2h 15m 30s" o "45.2s")
+    """
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    elif seconds < 3600:
+        minutes = int(seconds // 60)
+        secs = seconds % 60
+        return f"{minutes}m {secs:.1f}s"
+    else:
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = seconds % 60
+        return f"{hours}h {minutes}m {secs:.1f}s"
+
+
+def print_performance_stats(stats: dict, context: str = ""):
+    """
+    Imprime estadísticas de rendimiento simplificadas.
+    
+    Args:
+        stats: Diccionario con estadísticas de rendimiento
+        context: Contexto adicional para el título
+    """
+    print(f"\n{'=' * 50}")
+    print(f"⚡ RENDIMIENTO {context}")
+    print(f"{'=' * 50}")
+    print(f"🕒 Tiempo de ejecución: {stats['execution_time_formatted']}")
+    print(f"💾 RAM utilizada: {stats['memory_rss_mb']:.1f} MB")
+    print(f"💻 Memoria sistema utilizada: {stats['system_memory_used_percent']:.1f}%")
+    print(f"{'=' * 50}")
+
+
 def main():
     """Función principal - interfaz interactiva."""
 
@@ -694,6 +772,10 @@ def main():
         print("   ✅ Usando bootstrap puro - sin ruido estocástico")
 
         print("\n🚀 Iniciando simulación híbrida...")
+
+        # Inicializar medición de rendimiento
+        start_time = time.time()
+        process = psutil.Process()
 
         simulator = HybridSimulator()
         results = simulator.run_simulation(
@@ -764,6 +846,27 @@ def main():
                     print(f"   Desviación estándar: {vol_std:,.1f} Hm³")
                     print(f"   Rango: [{vol_min:,.1f}, {vol_max:,.1f}] Hm³")
 
+            # ANÁLISIS DE KPIs MONTE CARLO
+            print("\n" + "=" * 60)
+            print("📋 KPIs ESTRATÉGICOS MONTE CARLO")
+            print("=" * 60)
+            
+            # Recolectar todos los KPIs de todos los escenarios
+            all_kpis = []
+            for scenario in successful_scenarios:
+                for year_result in scenario["results"]:
+                    if "kpis" in year_result and year_result["kpis"]:
+                        all_kpis.append(year_result["kpis"])
+
+            if all_kpis:
+                # Agregar KPIs usando la función del módulo kpi
+                kpis_agregados = aggregate_kpis(all_kpis)
+                
+                # Mostrar KPIs agregados
+                print_kpis(kpis_agregados, "Monte Carlo")
+            else:
+                print("⚠️ No se pudieron calcular KPIs para los escenarios exitosos")
+
         # Generar gráficos de evolución histórica si hay múltiples años
         if n_years > 1 and results.get("results_by_year"):
             try:
@@ -772,40 +875,11 @@ def main():
                     results["results_by_year"],
                     output_dir="resultados"
                 )
-                print(f"📊 Gráficos generados: "
-                      f"{len(plot_files)} archivos PNG")
+                print(f"📊 Gráficos Monte Carlo: {len(plot_files)} archivos PNG")
                 for plot_file in plot_files:
-                    print(f"   📈 {plot_file}")
+                    print(f"   📈 {Path(plot_file).name}")
             except Exception as e:
                 print(f"   ⚠️ Error generando gráficos: {e}")
-
-        # Exportar resultados si hay datos exitosos
-        if results.get("successful_scenarios"):
-            try:
-                # Crear CSV con resumen de escenarios
-                import pandas as pd
-
-                scenarios_data = []
-                for scenario in results["successful_scenarios"]:
-                    scenarios_data.append({
-                        "scenario_id": scenario["scenario_id"],
-                        "total_energy_MWh": scenario["total_energy"],
-                        "total_toro_usage_Hm3": scenario["total_toro_usage"],
-                        "final_volume_Hm3": scenario["final_volume"]
-                    })
-
-                df_scenarios = pd.DataFrame(scenarios_data)
-                output_file = (f"resultados/montecarlo_scenarios_"
-                               f"{start_year}-{start_year + n_years - 1}.csv")
-
-                from pathlib import Path
-                Path("resultados").mkdir(exist_ok=True)
-                df_scenarios.to_csv(output_file, index=False)
-
-                print(f"\n📁 Resultados exportados: {output_file}")
-
-            except Exception as e:
-                print(f"   ⚠️ Error exportando: {e}")
 
         print("\n💡 VENTAJAS DEL MÉTODO HÍBRIDO:")
         print("   ✅ Variabilidad estocástica de Monte Carlo")
@@ -813,6 +887,10 @@ def main():
         print("   ✅ KPIs consistentes con análisis histórico")
         print(f"   ✅ Alta tasa de éxito: {results['success_rate']:.1f}%")
         print("   ✅ Resultados comparables y reproducibles")
+
+        # Imprimir estadísticas de rendimiento
+        performance_stats = get_performance_stats(start_time, process)
+        print_performance_stats(performance_stats, "(Monte Carlo)")
 
     except KeyboardInterrupt:
         print("\n\n👋 Saliendo del programa...")

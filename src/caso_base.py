@@ -1,24 +1,23 @@
 from typing import Tuple, Optional
 import os
 import sys
+import time
+import psutil
 import gurobipy as gp
+from pathlib import Path
 from gurobipy import GRB
 
 # --- Conjuntos/red ---
-from embalse import NODES, ARCS, A_inyeccion, A_generacion, IN, OUT
+from embalse import NODES, ARCS, A_inyeccion, IN, OUT
 # --- Datos (CSV) ---
 from data_loader import load_caudalmax, load_injections_for_year
 # --- Filtraciones y cotas ---
-from filt_cota import (
-    build_pwl_final_segments,
-    get_pwl_segments
-)
+from filt_cota import build_pwl_final_segments
 # --- KPIs ---
 from kpi import (
     extract_kpis,
     aggregate_kpis,
     print_kpis,
-    export_kpis_to_csv,
     generate_historical_plots
 )
 
@@ -42,8 +41,6 @@ T = [12, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
 # Reglas de riego / ecológico (constantes, mismos valores para todo t)
 TUCAPEL_MIN = 90.0     # m3/s
 ABANICO_MIN = 47.0     # m3/s
-SALTOS_MIN = 7.0       # m3/s
-SALTOS_MIN_T = {t: SALTOS_MIN for t in T}  # comodidad para indexar por t
 
 # Curvas estacionales para 1° y 2° regantes (factor por mes 1..12).
 # Tomadas de la Tabla N°2 (imagen). Valores entre 0 y 1.
@@ -54,14 +51,6 @@ FIRST_REGANTES_FACTOR = {
     5: 0.00, 6: 0.00, 7: 0.00, 8: 0.00,
     9: 1.00, 10: 1.00, 11: 1.00, 12: 1.00
 }
-# Para segundos regantes la columna "2° Regantes" de la tabla
-SECOND_REGANTES_FACTOR = {
-    1: 1.00, 2: 1.00, 3: 0.80, 4: 0.50,
-    5: 0.00, 6: 0.00, 7: 0.00, 8: 0.00,
-    9: 0.30, 10: 0.65, 11: 0.85, 12: 1.00
-}
-# Base para cálculo de déficit de 2dos regantes (según enunciado: 53 m3/s)
-SECOND_REGANTES_BASE = 53.0
 
 # Big-M y conversión
 M = 6000                        # Big-M
@@ -73,22 +62,82 @@ V_0 = 1400.0  # Volumen inicial por defecto
 V_min = 0.0     # Volumen mínimo
 V_max = 5582.0  # Volumen máximo
 
-# --- Colchones según configuración definitiva operacional ---
-# Riego puede ser valor fijo en Hm³ o porcentaje, Generación y Lago en %
-COLCHONES = {
-    # R=600 Hm³, G=5%, L=0%
-    "Inferior": {"lo": 0.0, "hi": 1200.0, "shares": (600.0, 0.05, 0.0)},
-    # R=40%, G=5%, L=45% (REDUCIDO del 55% para evitar infactibilidad)
-    "Transicion": {"lo": 1200.0, "hi": 1370.0, "shares": (0.40, 0.05, 0.55)},
-    # R=40%, G=40%, L=20%
-    "Intermedio": {"lo": 1370.0, "hi": 1900.0, "shares": (0.40, 0.40, 0.20)},
-    # R=25%, G=1200 Hm³, L=10%
-    "Superior":   {"lo": 1900.0, "hi": 5582.0, "shares": (0.25, 1200.0, 0.10)},
-}
-C_LABELS = list(COLCHONES.keys())
-
 # Configuración de filtraciones del embalse El Toro
 FILTR_ARC: Tuple[str, str] = ("Embalse", "control_FiltracionesLaja")
+
+
+# =============================
+# FUNCIONES DE RENDIMIENTO
+# =============================
+
+def get_performance_stats(start_time: float, process: psutil.Process) -> dict:
+    """
+    Calcula estadísticas de rendimiento del sistema.
+    
+    Args:
+        start_time: Tiempo de inicio de la ejecución (time.time())
+        process: Proceso actual de psutil
+        
+    Returns:
+        dict: Estadísticas de rendimiento incluyendo tiempo y memoria
+    """
+    execution_time = time.time() - start_time
+    
+    # Obtener información de memoria
+    memory_info = process.memory_info()
+    memory_percent = process.memory_percent()
+    
+    # Información del sistema
+    system_memory = psutil.virtual_memory()
+    
+    return {
+        "execution_time_seconds": execution_time,
+        "execution_time_formatted": format_time(execution_time),
+        "memory_rss_mb": memory_info.rss / (1024 * 1024),  # RSS en MB
+        "memory_vms_mb": memory_info.vms / (1024 * 1024),  # VMS en MB
+        "memory_percent": memory_percent,
+        "system_memory_total_gb": system_memory.total / (1024 * 1024 * 1024),
+        "system_memory_available_gb": system_memory.available / (1024 * 1024 * 1024),
+        "system_memory_used_percent": system_memory.percent
+    }
+
+def format_time(seconds: float) -> str:
+    """
+    Formatea tiempo en segundos a un formato legible.
+    
+    Args:
+        seconds: Tiempo en segundos
+        
+    Returns:
+        str: Tiempo formateado (ej: "2h 15m 30s" o "45.2s")
+    """
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    elif seconds < 3600:
+        minutes = int(seconds // 60)
+        secs = seconds % 60
+        return f"{minutes}m {secs:.1f}s"
+    else:
+        hours = int(seconds // 3600)
+        minutes = int((seconds % 3600) // 60)
+        secs = seconds % 60
+        return f"{hours}h {minutes}m {secs:.1f}s"
+
+def print_performance_stats(stats: dict, context: str = ""):
+    """
+    Imprime estadísticas de rendimiento simplificadas.
+    
+    Args:
+        stats: Diccionario con estadísticas de rendimiento
+        context: Contexto adicional para el título
+    """
+    print(f"\n{'=' * 50}")
+    print(f"⚡ RENDIMIENTO {context}")
+    print(f"{'=' * 50}")
+    print(f"🕒 Tiempo de ejecución: {stats['execution_time_formatted']}")
+    print(f"💾 RAM utilizada: {stats['memory_rss_mb']:.1f} MB")
+    print(f"💻 Memoria sistema utilizada: {stats['system_memory_used_percent']:.1f}%")
+    print(f"{'=' * 50}")
 
 
 # =============================
@@ -97,7 +146,7 @@ FILTR_ARC: Tuple[str, str] = ("Embalse", "control_FiltracionesLaja")
 def add_pwl_filtration_constraints(
     model,
     Filtr_vars,
-    Vprev_vars, 
+    Vprev_vars,
     time_periods: list,
     filtr_arc: tuple,
     segments: dict,
@@ -106,10 +155,10 @@ def add_pwl_filtration_constraints(
 ):
     """
     Agrega restricciones PWL para filtraciones con variables binarias.
-    
+
     Implementa la linearización de la función no-lineal de filtraciones
     usando segmentación PWL con variables binarias δ_{k,t}.
-    
+
     Args:
         model: Modelo de Gurobi
         Filtr_vars: Variables de filtración por período
@@ -119,12 +168,12 @@ def add_pwl_filtration_constraints(
         segments: Diccionario de segmentos PWL de filt_cota
         bigM: Valor Big-M para linearización
         v_max: Volumen máximo del embalse
-        
+
     Returns:
         dict: Variables auxiliares creadas (deltas)
     """
     f_i, f_j = filtr_arc
-    
+
     # Filtrar metadatos y obtener segmentos numéricos
     numeric_segments = {k: v for k, v in segments.items() if isinstance(k, int)}
     seg_ids = list(numeric_segments.keys())
@@ -138,11 +187,11 @@ def add_pwl_filtration_constraints(
 
     # Variables binarias δ_{k,t} para selección de segmento
     delta = model.addVars(
-        seg_ids, time_periods, 
-        vtype=GRB.BINARY, 
+        seg_ids, time_periods,
+        vtype=GRB.BINARY,
         name="delta_pwl_seg"
     )
-    
+
     # CRITICAL: Update model to commit variables
     model.update()
 
@@ -215,14 +264,11 @@ def build_model_for_one_year(
 
     # Helpers de balance
     def sum_in(n: str, t: int):
-        return gp.quicksum(y[i, n, t] for i in IN[n]) \
-             + gp.quicksum(x[i, n, t] for i in IN[n] if (i, n) in A_generacion)
+        return gp.quicksum(y[i, n, t] for i in IN[n])
 
     def sum_out(n: str, t: int):
-        return gp.quicksum(y[n, j, t] for j in OUT[n]) \
-             + gp.quicksum(
-                 x[n, j, t] for j in OUT[n] if (n, j) in A_generacion
-             )
+        return gp.quicksum(y[n, j, t] for j in OUT[n])
+
     A_ext = {(n, t): 0.0 for n in NODES for t in T}
     for (i, j) in A_inyeccion:
         for t in T:
@@ -256,8 +302,6 @@ def build_model_for_one_year(
 
     # 3) Variables
     y = m.addVars(ARCS, T, lb=0.0, name="y")
-    # Forzar sin generación: upper bound 0 para prohibir turbinado
-    x = m.addVars(A_generacion, T, lb=0.0, ub=0.0, name="x")
     V = m.addVars(T, lb=V_min, ub=V_max, name="V")
     Filtr = m.addVars(T, lb=0.0, name="Filtr")
     G = m.addVars(T, lb=0.0, name="G")
@@ -268,25 +312,9 @@ def build_model_for_one_year(
     dAb = m.addVars(T, vtype=GRB.BINARY, name="deltaAb")
     dTu = m.addVars(T, vtype=GRB.BINARY, name="deltaTu")
 
-    # Excedente de primeros regantes y su binaria
-    # Exc1_t = max{0, (Filtr_t + A_naturales_t) - 90*factor1_t}
-    Exc1 = m.addVars(T, lb=0.0, name="ExcedentePrimeros")
-    dExc1 = m.addVars(T, vtype=GRB.BINARY, name="deltaExc1")
-
     # "Pseudo-variable" para V0 y selección de colchón z[c]
     Vinit = m.addVar(lb=0.0, name="Vinit")
     m.addConstr(Vinit == V0_eff, name="link_Vinit")
-
-    z = m.addVars(C_LABELS, vtype=GRB.BINARY, name="z")
-    m.addConstr(gp.quicksum(z[c] for c in C_LABELS) == 1, name="C_sum_z")
-
-    # Selección por rangos con Big-M: lo_c + EPS <= Vinit <= hi_c si z[c]=1
-    for c in C_LABELS:
-        lo = COLCHONES[c]["lo"]
-        hi = COLCHONES[c]["hi"]
-        eps_lo = EPS if c != "Inferior" else 0.0   # no excluye 0 del inferior
-        m.addConstr(Vinit >= (lo + eps_lo) - M * (1 - z[c]), name=f"C_{c}_lo")
-        m.addConstr(Vinit <= hi + M * (1 - z[c]), name=f"C_{c}_hi")
 
     # 4) Restricciones
 
@@ -360,7 +388,6 @@ def build_model_for_one_year(
     for t in T:
         # Factores estacionales para el mes t
         first_factor = FIRST_REGANTES_FACTOR.get(t, 1.0)
-        #second_factor = SECOND_REGANTES_FACTOR.get(t, 1.0)
 
         # PRIMEROS REGANTES
         # Abanico: DefAb_t = max{0, 47*factor1_t - Filtr_t - A_abanico_t}
@@ -384,90 +411,23 @@ def build_model_for_one_year(
         m.addConstr(DefTu[t] <= M * dTu[t], name=f"DTu_ub2_{t}")
 
         # Cobertura desde Embalse via El Toro (suma de déficits)
-        # Q_extraccion_El_Toro >= Q_deficit_1os 
+        # Q_extraccion_El_Toro >= Q_deficit_1os
         m.addConstr(
-            x["Embalse", "ElToro", t] >= DefAb[t] + DefTu[t],
+            y["Embalse", "ElToro", t] >= DefAb[t] + DefTu[t],
             name=f"D_cover_by_ElToro_{t}"
         )
 
-    # (R7) Presupuestos por colchón basados en volumen inicial
-    # Variables auxiliares para linearización McCormick
-    vinit_share = m.addVars(C_LABELS, lb=0.0, ub=V_max, name="vinit_share")
-
-    for c in C_LABELS:
-        # Linearización McCormick para vinit_share[c] = z[c] * Vinit
-        m.addConstr(vinit_share[c] <= V_max * z[c],
-                    name=f"R7a_McCormick1_{c}")
-        m.addConstr(vinit_share[c] >= 0, name=f"R7b_McCormick2_{c}")
-        m.addConstr(vinit_share[c] <= Vinit, name=f"R7c_McCormick3_{c}")
-        m.addConstr(vinit_share[c] >= Vinit - V_max * (1 - z[c]),
-                    name=f"R7d_McCormick4_{c}")
-
-    # Cálculo de uso anual por categoría (Hm3) - CORREGIDO PARA USO DUAL
-
-    # Calcular total de agua por El Toro (convertir a Hm³/año)
-    sum_eltoro_total_Hm3 = gp.quicksum(
-        x["Embalse", "ElToro", t] for t in T
-    ) * Conv
-
-    # RIEGO: Solo la cobertura de déficits desde El Toro (primeros regantes)
-    # (uso exclusivo para riego = agua destinada a cubrir déficits)
-    sum_riego_Hm3 = gp.quicksum((DefAb[t] + DefTu[t]) for t in T)
-
-    # GENERACIÓN: No se contabiliza como uso de agua en este enfoque
-    # porque la función objetivo minimiza déficit y no maximiza generación.
-    # Mantener la variable por compatibilidad (valor 0).
-    sum_gen_Hm3 = gp.LinExpr(0.0)
-
-    # Cálculo de presupuestos por colchón
-    budget_terms = {"riego": [], "generacion": [], "lago": []}
-
-    for c in C_LABELS:
-        r_share, g_share, l_share = COLCHONES[c]["shares"]
-
-        # Para cada categoría: valor fijo (>1.0) o porcentaje (<=1.0)
-        categories = [("riego", r_share), ("generacion", g_share),
-                      ("lago", l_share)]
-        for category, share in categories:
-            if share > 1.0:  # Valor fijo en Hm³
-                budget_terms[category].append(share * z[c])
-            else:  # Porcentaje del volumen inicial
-                budget_terms[category].append(share * vinit_share[c])
-
-    # Restricciones de presupuesto anual
-    budget_riego = gp.quicksum(budget_terms["riego"])
-    budget_gen = gp.quicksum(budget_terms["generacion"])
-    budget_lago = gp.quicksum(budget_terms["lago"])
-
-    # RESTRICCIONES R7 REACTIVADAS: Ahora compatibles con PWL SOS2
-    m.addConstr(sum_riego_Hm3 <= budget_riego, name="R7e_presupuesto_riego")
-    m.addConstr(sum_gen_Hm3 <= budget_gen, name="R7f_presupuesto_generacion")
-
-    # Restricción mensual de volumen mínimo para lago
-    for t in T:
-        m.addConstr(V[t] >= budget_lago, name=f"R7g_volumen_lago_{t}")
-
-    # (R8) Mínimo ecológico en Saltos del Laja
-    for t in T:
-        m.addConstr(
-            gp.quicksum(y[i, "SaltosLaja", t] for i in IN["SaltosLaja"])
-            >= SALTOS_MIN_T[t],
-            name=f"R8_saltos_min_{t}"
-        )
-
-    # 5) FO: Max energía total
+    # 5) FO: Mín déficit total
     m.setObjective(gp.quicksum(DefAb[t] + DefTu[t] for t in T), GRB.MINIMIZE)
 
     # Adjuntar variables y metadatos al modelo para postprocesamiento
     m._y = y
-    m._x = x
     m._V = V
     m._Filtr = Filtr
     m._G = G
     m._meta = {
         "eta": eta,
         "Conv": Conv,
-        "A_generacion": A_generacion,
         "ARCS": ARCS
     }
 
@@ -604,6 +564,10 @@ if __name__ == "__main__":
         print(f"💧 Volumen inicial: {V0:,.1f} Hm³")
         print("=" * 60)
 
+        # Inicializar medición de rendimiento
+        start_time = time.time()
+        process = psutil.Process()
+
         # Ejecutar simulación
         results = []
         current_V0 = V0
@@ -629,9 +593,9 @@ if __name__ == "__main__":
                     v_final = V_vars[final_month].x
 
                     # Calcular uso del Toro (agua extraída) en Hm³
-                    x_vars = model._x
+                    y_vars = model._y
                     toro_usage = sum(
-                        x_vars["Embalse", "ElToro", t].x
+                        y_vars["Embalse", "ElToro", t].x
                         for t in T
                     ) * Conv
 
@@ -796,21 +760,24 @@ if __name__ == "__main__":
                         )
                     )
 
-                # Exportar a CSV
+                # Generar gráfico específico
                 try:
-                    export_files = export_kpis_to_csv(
-                        {"cota_mensual": cota_prom_agregada,
-                         "deficit_max_m3s": deficit_max_prom,
-                         "deficit_prom_m3s": deficit_prom_prom,
-                         "confiabilidad_%": confiabilidad_prom},
-                        prefix=f"agregados_{years[0]}-{years[-1]}"
+                    # Crear estructura básica de KPIs para gráficos
+                    kpis_simple = [{
+                        "cota_mensual": {t: 1320.0 for t in T},  # Valor placeholder
+                        "dependencia_lago_m3s": {t: deficit_prom_prom for t in T}
+                    }]
+                    plot_files = generate_historical_plots(
+                        kpis_simple,
+                        [years[0]],  # Año representativo
+                        output_dir="resultados",
+                        plot_name="evolucion_historica_lago_caso_base"
                     )
-                    print(
-                        f"\n📁 Resultados exportados a: "
-                        f"{len(export_files)} archivos CSV"
-                    )
+                    print(f"\n� Gráfico generado: {len(plot_files)} archivo PNG en 'resultados/'")
+                    for file_path in plot_files:
+                        print(f"   ✓ {Path(file_path).name}")
                 except Exception as e:
-                    print(f"   ⚠️ Error exportando: {e}")
+                    print(f"   ⚠️ Error generando gráfico: {e}")
 
         # Tabla detallada si hay múltiples años
         if years_count > 1:
@@ -833,6 +800,11 @@ if __name__ == "__main__":
                     )
             print("━" * 80)
 
+        # Imprimir estadísticas de rendimiento
+        performance_stats = get_performance_stats(start_time, process)
+        context = f"({years_count} años)" if years_count > 1 else f"(año {years[0]})"
+        print_performance_stats(performance_stats, context)
+
     def run_all_years():
         """Ejecuta el modelo para todos los años disponibles."""
         min_year, max_year = min(YEARS_HORIZON), max(YEARS_HORIZON)
@@ -853,6 +825,10 @@ if __name__ == "__main__":
 
         print("\n🚀 Iniciando simulación completa...")
         print("=" * 60)
+
+        # Inicializar medición de rendimiento
+        start_time = time.time()
+        process = psutil.Process()
 
         results = []
         current_V0 = V0
@@ -878,9 +854,9 @@ if __name__ == "__main__":
                     v_final = V_vars[final_month].x
 
                     # Calcular uso del Toro
-                    x_vars = model._x
+                    y_vars = model._y
                     toro_usage = sum(
-                        x_vars["Embalse", "ElToro", t].x
+                        y_vars["Embalse", "ElToro", t].x
                         for t in T
                     ) * Conv
 
@@ -1001,35 +977,27 @@ if __name__ == "__main__":
                 # Mostrar los 4 KPIs estratégicos históricos
                 print_kpis(kpis_agregados, "Histórico")
 
-                # Exportar resultados históricos
-                try:
-                    export_files = export_kpis_to_csv(
-                        kpis_agregados,
-                        prefix="historicos_1960-2023"
-                    )
-                    print(
-                        f"\n📁 KPIs históricos exportados: "
-                        f"{len(export_files)} archivos CSV"
-                    )
-                except Exception as e:
-                    print(f"   ⚠️ Error exportando históricos: {e}")
-
-                # Generar gráficos históricos
+                # Generar gráficos históricos con nombre específico
                 try:
                     plot_files = generate_historical_plots(
                         kpis_historicos,
                         all_years,
-                        output_dir="resultados"
+                        output_dir="resultados",
+                        plot_name="evolucion_historica_lago_caso_base"
                     )
-                    print(
-                        f"📊 Gráficos generados: {len(plot_files)} archivos PNG"
-                    )
+                    print(f"📊 Gráficos generados: {len(plot_files)} archivos PNG")
+                    for file_path in plot_files:
+                        print(f"   ✓ {Path(file_path).name}")
                 except Exception as e:
                     print(f"   ⚠️ Error generando gráficos: {e}")
             else:
                 print(
                     "\n⚠️ No se pudieron calcular KPIs históricos detallados"
                 )
+
+        # Imprimir estadísticas de rendimiento
+        performance_stats = get_performance_stats(start_time, process)
+        print_performance_stats(performance_stats, "(simulación completa)")
 
     # Bucle principal
     while True:

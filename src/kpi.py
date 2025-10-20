@@ -679,7 +679,8 @@ def print_kpis(kpis: Dict[str, Any], context: str = "") -> None:
 
 def export_kpis_to_csv(kpis: Dict[str, Any],
                       output_dir: str = "resultados",
-                      prefix: str = "kpis") -> List[str]:
+                      prefix: str = "kpis",
+                      suffix: str = "") -> List[str]:
     """
     Exporta KPIs a archivos CSV estructurados para análisis posterior.
     
@@ -703,6 +704,7 @@ def export_kpis_to_csv(kpis: Dict[str, Any],
         kpis: Diccionario con KPIs calculados (individual o agregado)
         output_dir: Directorio de salida (se crea si no existe)
         prefix: Prefijo para nombres de archivo (ej: "2023", "historico", "montecarlo")
+        suffix: Sufijo adicional para evitar sobreescribir archivos (ej: timestamp, configuración)
 
     Returns:
         List[str]: Lista de rutas completas de archivos CSV generados
@@ -762,7 +764,12 @@ def export_kpis_to_csv(kpis: Dict[str, Any],
     # ===============================
     if data:
         kpis_df = pd.DataFrame(data)
-        kpis_file = output_path / f"{prefix}_kpis_estrategicos.csv"
+        # Construir nombre con sufijo si se proporciona
+        base_name = f"{prefix}_kpis_estrategicos"
+        if suffix:
+            kpis_file = output_path / f"{base_name}_{suffix}.csv"
+        else:
+            kpis_file = output_path / f"{base_name}.csv"
         kpis_df.to_csv(kpis_file, index=False, encoding='utf-8')
         files_created.append(str(kpis_file))
 
@@ -776,7 +783,12 @@ def export_kpis_to_csv(kpis: Dict[str, Any],
             "mes": T,  # Período hidrológico: [12,1,2,...,11]
             "cota_msnm": [cota_data.get(t, 0) for t in T]
         })
-        cota_file = output_path / f"{prefix}_trayectoria_cota.csv"
+        # Construir nombre con sufijo si se proporciona
+        base_name = f"{prefix}_trayectoria_cota"
+        if suffix:
+            cota_file = output_path / f"{base_name}_{suffix}.csv"
+        else:
+            cota_file = output_path / f"{base_name}.csv"
         cota_df.to_csv(cota_file, index=False, encoding='utf-8')
         files_created.append(str(cota_file))
 
@@ -785,7 +797,8 @@ def export_kpis_to_csv(kpis: Dict[str, Any],
 
 def generate_historical_plots(kpis_historicos: List[Dict[str, Any]],
                              years: List[int],
-                             output_dir: str = "resultados") -> List[str]:
+                             output_dir: str = "resultados",
+                             plot_name: str = "evolucion_historica_lago") -> List[str]:
     """
     Genera gráficos de evolución histórica para análisis visual de tendencias.
     
@@ -809,6 +822,7 @@ def generate_historical_plots(kpis_historicos: List[Dict[str, Any]],
         kpis_historicos: Lista de KPIs calculados por año histórico
         years: Lista de años correspondientes (misma longitud que kpis_historicos)
         output_dir: Directorio donde guardar los gráficos PNG
+        plot_name: Nombre específico para el archivo de gráfico (sin extensión)
 
     Returns:
         List[str]: Lista de rutas completas de archivos PNG generados
@@ -865,8 +879,8 @@ def generate_historical_plots(kpis_historicos: List[Dict[str, Any]],
 
     plt.tight_layout()
 
-    # Guardar gráfico
-    plot_file = output_path / "evolucion_historica_lago.png"
+    # Guardar gráfico con nombre específico
+    plot_file = output_path / f"{plot_name}.png"
     plt.savefig(plot_file, dpi=300, bbox_inches='tight')
     plt.close()
     files_created.append(str(plot_file))
