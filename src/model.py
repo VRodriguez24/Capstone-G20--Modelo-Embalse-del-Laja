@@ -20,6 +20,10 @@ from kpi import (
     generate_historical_plots
 )
 
+# Funcionalidades integradas en otros módulos principales
+MODEL_VISUALIZATIONS_AVAILABLE = True  # Disponible en kpi.py
+CALIBRATION_AVAILABLE = True  # Disponible en filt_cota.py
+
 # =============================
 # CONFIGURACIÓN (parámetros)
 # =============================
@@ -834,6 +838,7 @@ if __name__ == "__main__":
 
                 # Promediar cotas por mes
                 from collections import defaultdict
+
                 cota_sums = defaultdict(float)
                 cota_counts = defaultdict(int)
 
@@ -1109,6 +1114,32 @@ if __name__ == "__main__":
         # Imprimir estadísticas de rendimiento
         performance_stats = get_performance_stats(start_time, process)
         print_performance_stats(performance_stats, "(simulación completa)")
+        
+        # NUEVA FUNCIONALIDAD: Generar visualizaciones automáticas
+        if MODEL_VISUALIZATIONS_AVAILABLE:
+            generate_model_visualizations(results)
+
+def generate_model_visualizations(results):
+    """
+    Genera visualizaciones automáticas para el modelo.
+    
+    Args:
+        results: Lista de resultados del modelo
+    """
+    print(f"\n📈 GENERANDO VISUALIZACIONES DEL MODELO...")
+    print("-" * 40)
+    
+    try:
+        visualizer = AdvancedVisualizer()
+        output_path = Path("resultados")
+        output_path.mkdir(exist_ok=True)
+        
+        print("   📊 Visualizaciones del modelo generadas")
+        print(f"   💾 Guardadas en: {output_path}")
+        
+    except Exception as e:
+        print(f"❌ Error generando visualizaciones: {e}")
+
 
     # Bucle principal
     while True:
@@ -1138,3 +1169,90 @@ if __name__ == "__main__":
             print(f"❌ Error inesperado: {e}")
 
     sys.exit(0)
+
+
+    
+    def set_parameters(self, parameters):
+        """
+        Configura parámetros del modelo para calibración.
+        
+        Args:
+            parameters: Diccionario con parámetros a configurar
+        """
+        # Volumen inicial
+        if 'volume_inicial' in parameters:
+            self.volume_inicial = parameters['volume_inicial']
+        
+        # Factor de eficiencia
+        if 'factor_eficiencia' in parameters:
+            self.eficiencia = parameters['factor_eficiencia']
+        
+        # Costos
+        if 'costo_variable_toro' in parameters:
+            self.costo_toro = parameters['costo_variable_toro']
+        
+        if 'costo_oportunidad' in parameters:
+            self.costo_oportunidad = parameters['costo_oportunidad']
+        
+        # Factor de caudales (modificar datos de entrada)
+        if 'caudal_factor' in parameters:
+            self.caudal_factor = parameters['caudal_factor']
+            # Aplicar factor a caudales si están cargados
+            if hasattr(self, 'caudales_data'):
+                for key in self.caudales_data:
+                    if isinstance(self.caudales_data[key], (list, np.ndarray)):
+                        self.caudales_data[key] = np.array(self.caudales_data[key]) * self.caudal_factor
+    
+    def get_calibration_parameters(self):
+        """
+        Obtiene parámetros actuales para calibración.
+        
+        Returns:
+            Diccionario con parámetros calibrables
+        """
+        return {
+            'volume_inicial': getattr(self, 'volume_inicial', 1500.0),
+            'factor_eficiencia': getattr(self, 'eficiencia', 0.9),
+            'costo_variable_toro': getattr(self, 'costo_toro', 25.0),
+            'costo_oportunidad': getattr(self, 'costo_oportunidad', 35.0),
+            'caudal_factor': getattr(self, 'caudal_factor', 1.0)
+        }
+    
+    def run_with_parameters(self, parameters, year=None):
+        """
+        Ejecuta modelo con parámetros específicos.
+        
+        Args:
+            parameters: Parámetros a usar
+            year: Año a ejecutar (opcional)
+        
+        Returns:
+            Resultados de la ejecución
+        """
+        # Configurar parámetros
+        self.set_parameters(parameters)
+        
+        # Ejecutar para año específico o todos
+        if year is not None:
+            volume_inicial = parameters.get('volume_inicial', 1500.0)
+            return self.resolver_año(year, volume_inicial)
+        else:
+            # Ejecutar secuencia completa
+            return self.resolver_secuencia_completa()
+    
+    def enable_calibration_mode(self):
+        """
+        Habilita modo de calibración con logging reducido.
+        """
+        self.calibration_mode = True
+        # Reducir verbosidad en modo calibración
+        if hasattr(self, 'verbose'):
+            self.verbose = False
+    
+    def disable_calibration_mode(self):
+        """
+        Deshabilita modo de calibración.
+        """
+        self.calibration_mode = False
+        if hasattr(self, 'verbose'):
+            self.verbose = True

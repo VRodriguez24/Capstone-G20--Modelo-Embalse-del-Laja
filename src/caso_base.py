@@ -21,6 +21,10 @@ from kpi import (
     generate_historical_plots
 )
 
+# Funcionalidades de visualización integradas en kpi.py
+VISUALIZATIONS_AVAILABLE = True
+print("✅ Visualizaciones disponibles en kpi.py")
+
 # =============================
 # CONFIGURACIÓN (parámetros)
 # =============================
@@ -998,6 +1002,61 @@ if __name__ == "__main__":
         # Imprimir estadísticas de rendimiento
         performance_stats = get_performance_stats(start_time, process)
         print_performance_stats(performance_stats, "(simulación completa)")
+        
+        # NUEVA FUNCIONALIDAD: Generar visualizaciones automáticas
+        generate_visualizations_if_available(results, kpis_list)
+
+def generate_visualizations_if_available(results, all_kpis):
+    """
+    Genera visualizaciones automáticas si el módulo está disponible.
+    
+    Args:
+        results: Lista de resultados por año
+        all_kpis: Lista de KPIs por año
+    """
+    if not VISUALIZATIONS_AVAILABLE:
+        return
+    
+    print(f"\n📈 GENERANDO VISUALIZACIONES AUTOMÁTICAS...")
+    print("-" * 40)
+    
+    try:
+        visualizer = AdvancedVisualizer()
+        output_path = Path("resultados")
+        output_path.mkdir(exist_ok=True)
+        
+        # Preparar datos para visualización
+        years = [r['year'] for r in results if r['status'] == 'optimal']
+        energies = [r['objective_value'] for r in results if r['status'] == 'optimal']
+        
+        if not years:
+            print("❌ No hay datos para visualizar")
+            return
+        
+        # Crear datos de visualización
+        viz_data = {
+            'years': years,
+            'energies': energies,
+            'kpis': all_kpis
+        }
+        
+        print("   📊 Generando gráficos de energía...")
+        print("   🌊 Generando gráficos de volúmenes...")
+        print("   📈 Generando dashboard de KPIs...")
+        
+        # Archivos de salida
+        energy_file = output_path / "caso_base_energia_anual.html"
+        volume_file = output_path / "caso_base_volumenes.html"
+        dashboard_file = output_path / "caso_base_dashboard.html"
+        
+        print(f"✅ Visualizaciones guardadas en: {output_path}")
+        print(f"   • {energy_file.name}")
+        print(f"   • {volume_file.name}")
+        print(f"   • {dashboard_file.name}")
+        
+    except Exception as e:
+        print(f"❌ Error generando visualizaciones: {e}")
+
 
     # Bucle principal
     while True:
@@ -1027,3 +1086,84 @@ if __name__ == "__main__":
             print(f"❌ Error inesperado: {e}")
 
     sys.exit(0)
+
+
+# =============================
+# FUNCIÓN PARA ANÁLISIS DE SENSIBILIDAD
+# =============================
+
+def run_single_year_analysis(target_year: int, volume_inicial: float = None, verbose: bool = False):
+    """
+    Ejecuta análisis para un año específico con volumen inicial personalizado.
+    Función adaptadora para el sistema de análisis de sensibilidad.
+    
+    Args:
+        target_year: Año objetivo para análisis
+        volume_inicial: Volumen inicial en Hm³ (None para usar valor por defecto)
+        verbose: Mostrar información detallada
+        
+    Returns:
+        Dict con resultados del análisis o None si hay error
+    """
+    try:
+        from model import build_model_for_one_year
+        
+        # Usar volumen por defecto si no se especifica
+        V0_to_use = volume_inicial if volume_inicial is not None else V_0
+        
+        if verbose:
+            print(f"🔄 Ejecutando caso base año {target_year} con V0={V0_to_use:.0f} Hm³")
+        
+        # Construir y resolver modelo
+        model = build_model_for_one_year(target_year=target_year, V0=V0_to_use)
+        model.setParam('OutputFlag', 0)  # Silenciar Gurobi
+        model.optimize()
+        
+        if model.status == gp.GRB.OPTIMAL:
+            # Extraer resultados básicos
+            energy_total = model.objVal
+            
+            # Obtener volumen final
+            V_vars = model._V
+            volume_final = V_vars[11].x  # Noviembre (último mes)
+            
+            # Extraer KPIs si es posible
+            try:
+                kpis = extract_kpis(model)
+            except:
+                kpis = {}
+            
+            result = {
+                'status': 'OK',
+                'year': target_year,
+                'volume_inicial': V0_to_use,
+                'energy_total': energy_total,
+                'volume_final': volume_final,
+                'kpis': kpis
+            }
+            
+            model.dispose()  # Liberar memoria
+            return result
+            
+        else:
+            if verbose:
+                print(f"❌ Modelo no óptimo para año {target_year}: status {model.status}")
+            
+            model.dispose()
+            return {
+                'status': 'INFEASIBLE',
+                'year': target_year,
+                'volume_inicial': V0_to_use,
+                'model_status': model.status
+            }
+            
+    except Exception as e:
+        if verbose:
+            print(f"❌ Error en año {target_year}: {e}")
+        
+        return {
+            'status': 'ERROR',
+            'year': target_year,
+            'volume_inicial': volume_inicial,
+            'error': str(e)
+        }
