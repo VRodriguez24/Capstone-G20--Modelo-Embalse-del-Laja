@@ -355,35 +355,30 @@ ls -la
 cd src
 python caso_base.py
 ```
-- **Duración**: 15-30 minutos (64 años de análisis secuencial)
+- **Duración**: 10 segundos aprox (64 años de análisis secuencial)
 - **Datos procesados**: 4,609 registros mensuales históricos validados
-- **Output**: Gráficos en `resultados/` + archivos de análisis
+- **Output**: Gráficos en `resultados/evolucion_historica_lago_caso_base.png`
 - **Propósito**: Línea base determinista y calibración del modelo
 
-#### **2. Simulación Monte Carlo (Análisis de Riesgo)**  
+#### **2. Simulación Monte Carlo**  
+```powershell
+cd src
+python model.py
+```
+- **Configuración**: Interfaz interactiva para parámetros (años, escenarios, bootstrap)
+- **Duración**: 1 min aprox (64 años)
+- **Output**: Visualizaciones en `resultados/evolucion_historica_lago.png`
+- **Propósito**: Correr nuestro modelo con los datos historicos para todos los años
+
+#### **3. Simulación Monte Carlo**  
 ```powershell
 cd src
 python montecarlo.py
 ```
 - **Configuración**: Interfaz interactiva para parámetros (años, escenarios, bootstrap)
-- **Duración**: 30 min - 8 horas (según número de escenarios: 100-1000+)
+- **Duración**: 40-50 min aprox (según número de escenarios: 100, con 64 años)
 - **Output**: Visualizaciones Monte Carlo en `resultados/montecarlo_evolucion_historica.png`
-- **Propósito**: Análisis de robustez y cuantificación de incertidumbre
-
-#### **3. Modelo Individual (Testing/Validación)**
-```powershell
-cd src
-python -c "
-from model import build_model_for_one_year
-model = build_model_for_one_year(2020, V0=1400.0)
-model.optimize()
-print(f'Energía generada: {model.objVal:.2f} MWh')
-print(f'Status optimización: {model.status} (2=óptimo)')
-print(f'Gap: {model.MIPGap:.6f}')
-"
-```
-- **Uso**: Validación, debugging, análisis de año específico
-- **Duración**: 5-45 segundos por año individual
+- **Propósito**: Correr nuestro modelo con el blockboostrap implementado en Monte Carlo
 
 ### Configuración de Parámetros
 
@@ -417,17 +412,6 @@ verbose = True                   # Logging detallado
 
 ---
 
-## 📊 Interpretación de Resultados
-
-### KPIs Estratégicos - Valores de Referencia
-
-| **KPI** | **Excelente** | **Bueno** | **Regular** | **Problemático** |
-|---------|---------------|-----------|-------------|------------------|
-| **Tiempo Colchón Superior** | >40% | 25-40% | 15-25% | <15% |
-| **Uso Presupuesto Riego** | 85-100% | 70-85% | 50-70% | <50% o >100% |
-| **Participación El Toro** | 45-65% | 35-45% o 65-75% | 25-35% o 75-85% | <25% o >85% |
-| **Factor Utilización** | >75% | 60-75% | 45-60% | <45% |
-
 ### Estructura de Archivos de Salida
 
 #### **Estructura Real de Resultados:**
@@ -439,168 +423,18 @@ verbose = True                   # Logging detallado
 └── montecarlo_evolucion_historica.png         # Simulación estocástica multi-escenario
 ```
 
-**Archivos Dinámicos (generados automáticamente):**
+**Archivos Dinámicos (generados en consola):**
 ```
-📁 resultados/ (durante ejecución)
+(Durante ejecución)
 ├── kpis_estrategicos_TIMESTAMP.csv            # KPIs por escenario/año
 ├── trayectoria_volumen_TIMESTAMP.csv          # Evolución temporal embalse
 ├── distribucion_colchones_TIMESTAMP.csv       # Análisis operativo por rangos
 └── metricas_performance_TIMESTAMP.csv         # Benchmarks computacionales
 ```
 
-### Interpretación Práctica de Resultados
-
-#### **Escenarios Operativos Típicos:**
-
-**🟢 Operación Óptima:**
-- Colchón Superior >35%, Intermedio >30%
-- Uso Presupuesto Riego 85-95%
-- Participación El Toro 50-60%
-- Factor Utilización >70%
-
-**🟡 Operación Balanceada:**
-- Colchón Superior 20-35%, Intermedio >25%
-- Uso Presupuesto Riego 75-90%
-- Participación El Toro 40-70%
-- Factor Utilización 55-70%
-
-**🔴 Operación Tensionada:**
-- Colchón Inferior >20%, Transición >15%
-- Uso Presupuesto Riego <75% o >100%
-- Participación El Toro <35% o >75%
-
 ---
 
-## 🎯 Casos de Uso y Aplicaciones
-
-### 1. **Planificación Operativa Anual**
-- **Objetivo**: Optimizar estrategia de llenado/vaciado del embalse
-- **Método**: Análisis histórico determinista + KPIs estratégicos
-- **Deliverables**: 
-  - Volúmenes objetivo estacionales
-  - Presupuestos hídricos riego/generación
-  - Identificación períodos críticos
-
-### 2. **Análisis de Riesgo Hidrológico**
-- **Objetivo**: Cuantificar probabilidad de déficits bajo incertidumbre
-- **Método**: Simulación Monte Carlo con bootstrap por bloques
-- **Deliverables**:
-  - Distribuciones de energía generada
-  - Bandas de confianza operativas
-  - Análisis de valor en riesgo (VaR)
-
-### 3. **Evaluación de Políticas Operativas**
-- **Objetivo**: Impacto de cambios regulatorios/operativos
-- **Método**: Análisis comparativo determinista vs. estocástico
-- **Deliverables**:
-  - Sensibilidad a caudales ecológicos
-  - Trade-offs generación vs. riego
-  - Justificación técnica de colchones
-
-### 4. **Soporte Decisiones Regulatorias**
-- **Objetivo**: Respaldo técnico para cumplimiento normativo
-- **Método**: Reportes ejecutivos automatizados
-- **Deliverables**:
-  - Cumplimiento normativa DGA
-  - Reportes stakeholders  
-  - Justificación operación multi-propósito
-
----
-
-## 🔧 Especificaciones Técnicas
-
-### Arquitectura Computacional
-- **Modelo de Optimización**: Programación Lineal Mixta-Entera (MILP)
-- **Solver**: Gurobi 10.0.3 con algoritmos branch-and-cut
-- **Variables por año**: ~50,000 (continuas + binarias PWL)
-- **Restricciones por año**: ~30,000 (balance + límites + lógica)
-- **Gap de optimalidad**: 1e-4 (0.01%)
-
-### Red Hidráulica Modelada
-- **Topología**: 42 nodos, 50+ arcos dirigidos
-- **Capacidad total instalada**: 1,050 MW (7 centrales)
-- **Volumen embalse principal**: 0-5,582 Hm³ (El Toro)
-- **Demandas anuales**: 900 Hm³ riego + caudales ecológicos
-- **Filtraciones**: Función no-lineal PWL 8 segmentos
-
-### Performance Computacional
-```python
-# Benchmarks validados (hardware actual):
-# Código: 4,183 líneas Python total en 7 módulos
-# Datos: 4,609 registros históricos (1960-2023)
-
-Año individual:        5-45 segundos (según complejidad hidrológica del año)
-Análisis histórico:    15-30 minutos (64 años × optimización secuencial)
-Monte Carlo (100):     30-90 minutos (bootstrap por bloques temporal)
-Monte Carlo (500):     2-4 horas (análisis robusto con correlaciones)
-Monte Carlo (1000):    4-8 horas (análisis exhaustivo de incertidumbre)
-
-# Uso de memoria validado:
-Modelo MILP individual: ~500 MB - 1 GB (963 líneas, ~50k variables)
-Sistema KPIs completo:  ~200-400 MB (1,001 líneas, 4 indicadores)  
-Análisis histórico:     ~2-4 GB (875 líneas, 64 años en memoria)
-Monte Carlo completo:   ~4-8 GB (757 líneas, múltiples escenarios)
-```
-
-### Validación y Testing
-- **Consistencia datos**: Validación cruzada series históricas
-- **Balance hídrico**: Verificación automática conservación masa
-- **Optimización**: Tests unitarios convergencia solver
-- **KPIs**: Validación rangos y coherencia lógica
-
----
-
-## 🛠️ Desarrollo y Extensibilidad
-
-### Principios de Diseño
-```python
-# Arquitectura modular con separación de responsabilidades
-src/
-├── model.py          # Core: formulación matemática y solver
-├── montecarlo.py     # Extensión: análisis estocástico  
-├── kpi.py           # Analytics: métricas de negocio
-├── filt_cota.py     # Utils: funciones técnicas específicas
-├── embalse.py       # Config: topología y parámetros  
-└── data_loader.py   # Interface: abstracción de datos
-```
-
-### Extensiones Futuras
-#### **Nuevas Centrales:**
-```python
-# Agregar en embalse.py
-NODES.append("NuevaCentral")
-ARCS.append(("control_Nueva", "NuevaCentral"))
-
-# Actualizar data_loader.py  
-CENTRAL_TO_GEN_ARC["NUEVA"] = ("control_Nueva", "NuevaCentral")
-```
-
-#### **KPIs Adicionales:**
-```python
-# Extender kpi.py
-def calculate_custom_kpi(model: gp.Model) -> float:
-    """Implementar nueva métrica de negocio"""
-    return custom_calculation(model._x, model._V)
-```
-
-#### **Algoritmos de Sampling:**
-```python
-# Heredar de BlockBootstrapSampler
-class CustomSampler(BlockBootstrapSampler):
-    def sample_year(self, **kwargs) -> Dict:
-        """Implementar nueva metodología estocástica"""
-        return custom_sampling_logic()
-```
-
-### Mantenimiento y Debugging
-- **Logging**: Sistema de trazas configurables por módulo
-- **Error Handling**: Excepciones específicas con mensajes descriptivos
-- **Memory Management**: Disposal automático objetos Gurobi
-- **Performance Monitoring**: Métricas tiempo/memoria integradas
-
----
-
-## � Referencias Técnicas y Metodológicas
+## Referencias Técnicas y Metodológicas
 
 ### Optimización y Programación Lineal
 - **Gurobi Optimization LLC** (2023). *Gurobi Optimizer Reference Manual*, Version 10.0.3
@@ -618,69 +452,9 @@ class CustomSampler(BlockBootstrapSampler):
 
 ---
 
-## 📞 Información del Proyecto
-
-### Equipo de Desarrollo
-**Proyecto**: Capstone G20 - Modelo de Optimización Embalse del Laja  
-**Institución**: Pontificia Universidad Católica de Chile  
-**Facultad**: Ingeniería - Departamento de Ingeniería Industrial y de Sistemas  
-**Período Académico**: 10° Semestre 2025  
-**Modalidad**: Proyecto Terminal de Carrera
-
-### Ambiente Técnico de Desarrollo
-- **Lenguaje**: Python 3.10.11
-- **Solver**: Gurobi 10.0.3 (Licencia Académica UC hasta 27-Nov-2025)
-- **OS**: Windows 10/11 con PowerShell v5.1
-- **IDE**: Visual Studio Code con extensiones Python/Jupyter
-- **Control de Versiones**: Git con repositorio GitHub
-
-### Estado del Proyecto
-- **Versión Actual**: 2.1 (Producción Estable)
-- **Rama Principal**: `main` 
-- **Última Actualización**: 24 de octubre de 2025
-- **Testing**: Completamente validado con series históricas 1960-2023 (4,609 registros)
-- **Documentación**: Técnica completa y académica actualizada
-- **Entrega Final**: Preparado para presentación Capstone G20
-
----
-
 ## 📄 Licencia y Uso Académico
 
 Este proyecto es desarrollado bajo **licencia académica** exclusivamente para propósitos educativos y de investigación en la Pontificia Universidad Católica de Chile. 
 
-**Restricciones de Uso:**
-- ✅ Uso académico y educativo
-- ✅ Investigación no comercial  
-- ✅ Documentación y referencias
-- ❌ Uso comercial sin autorización
-- ❌ Redistribución sin reconocimiento
-- ❌ Modificación de licencias de terceros (Gurobi)
-
-**Reconocimientos:**
-- Gurobi Optimization LLC por licencia académica
-- Pontificia Universidad Católica de Chile por recursos computacionales
-- Departamento de Ingeniería Industrial y de Sistemas por supervisión académica
-
----
-
-## 📝 Log de Actualizaciones
-
-### v2.1 - Octubre 2025
-- ✅ **Codebase completo**: 4,183 líneas Python en 7 módulos especializados
-- ✅ **Base de datos validada**: 4,609 registros históricos filtrados (1960-2023)
-- ✅ **Documentación técnica**: README actualizado con métricas reales del sistema
-- ✅ **Sistema de archivos**: `.gitignore` configurado para desarrollo Python
-- ✅ **Visualizaciones**: 4 gráficos principales generados automáticamente
-- ✅ **KPIs estratégicos**: Sistema completo de 4 indicadores (1,001 líneas)
-- ✅ **Pipeline híbrido**: Determinista (MILP) + estocástico (Monte Carlo)
-
-### v2.0 - Octubre 2025
-- ✅ **Motor MILP**: 963 líneas de optimización con Gurobi 10.0.3
-- ✅ **Análisis histórico**: 875 líneas para procesamiento 1960-2023
-- ✅ **Simulación Monte Carlo**: 757 líneas de bootstrap por bloques
-- ✅ **Modelado PWL**: 388 líneas para filtraciones no-lineales
-- ✅ **Integración completa**: Sistema operativo y validado
-
----
 
 *Este README fue actualizado por última vez el 24 de octubre de 2025 como parte de la documentación final del Proyecto Capstone G20.*
