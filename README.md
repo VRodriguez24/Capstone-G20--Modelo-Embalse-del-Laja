@@ -458,3 +458,4 @@ Este proyecto es desarrollado bajo **licencia académica** exclusivamente para p
 
 
 *Este README fue actualizado por última vez el 24 de octubre de 2025 como parte de la documentación final del Proyecto Capstone G20.*
+
