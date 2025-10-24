@@ -184,7 +184,7 @@ def build_pwl_final_segments(V_max: float = 5582.0) -> Dict[int, Dict[str, Any]]
     3. Evalúa error de aproximación para validación
     """
     # Generar breakpoints optimizados
-    breaks = _generate_breakpoints(V_max, target_error=0.05)
+    breaks = _generate_breakpoints(V_max, target_error=0.15)
     n_segments = len(breaks) - 1
     
     segments: Dict[int, Dict[str, Any]] = {}
@@ -303,7 +303,7 @@ def test_funciones():
 
 def plot_filtration_comparison(
         V_max: float = 5582.0,
-        save_path: str = "resultados/filtration_comparison_005.png"
+        save_path: str = "resultados/filtration_comparison_015.png"
 ):
     """
     Genera gráfico comparativo de función original vs PWL linearizada.
@@ -398,7 +398,7 @@ def generate_summary():
     print("   1. Puntos base en límites de colchones "
           "(0, 1200, 1370, 1900, 5582)")
     print("   2. Análisis adaptativo de curvatura")
-    print("   3. Subdivisión si error > 0.05 m³/s")
+    print("   3. Subdivisión si error > 0.15 m³/s")
     print("   4. Optimización recursiva hasta tolerancia")
     
     print("\n💻 USO EN MODELO:")
