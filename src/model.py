@@ -40,23 +40,25 @@ T = [12, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11]
 # Reglas de riego / ecológico (constantes, mismos valores para todo t)
 TUCAPEL_MIN = 90.0     # m3/s
 ABANICO_MIN = 47.0     # m3/s
-SALTOS_MIN = 7.0       # m3/s
-SALTOS_MIN_T = {t: SALTOS_MIN for t in T}  # comodidad para indexar por t
+SALTOS_MIN = 7.0       # m3/s (base, se multiplica por factor estacional)
 
-# Curvas estacionales para 1° y 2° regantes (factor por mes 1..12).
-# Tomadas de la Tabla N°2 (imagen). Valores entre 0 y 1.
-# Columnas usadas: 1° Regantes y 2° Regantes
+# Curvas estacionales para 1°, 2° regantes y caudal ecologico (por mes 1..12)
+# Tomadas de la Tabla N°2 (imagen). Valores entre 0 y 1
 # NOTA: Los factores siguen siendo por mes calendario (1=Ene, 12=Dic)
 FIRST_REGANTES_FACTOR = {
     1: 1.00, 2: 1.00, 3: 1.00, 4: 1.00,
     5: 0.00, 6: 0.00, 7: 0.00, 8: 0.00,
     9: 1.00, 10: 1.00, 11: 1.00, 12: 1.00
 }
-# Para segundos regantes la columna "2° Regantes" de la tabla
 SECOND_REGANTES_FACTOR = {
     1: 1.00, 2: 1.00, 3: 0.80, 4: 0.50,
     5: 0.00, 6: 0.00, 7: 0.00, 8: 0.00,
     9: 0.30, 10: 0.65, 11: 0.85, 12: 1.00
+}
+SALTOS_REGANTES_FACTOR = {
+    1: 1.00, 2: 1.00, 3: 0.00, 4: 0.00,
+    5: 0.00, 6: 0.00, 7: 0.00, 8: 0.00,
+    9: 0.00, 10: 0.00, 11: 0.00, 12: 0.50
 }
 # Base para cálculo de déficit de 2dos regantes (según enunciado: 53 m3/s)
 SECOND_REGANTES_BASE = 53.0
@@ -72,16 +74,17 @@ V_min = 0.0     # Volumen mínimo
 V_max = 5582.0  # Volumen máximo
 
 # --- Colchones según configuración definitiva operacional ---
-# Riego puede ser valor fijo en Hm³ o porcentaje, Generación y Lago en %
+# (ANEXO 1 Convenio) Riego puede ser valor fijo en Hm³ o porcentaje
+# Generación y Lago en %
 COLCHONES = {
     # R=600 Hm³, G=5%, L=0%
     "Inferior": {"lo": 0.0, "hi": 1200.0, "shares": (600.0, 0.05, 0.0)},
-    # R=40%, G=5%, L=45% (REDUCIDO del 55% para evitar infactibilidad)
+    # R=40%, G=5%, L=55%
     "Transicion": {"lo": 1200.0, "hi": 1370.0, "shares": (0.40, 0.05, 0.55)},
     # R=40%, G=40%, L=20%
     "Intermedio": {"lo": 1370.0, "hi": 1900.0, "shares": (0.40, 0.40, 0.20)},
-    # R=25%, G=1200 Hm³, L=10%
-    "Superior":   {"lo": 1900.0, "hi": 5582.0, "shares": (0.25, 1200.0, 0.10)},
+    # R=25%, G=65%, L=10%
+    "Superior":   {"lo": 1900.0, "hi": 5582.0, "shares": (0.25, 0.65, 0.10)},
 }
 C_LABELS = list(COLCHONES.keys())
 
@@ -96,31 +99,35 @@ FILTR_ARC: Tuple[str, str] = ("Embalse", "control_FiltracionesLaja")
 def get_performance_stats(start_time: float, process: psutil.Process) -> dict:
     """
     Calcula estadísticas de rendimiento del sistema.
-    
+
     Args:
         start_time: Tiempo de inicio de la ejecución (time.time())
         process: Proceso actual de psutil
-        
+
     Returns:
         dict: Estadísticas de rendimiento incluyendo tiempo y memoria
     """
     execution_time = time.time() - start_time
-    
+
     # Obtener información de memoria
     memory_info = process.memory_info()
     memory_percent = process.memory_percent()
-    
+
     # Información del sistema
     system_memory = psutil.virtual_memory()
-    
+
     return {
         "execution_time_seconds": execution_time,
         "execution_time_formatted": format_time(execution_time),
         "memory_rss_mb": memory_info.rss / (1024 * 1024),  # RSS en MB
         "memory_vms_mb": memory_info.vms / (1024 * 1024),  # VMS en MB
         "memory_percent": memory_percent,
-        "system_memory_total_gb": system_memory.total / (1024 * 1024 * 1024),
-        "system_memory_available_gb": system_memory.available / (1024 * 1024 * 1024),
+        "system_memory_total_gb": (
+            system_memory.total / (1024 * 1024 * 1024)
+        ),
+        "system_memory_available_gb": (
+            system_memory.available / (1024 * 1024 * 1024)
+        ),
         "system_memory_used_percent": system_memory.percent
     }
 
@@ -128,10 +135,10 @@ def get_performance_stats(start_time: float, process: psutil.Process) -> dict:
 def format_time(seconds: float) -> str:
     """
     Formatea tiempo en segundos a un formato legible.
-    
+
     Args:
         seconds: Tiempo en segundos
-        
+
     Returns:
         str: Tiempo formateado (ej: "2h 15m 30s" o "45.2s")
     """
@@ -151,7 +158,7 @@ def format_time(seconds: float) -> str:
 def print_performance_stats(stats: dict, context: str = ""):
     """
     Imprime estadísticas de rendimiento simplificadas.
-    
+
     Args:
         stats: Diccionario con estadísticas de rendimiento
         context: Contexto adicional para el título
@@ -161,7 +168,8 @@ def print_performance_stats(stats: dict, context: str = ""):
     print(f"{'=' * 50}")
     print(f"🕒 Tiempo de ejecución: {stats['execution_time_formatted']}")
     print(f"💾 RAM utilizada: {stats['memory_rss_mb']:.1f} MB")
-    print(f"💻 Memoria sistema utilizada: {stats['system_memory_used_percent']:.1f}%")
+    print("💻 Memoria sistema utilizada:",
+          f"{stats['system_memory_used_percent']:.1f}%")
     print(f"{'=' * 50}")
 
 
@@ -171,7 +179,7 @@ def print_performance_stats(stats: dict, context: str = ""):
 def add_pwl_filtration_constraints(
     model,
     Filtr_vars,
-    Vprev_vars, 
+    Vprev_vars,
     time_periods: list,
     filtr_arc: tuple,
     segments: dict,
@@ -200,7 +208,11 @@ def add_pwl_filtration_constraints(
     f_i, f_j = filtr_arc
 
     # Filtrar metadatos y obtener segmentos numéricos
-    numeric_segments = {k: v for k, v in segments.items() if isinstance(k, int)}
+    numeric_segments = {
+        k: v
+        for k, v in segments.items()
+        if isinstance(k, int)
+    }
     seg_ids = list(numeric_segments.keys())
 
     # Igualar arco de filtración con variable
@@ -336,10 +348,17 @@ def build_model_for_one_year(
     G = m.addVars(T, lb=0.0, name="G")
 
     # Déficits y binarias (primeros regantes)
+    # Tucapel: max{0, 90*factor1_t - Filtr_t - A_naturales_t}
+    # Abanico: max{0, 47*factor1_t - Filtr_t - A_abanico_t}
     DefAb = m.addVars(T, lb=0.0, name="DeficitAbanico")
     DefTu = m.addVars(T, lb=0.0, name="DeficitTucapel")
     dAb = m.addVars(T, vtype=GRB.BINARY, name="deltaAb")
     dTu = m.addVars(T, vtype=GRB.BINARY, name="deltaTu")
+
+    # Déficit consolidado primeros regantes: min{DefTu, DefAb}
+    # Déficit que El Toro debe compensar
+    Def1 = m.addVars(T, lb=0.0, name="Deficit1erosRegantes")
+    dMin = m.addVars(T, vtype=GRB.BINARY, name="deltaMin")
 
     # Excedente de primeros regantes y su binaria
     # Exc1_t = max{0, (Filtr_t + A_naturales_t) - 90*factor1_t}
@@ -435,7 +454,7 @@ def build_model_for_one_year(
             Vprev_vars[t] = V[prev_t]
 
     # Agregar restricciones PWL con 4 segmentos y variables binarias
-    pwl_vars = add_pwl_filtration_constraints(
+    add_pwl_filtration_constraints(
         model=m,
         Filtr_vars=Filtr,
         Vprev_vars=Vprev_vars,
@@ -456,6 +475,16 @@ def build_model_for_one_year(
         second_factor = SECOND_REGANTES_FACTOR.get(t, 1.0)
 
         # PRIMEROS REGANTES
+        # Tucapel: DefTu_t = max{0, 90*factor1_t - Filtr_t - A_naturales_t}
+        # Convertir demandas a Hm³/mes para consistencia de unidades
+        demanda_tucapel = TUCAPEL_MIN * first_factor * Conv  # Hm³/mes
+        expr_tu = demanda_tucapel - Filtr[t] - A_nat_tu_t(t)
+        m.addConstr(DefTu[t] >= expr_tu - M * (1 - dTu[t]), name=f"DTu_lb_{t}")
+        m.addConstr(
+            DefTu[t] <= expr_tu + M * (1 - dTu[t]), name=f"DTu_ub1_{t}"
+            )
+        m.addConstr(DefTu[t] <= M * dTu[t], name=f"DTu_ub2_{t}")
+
         # Abanico: DefAb_t = max{0, 47*factor1_t - Filtr_t - A_abanico_t}
         # Convertir demandas a Hm³/mes para consistencia de unidades
         demanda_abanico = ABANICO_MIN * first_factor * Conv  # Hm³/mes
@@ -466,15 +495,27 @@ def build_model_for_one_year(
             )
         m.addConstr(DefAb[t] <= M * dAb[t], name=f"DAb_ub2_{t}")
 
-        # Tucapel: DefTu_t = max{0, 90*factor1_t - Filtr_t - A_naturales_t}
-        # Convertir demandas a Hm³/mes para consistencia de unidades
-        demanda_tucapel = TUCAPEL_MIN * first_factor * Conv  # Hm³/mes
-        expr_tu = demanda_tucapel - Filtr[t] - A_nat_tu_t(t)
-        m.addConstr(DefTu[t] >= expr_tu - M * (1 - dTu[t]), name=f"DTu_lb_{t}")
-        m.addConstr(
-            DefTu[t] <= expr_tu + M * (1 - dTu[t]), name=f"DTu_ub1_{t}"
-            )
-        m.addConstr(DefTu[t] <= M * dTu[t], name=f"DTu_ub2_{t}")
+        # DÉFICIT CONSOLIDADO PRIMEROS REGANTES
+        # Def1_t = min{DefTu_t, DefAb_t}
+        # Osea, Def1_t debe ser menor o igual a ambos ( <= al min de los dos)
+        m.addConstr(Def1[t] <= DefTu[t], name=f"D1_min_Tu_{t}")
+        m.addConstr(Def1[t] <= DefAb[t], name=f"D1_min_Ab_{t}")
+
+        # Linearización usando variable binaria dMin[t]:
+        # Si dMin[t] = 1 -> DefTu <= DefAb -> Def1 = DefTu
+        # Si dMin[t] = 0 -> DefAb < DefTu  -> Def1 = DefAb
+
+        # Forzar que Def1 sea igual al menor
+        m.addConstr(Def1[t] >= DefTu[t] - M * (1 - dMin[t]),
+                    name=f"D1_eq_Tu_{t}")
+        m.addConstr(Def1[t] >= DefAb[t] - M * dMin[t],
+                    name=f"D1_eq_Ab_{t}")
+
+        # Forzar la selección correcta de dMin (CRÍTICO para corrección)
+        m.addConstr(DefTu[t] <= DefAb[t] + M * (1 - dMin[t]),
+                    name=f"D1_sel_Tu_{t}")
+        m.addConstr(DefAb[t] <= DefTu[t] + M * dMin[t],
+                    name=f"D1_sel_Ab_{t}")
 
         # SEGUNDOS REGANTES (medido en Tucapel):
         # Paso 1: Calcular excedente de primeros regantes
@@ -500,10 +541,10 @@ def build_model_for_one_year(
         m.addConstr(Def2[t] <= expr_2 + M * (1 - d2[t]), name=f"D2_ub1_{t}")
         m.addConstr(Def2[t] <= M * d2[t], name=f"D2_ub2_{t}")
 
-        # Cobertura desde Embalse via El Toro (suma de déficits)
-        # Q_extraccion_El_Toro >= Q_deficit_1os + Q_deficit_2os
+        # Cobertura desde Embalse via El Toro
+        # Q_extraccion_El_Toro >= Def1_t (déficit 1os) + Def2_t (déficit 2dos)
         m.addConstr(
-            x["Embalse", "ElToro", t] >= DefAb[t] + DefTu[t] + Def2[t],
+            x["Embalse", "ElToro", t] >= Def1[t] + Def2[t],
             name=f"D_cover_by_ElToro_{t}"
         )
 
@@ -529,8 +570,10 @@ def build_model_for_one_year(
 
     # RIEGO: Solo la cobertura de déficits desde El Toro
     # (uso exclusivo para riego = agua destinada a cubrir déficits)
+    # Def1 = min{DefTu, DefAb} (déficit consolidado primeros regantes)
+    # Def2 = déficit segundos regantes
     sum_riego_Hm3 = gp.quicksum(
-        (DefAb[t] + DefTu[t] + Def2[t]) for t in T
+        (Def1[t] + Def2[t]) for t in T
     )  # Ya está en Hm³/mes, suma anual
 
     # GENERACIÓN: Solo el excedente de El Toro que NO cubre déficits
@@ -557,19 +600,39 @@ def build_model_for_one_year(
     budget_gen = gp.quicksum(budget_terms["generacion"])
     budget_lago = gp.quicksum(budget_terms["lago"])
 
-    # RESTRICCIONES R7 REACTIVADAS: Ahora compatibles con PWL SOS2
+    # RESTRICCIÓN RIEGO
     m.addConstr(sum_riego_Hm3 <= budget_riego, name="R7e_presupuesto_riego")
-    m.addConstr(sum_gen_Hm3 <= budget_gen, name="R7f_presupuesto_generacion")
 
-    # Restricción mensual de volumen mínimo para lago
+    # RESTRICCIÓN GENERACIÓN
+    # Generación con cap de 1200 Hm³ para Colchón Superior
+    # Si Superior activo (z["Superior"]=1): budget_gen limitado a 1200 Hm³
+    budget_gen_capped = m.addVar(lb=0.0, name="budget_gen_capped")
+    m.addConstr(budget_gen_capped <= budget_gen,
+                name="R7f_gen_base")
+    m.addConstr(
+        budget_gen_capped <= 1200.0 * z["Superior"] + M * (1 - z["Superior"]),
+        name="R7f_gen_cap_superior"
+    )
+    # Para otros colchones, no hay límite adicional
+    m.addConstr(budget_gen_capped >= budget_gen - M * z["Superior"],
+                name="R7f_gen_otros")
+
+    m.addConstr(sum_gen_Hm3 <= budget_gen_capped,
+                name="R7f_presupuesto_generacion")
+
+    # RESTRICCIÓN LAGO
     for t in T:
         m.addConstr(V[t] >= budget_lago, name=f"R7g_volumen_lago_{t}")
 
-    # (R8) Mínimo ecológico en Saltos del Laja
+    # (R8) Mínimo ecológico en Saltos del Laja (con factor estacional)
     for t in T:
+        # Aplicar factor estacional al caudal mínimo base
+        saltos_factor = SALTOS_REGANTES_FACTOR.get(t, 1.0)
+        saltos_min_t = SALTOS_MIN * saltos_factor
+
         m.addConstr(
             gp.quicksum(y[i, "SaltosLaja", t] for i in IN["SaltosLaja"])
-            >= SALTOS_MIN_T[t],
+            >= saltos_min_t,
             name=f"R8_saltos_min_{t}"
         )
 
@@ -607,7 +670,7 @@ if __name__ == "__main__":
         print("=" * 60)
         min_year, max_year = min(YEARS_HORIZON), max(YEARS_HORIZON)
         print(f"📊 Datos disponibles: {min_year} - {max_year}")
-        print("📅 Período hidrológico: Diciembre → Noviembre")
+        print("📅 Período hidrológico: Diciembre -> Noviembre")
         print("    (fin temporada 30-Nov)")
         print("\n🎯 Opciones:")
         print("1️⃣  Año/Rango específico (ej: '1985' o '1980-1990')")
@@ -683,10 +746,10 @@ if __name__ == "__main__":
 
         print("\n📅 AÑO/RANGO ESPECÍFICO")
         print(f"📊 Datos disponibles: {min_year}-{max_year}")
-        print("📅 Cada 'año' = período hidrológico Dic→Nov")
+        print("📅 Cada 'año' = período hidrológico Dic->Nov")
         print("    (ej: 1985 = Dic'84 a Nov'85)")
         print("💡 Ejemplos:")
-        print("   • Un año: '1985' (Dic'84 → Nov'85)")
+        print("   • Un año: '1985' (Dic'84 -> Nov'85)")
         print("   • Rango: '1980-1990' (11 períodos hidrológicos)")
         print("   • Década: '1990-1999' (10 períodos hidrológicos)")
 
@@ -896,8 +959,6 @@ if __name__ == "__main__":
                         )
                     )
 
-
-
         # Tabla detallada si hay múltiples años
         if years_count > 1:
             print("\n📊 DETALLE POR AÑO:")
@@ -921,7 +982,10 @@ if __name__ == "__main__":
 
         # Imprimir estadísticas de rendimiento
         performance_stats = get_performance_stats(start_time, process)
-        context = f"({years_count} años)" if years_count > 1 else f"(año {years[0]})"
+        if years_count > 1:
+            context = f"({years_count} años)"
+        else:
+            context = f"(año {years[0]})"
         print_performance_stats(performance_stats, context)
 
     def run_all_years():
@@ -931,7 +995,7 @@ if __name__ == "__main__":
 
         print("\n🚀 SIMULACIÓN COMPLETA")
         print(f"📊 Período: {min_year}-{max_year} ({total_years} períodos)")
-        print("📅 Cada período: Diciembre → Noviembre (fin temporada 30-Nov)")
+        print("📅 Cada período: Diciembre -> Noviembre (fin temporada 30-Nov)")
 
         confirm_msg = f"¿Confirmas ejecutar {total_years} años? [s/N]"
         confirm = get_input(confirm_msg, default="N")
@@ -1098,7 +1162,8 @@ if __name__ == "__main__":
                         output_dir="resultados",
                         plot_name="evolucion_historica_lago"
                     )
-                    print(f"📊 Gráficos generados: {len(plot_files)} archivos PNG")
+                    n_plots = len(plot_files)
+                    print(f"📊 Gráficos: {n_plots} PNG")
                 except Exception as e:
                     print(f"   ⚠️ Error generando gráficos: {e}")
             else:
