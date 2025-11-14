@@ -279,6 +279,138 @@ def get_pwl_segments() -> Dict[int, Dict[str, Any]]:
 
 
 # =============================
+# INTEGRACIÓN CON MODELO GUROBI
+# =============================
+def add_pwl_filtration_constraints(
+    model,
+    Filtr_vars,
+    Vprev_vars,
+    time_periods: list,
+    filtr_arc: tuple,
+    segments: Dict[int, Dict[str, Any]],
+    bigM: float,
+    v_max: float = 5582.0,
+):
+    """
+    Agrega restricciones PWL para filtraciones con variables binarias.
+
+    Implementa la linearización de la función no-lineal de filtraciones
+    usando segmentación PWL con variables binarias δ_{k,t}.
+
+    Esta función pertenece a filt_cota.py porque:
+    - Encapsula la lógica específica de filtraciones PWL
+    - Trabaja directamente con los segmentos generados aquí
+    - Permite reutilización en múltiples modelos (model.py, caso_base.py)
+    - Mantiene cohesión: datos (segmentos) + operaciones (restricciones)
+
+    Args:
+        model: Modelo de Gurobi
+        Filtr_vars: Variables de filtración por período
+        Vprev_vars: Variables de volumen previo por período
+        time_periods: Lista de períodos de tiempo
+        filtr_arc: Tupla (origen, destino) del arco de filtración
+        segments: Diccionario de segmentos PWL
+        bigM: Valor Big-M para linearización
+        v_max: Volumen máximo del embalse (Hm³)
+
+    Returns:
+        dict: Variables auxiliares creadas (deltas y segmentos usados)
+
+    Example:
+        >>> from filt_cota import:
+            build_pwl_final_segments, add_pwl_filtration_constraints
+        >>> segments = build_pwl_final_segments(V_max=5582.0)
+        >>> pwl_vars = add_pwl_filtration_constraints(
+        ...     model=m,
+        ...     Filtr_vars=Filtr,
+        ...     Vprev_vars=Vprev_vars,
+        ...     time_periods=T,
+        ...     filtr_arc=("Embalse", "control_FiltracionesLaja"),
+        ...     segments=segments,
+        ...     bigM=6000
+        ... )
+    """
+    # Importar GRB solo cuando se necesite (evita dependencia circular)
+    try:
+        from gurobipy import GRB
+    except ImportError:
+        raise ImportError(
+            "Gurobi no está instalado. "
+            "Esta función requiere gurobipy."
+        )
+
+    f_i, f_j = filtr_arc
+
+    # Filtrar metadatos y obtener segmentos numéricos
+    numeric_segments = {
+        k: v
+        for k, v in segments.items()
+        if isinstance(k, int)
+    }
+    seg_ids = list(numeric_segments.keys())
+
+    # Igualar arco de filtración con variable
+    for t in time_periods:
+        model.addConstr(
+            model._y[f_i, f_j, t] == Filtr_vars[t],
+            name=f"R5a_filtr_arc_{t}"
+        )
+
+    # Variables binarias δ_{k,t} para selección de segmento
+    delta = model.addVars(
+        seg_ids, time_periods,
+        vtype=GRB.BINARY,
+        name="delta_pwl_seg"
+    )
+
+    # CRITICAL: Update model to commit variables
+    model.update()
+
+    for t in time_periods:
+        # Un único segmento activo por período
+        model.addConstr(
+            sum(delta[k, t] for k in seg_ids) == 1,
+            name=f"R5b_one_seg_{t}"
+        )
+
+        Vprev = Vprev_vars[t]
+
+        # Restricciones por segmento PWL
+        for k in seg_ids:
+            seg = numeric_segments[k]
+            vmin, vmax = seg["v_min"], seg["v_max"]
+            slope, b = seg["slope"], seg["intercept"]
+
+            # Volumen debe estar en el rango del segmento cuando δ_k=1
+            # Si δ_k=1: vmin ≤ Vprev ≤ vmax
+            # Si δ_k=0: restricciones desactivadas con Big-M
+            model.addConstr(
+                Vprev >= vmin - bigM * (1 - delta[k, t]),
+                name=f"R5c_vol_lb_{k}_{t}"
+            )
+            model.addConstr(
+                Vprev <= vmax + bigM * (1 - delta[k, t]),
+                name=f"R5d_vol_ub_{k}_{t}"
+            )
+
+            # Filtración = función lineal del segmento cuando δ_k=1
+            model.addConstr(
+                Filtr_vars[t] >= (
+                    slope * Vprev + b - bigM * (1 - delta[k, t])
+                ),
+                name=f"R5e_filtr_lb_{k}_{t}"
+            )
+            model.addConstr(
+                Filtr_vars[t] <= (
+                    slope * Vprev + b + bigM * (1 - delta[k, t])
+                ),
+                name=f"R5f_filtr_ub_{k}_{t}"
+            )
+
+    return {"delta_pwl": delta, "segments_used": numeric_segments}
+
+
+# =============================
 # FUNCIONES DE TESTING (OPCIONALES)
 # =============================
 def test_funciones():

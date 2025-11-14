@@ -51,6 +51,8 @@ Desarrollar un modelo de optimización integral para la operación del Sistema E
 │   ├── kpi.py                                # Sistema de KPIs estratégicos
 │   ├── caso_base.py                          # Análisis histórico determinista
 │   ├── montecarlo.py                         # Simulador estocástico híbrido
+│   ├── analisis_sensibilidad_v0.py           # Análisis de sensibilidad V0
+│   ├── ejemplo_sensibilidad_rapido.py        # Demo rápido sensibilidad
 │   ├── filt_cota.py                          # Modelado no-lineal PWL
 │   ├── data_loader.py                        # Interfaz de datos CSV
 │   └── embalse.py                            # Topología red hidráulica
@@ -65,7 +67,9 @@ Desarrollar un modelo de optimización integral para la operación del Sistema E
     ├── evolucion_historica_lago.png          # Evolución histórica del embalse
     ├── evolucion_historica_lago_caso_base.png # Caso base histórico
     ├── filtration_comparison_015.png         # Comparación filtraciones PWL
-    └── montecarlo_evolucion_historica.png    # Simulación Monte Carlo
+    ├── montecarlo_evolucion_historica.png    # Simulación Monte Carlo
+    ├── sensibilidad_v0_completo.png          # Análisis sensibilidad V0
+    └── sensibilidad_v0.csv                   # Datos sensibilidad exportados
 ```
 
 ---
@@ -379,6 +383,21 @@ python montecarlo.py
 - **Duración**: 40-50 min aprox (según número de escenarios: 100, con 64 años)
 - **Output**: Visualizaciones Monte Carlo en `resultados/montecarlo_evolucion_historica.png`
 - **Propósito**: Correr nuestro modelo con el blockboostrap implementado en Monte Carlo
+
+#### **4. Análisis de Sensibilidad del Volumen Inicial (V0)**  
+```powershell
+cd src
+python analisis_sensibilidad_v0.py
+```
+- **Configuración**: Interfaz interactiva (rango V0, puntos, escenarios)
+- **Duración**: 5-60 min aprox (según configuración)
+- **Output**: Gráficos en `resultados/sensibilidad_v0_completo.png` + CSV exportado
+- **Propósito**: Identificar V0 óptimo para maximizar energía y confiabilidad
+
+**Ejemplo Rápido** (5 puntos, 10 escenarios, 5 años):
+```powershell
+python ejemplo_sensibilidad_rapido.py
+```
 
 ### Configuración de Parámetros
 
