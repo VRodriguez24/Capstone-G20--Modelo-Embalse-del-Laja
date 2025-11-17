@@ -408,6 +408,5 @@ class HybridSimulator:
 
 
 if __name__ == "__main__":
-    from run_montecarlo import run_monte_carlo
+    from ui_montecarlo import run_monte_carlo
     run_monte_carlo()
-

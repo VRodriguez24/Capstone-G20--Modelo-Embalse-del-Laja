@@ -293,7 +293,7 @@ if __name__ == "__main__":
     Interfaz para ejecutar el modelo caso base (sin reparto por colchones).
     Uso: python src/caso_base.py
     """
-    from run_model import run
+    from ui_model import run
 
     run(
         build_model_func=build_model_for_one_year,
