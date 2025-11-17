@@ -48,7 +48,6 @@ A_generacion = [
     ("control_Antuco",    "Antuco"),
     ("control_Rucue",     "Rucue"),
     ("control_Quilleco",  "Quilleco"),
-    ("control_CanalLaja", "CanalLaja"),
     ("control_ElDiuto",   "ElDiuto"),
     ("control_Laja_I",    "Laja_I"),
 ]
@@ -56,7 +55,6 @@ A_generacion = [
 # Conectividad (virtuales)
 A_conectividad = [
     ("AltoPolc",                 "Embalse"),
-    ("Embalse",                  "control_FiltracionesLaja"),
     ("control_FiltracionesLaja", "FiltracionesLaja"),
     ("FiltracionesLaja",         "control_Abanico"),
     ("Abanico",                  "control_Antuco"),
@@ -74,6 +72,7 @@ A_conectividad = [
     ("Canecol",                  "control_Tucapel"),
     ("control_Tucapel",          "Tucapel"),
     ("Tucapel",                  "control_CanalLaja"),
+    ("control_CanalLaja",        "CanalLaja"),
     ("CanalLaja",                "control_ElDiuto"),
     ("ElDiuto",                  "NodoMar"),
     ("Laja_I",                   "SaltosLaja"),
@@ -81,9 +80,11 @@ A_conectividad = [
 
 # Vertimientos (entre controles y sumideros)
 A_vertimiento = [
+    ("Embalse",           "control_FiltracionesLaja"),
     ("control_Abanico",   "control_Antuco"),
     ("control_Antuco",    "control_Riegzaco"),
     ("control_Riegzaco",  "control_Clajrucue"),
+    ("control_Canrucue",  "control_Tucapel"),
     ("control_Clajrucue", "control_Tucapel"),
     ("control_Rucue",     "control_Quilleco"),
     ("control_Quilleco",  "control_Tucapel"),

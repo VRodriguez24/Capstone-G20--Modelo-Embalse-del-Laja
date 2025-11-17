@@ -9,14 +9,31 @@ from embalse import (
 # CSV 1: data/CaudalMax_filtrado.csv  (centrales con MÁX y rendimiento)
 # Formato central (mayúsculas):
 # ELTORO, ABANICO, ANTUCO, RUCUE, QUILLECO, LAJA_I, EL_DIUTO
+
+# Centrales GENERADORAS (rendimiento > 0, arcos en A_generacion)
 CENTRAL_TO_GEN_ARC: Dict[str, Tuple[str, str]] = {
-    "ELTORO":   ("Embalse", "ElToro"),
-    "ABANICO":  ("control_Abanico", "Abanico"),
-    "ANTUCO":   ("control_Antuco", "Antuco"),
-    "RUCUE":    ("control_Rucue", "Rucue"),
-    "QUILLECO": ("control_Quilleco", "Quilleco"),
-    "LAJA_I":   ("control_Laja_I", "Laja_I"),
-    "EL_DIUTO": ("control_ElDiuto", "ElDiuto"),
+    "ELTORO":      ("Embalse", "ElToro"),
+    "ABANICO":     ("control_Abanico", "Abanico"),
+    "ANTUCO":      ("control_Antuco", "Antuco"),
+    "RUCUE":       ("control_Rucue", "Rucue"),
+    "QUILLECO":    ("control_Quilleco", "Quilleco"),
+    "LAJA_I":      ("control_Laja_I", "Laja_I"),
+    "EL_DIUTO":    ("control_ElDiuto", "ElDiuto"),
+}# Centrales de CONTROL (rendimiento = 0, arcos en conectividad)
+# Mapean a arcos de conectividad donde se aplica límite de capacidad
+# Puede ser un solo arco (tuple) o múltiples arcos (list)
+CENTRAL_TO_CONTROL_ARC: Dict[str, any] = {
+    "RIEGZACO":    ("control_Riegzaco", "Riegazaco"),
+    "CANECOL":     ("control_Canecol", "Canecol"),
+    "CANRUCUE":    ("control_Canrucue", "Canrucue"),
+    "CLAJRUCUE":   ("control_Clajrucue", "Clajrucue"),
+    "TUCAPEL":     ("control_Tucapel", "Tucapel"),
+    "SALTOS":      ("Laja_I", "SaltosLaja"),
+    # CanalLaja tiene 2 arcos de conectividad con mismo límite
+    "CANAL_LAJA":  [
+        ("control_CanalLaja", "CanalLaja"),
+        ("CanalLaja", "control_ElDiuto")
+    ],
 }
 
 # CSV 2: data/Caudales_historicos_filtrado.csv
@@ -45,8 +62,12 @@ def load_caudalmax(path_csv: str):
     """
     Lee 'data/CaudalMax_filtrado.csv' y arma:
     - eta[(i,j)] = rendimiento_mwh_m3s  (solo para A_generacion)
-    - cap_max[(i,j)] = caudal_maximo    (solo para A_generacion)
+    - cap_max[(i,j)] = caudal_maximo    (para A_generacion y A_control)
     Retorna (eta, cap_max, potencia_max) para registro.
+
+    Ahora procesa:
+    - Centrales generadoras (rendimiento > 0) → A_generacion
+    - Centrales de control (rendimiento = 0) → A_conectividad
     """
     df = pd.read_csv(path_csv)
     req_cols = {"central", "rendimiento_mwh_m3s",
@@ -61,16 +82,29 @@ def load_caudalmax(path_csv: str):
 
     for row in df.itertuples(index=False):
         k = _norm_central_for_gen(row.central)
-        if k not in CENTRAL_TO_GEN_ARC:
-            # ignora centrales no mapeadas
-            continue
-        arc = CENTRAL_TO_GEN_ARC[k]
-        if arc not in A_generacion:
-            # seguridad extra: solo setear en arcos de generación
-            continue
-        eta[arc] = float(row.rendimiento_mwh_m3s)
-        cap_max[arc] = float(row.caudal_maximo)
-        potencia_max[arc] = float(row.potencia_maxima)
+
+        # 1) Verificar si es central generadora
+        if k in CENTRAL_TO_GEN_ARC:
+            arc = CENTRAL_TO_GEN_ARC[k]
+            if arc not in A_generacion:
+                continue
+            eta[arc] = float(row.rendimiento_mwh_m3s)
+            cap_max[arc] = float(row.caudal_maximo)
+            potencia_max[arc] = float(row.potencia_maxima)
+
+        # 2) Verificar si es central de control
+        # (puede aplicar a múltiples arcos para una misma central)
+        if k in CENTRAL_TO_CONTROL_ARC:
+            arcs_control = CENTRAL_TO_CONTROL_ARC[k]
+            # Puede ser un solo arco o lista de arcos
+            if isinstance(arcs_control, tuple) and len(arcs_control) == 2:
+                # Un solo arco
+                arcs_control = [arcs_control]
+
+            for arc in arcs_control:
+                # Las centrales de control solo aportan límite capacidad
+                cap_max[arc] = float(row.caudal_maximo)
+                # No setear eta (ya es 0.0 por defecto)
 
     return eta, cap_max, potencia_max
 

@@ -72,11 +72,39 @@ def run():
 
     # 4) Filtrar rendimiento != 1 (y no NaN)
     df = df[df["rendimiento_mwh_m3s"].notna()]
-    df = df[df["rendimiento_mwh_m3s"] != 1]
+
+    # Separar centrales con rendimiento != 1 (las que generan energía)
+    df_filtered = df[df["rendimiento_mwh_m3s"] != 1].copy()
+
+    # Centrales con rendimiento = 1 que queremos incluir
+    # Excluir: RieTucapel (no la queremos)
+    centrales_incluir = [
+        "RIEGZACO", "CANECOL", "CANRUCUE", "CLAJRUCUE",
+        "TUCAPEL", "CANAL_LAJA", "RIESALTOS"
+    ]
+
+    # Filtrar centrales de control (rendimiento = 1)
+    df_control = df[df["rendimiento_mwh_m3s"] == 1].copy()
+    df_control = df_control[
+        df_control["central"].str.upper().isin(centrales_incluir)
+    ].copy()
+
+    # Renombrar RieSaltos → SALTOS
+    df_control["central"] = df_control["central"].str.replace(
+        "RieSaltos", "SALTOS", case=False, regex=False
+    )
+
+    # Para las centrales de control: rendimiento = 0, potencia = 0
+    # Solo conservan su caudal_maximo como límite de capacidad
+    df_control["rendimiento_mwh_m3s"] = 0.0
+    df_control["potencia_maxima"] = 0.0
+
+    # Combinar centrales generadoras + centrales de control
+    df_combined = pd.concat([df_filtered, df_control], ignore_index=True)
 
     # 5) Exportar
-    out = df[["central", "rendimiento_mwh_m3s",
-              "potencia_maxima", "caudal_maximo"]].copy()
+    out = df_combined[["central", "rendimiento_mwh_m3s",
+                       "potencia_maxima", "caudal_maximo"]].copy()
     out.to_csv(out_dir / "CaudalMax_filtrado.csv", index=False)
 
     print()

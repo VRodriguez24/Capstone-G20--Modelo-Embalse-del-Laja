@@ -27,11 +27,14 @@ Este módulo implementa 4 KPIs estratégicos para evaluar la operación del Emba
    - Cálculo: (Uso_real_anual / Presupuesto_asignado) × 100
    - Interpretación: >100% indica sobre-uso, <100% indica subutilización
 
-3. 🏭 PARTICIPACIÓN EL TORO EN GENERACIÓN (%)
-   - Definición: Porcentaje de energía generada por Central El Toro vs total del sistema
-   - Propósito: Medir dominancia energética de la central principal
-   - Cálculo: (Energía_ElToro / Energía_Total_Sistema) × 100
-   - Interpretación: Mayor % indica mayor dependencia de El Toro para generación
+3. 📌 DÉFICIT MÁXIMO Y DÉFICIT PROMEDIO (Hm³ y % de la demanda)
+    - Definición: Indicadores que cuantifican la escasez de agua para riego
+      en términos absolutos (Hm³) y normalizados respecto de la demanda.
+    - Componentes:
+         1) Déficit máximo (Worst-case) por grupo de regantes (1R, 2R)
+         2) Déficit promedio mensual (Valor esperado) por grupo (Hm³/mes)
+         3) Déficit como % de la demanda estacional (normaliza por mes)
+    - Propósito: Medir seguridad hídrica (worst-case) y confiabilidad típica (promedio)
 
 4. 🏗️ FACTOR DE UTILIZACIÓN (%)
    - Definición: Porcentaje de uso real vs capacidad disponible ponderado por tamaño
@@ -78,7 +81,10 @@ def extract_kpis(model, include_detailed: bool = True) -> Dict[str, Any]:
             - 'V_end': Volumen final del embalse (Hm³)
             - 'tiempo_colchones_%': Dict con % tiempo en cada colchón
             - 'uso_presupuestos_%': Dict con % uso de presupuestos riego/generación
-            - 'participacion_toro_%': % participación energética de El Toro
+            - 'deficit_max_hm3': {'1R': 0.0, '2R': 0.0},
+            - 'deficit_prom_hm3': {'1R': 0.0, '2R': 0.0},
+            - 'deficit_sum_hm3': {'1R': 0.0, '2R': 0.0},
+            - 'deficit_pct': {'1R': 0.0, '2R': 0.0},
             - 'factor_utilizacion_%': Dict con factor utilización sistema/centrales
             - 'cota_mensual': Dict con cotas mensuales (msnm)
             - 'dependencia_lago_m3s': Dict con déficits mensuales (m³/s)
@@ -92,7 +98,11 @@ def extract_kpis(model, include_detailed: bool = True) -> Dict[str, Any]:
             'V_end': None,
             'tiempo_colchones_%': {},
             'uso_presupuestos_%': {'riego': 0.0, 'generacion': 0.0},
-            'participacion_toro_%': 0.0,
+            # historial/compatibilidad: déficits en riego
+            'deficit_max_hm3': {'1R': 0.0, '2R': 0.0},
+            'deficit_prom_hm3': {'1R': 0.0, '2R': 0.0},
+            'deficit_sum_hm3': {'1R': 0.0, '2R': 0.0},
+            'deficit_pct': {'1R': 0.0, '2R': 0.0},
             'factor_utilizacion_%': {'sistema': 0.0},
             'cota_mensual': {},
             'dependencia_lago_m3s': {}
@@ -116,7 +126,10 @@ def extract_kpis(model, include_detailed: bool = True) -> Dict[str, Any]:
         basic_kpis.update({
             'tiempo_colchones_%': {},
             'uso_presupuestos_%': {'riego': 0.0, 'generacion': 0.0},
-            'participacion_toro_%': 0.0,
+            'deficit_max_hm3': {'1R': 0.0, '2R': 0.0},
+            'deficit_prom_hm3': {'1R': 0.0, '2R': 0.0},
+            'deficit_sum_hm3': {'1R': 0.0, '2R': 0.0},
+            'deficit_pct': {'1R': 0.0, '2R': 0.0},
             'factor_utilizacion_%': {'sistema': 0.0},
             'cota_mensual': {},
             'dependencia_lago_m3s': {}
@@ -149,7 +162,11 @@ def _calculate_strategic_kpis(model) -> Dict[str, Any]:
         3. Participación El Toro: Dominancia energética de central principal
         4. Factor utilización: Eficiencia hidráulica del sistema
     """
-    from model import T, Conv, COLCHONES, C_LABELS
+    from model import (
+        T, Conv, COLCHONES, C_LABELS,
+        FIRST_REGANTES_FACTOR, SECOND_REGANTES_FACTOR,
+        TUCAPEL_MIN, ABANICO_MIN, SEGUNDOS_MIN
+    )
 
     # PASO 1: Extraer datos base del modelo optimizado
     # ================================================
@@ -292,36 +309,71 @@ def _calculate_strategic_kpis(model) -> Dict[str, Any]:
     }
 
     # ================================================
-    # KPI 3: PARTICIPACIÓN DE EL TORO ✓ CORRECTO
+    # KPI 3: DÉFICITS PARA PRIMEROS Y SEGUNDOS REGANTES (NEW)
     # ================================================
-    # Definición: % de energía generada por Central El Toro vs total del sistema
-    # Metodología: Usa factores de conversión eta (m³/s → MWh) correctamente
-    # Propósito: Medir dominancia energética de la central principal del embalse
-    # Fórmula: (Energía_ElToro / Energía_Total_Sistema) × 100
-    
-    energia_toro, energia_total = 0.0, 0.0  # Energía acumulada anual (MWh)
-    try:
-        from model import A_generacion
-        # Factores de conversión: eta[arco] = MWh por m³/s
-        eta = model._meta.get("eta", {}) if hasattr(model, '_meta') else {}
+    # Calcula: déficit mensual por grupo (1R = Tucapel+Abanico, 2R = segundos)
+    # Devuelve: máximo (Hm3), promedio mensual (Hm3/mes), suma anual (Hm3)
+    # y porcentaje respecto de la demanda estacional (usa Tucapel como base para 1R)
 
-        for t in T:
-            # Energía generada por El Toro en mes t
-            x_toro_var = model.getVarByName(f"x[Embalse,ElToro,{t}]")
-            if x_toro_var and ("Embalse", "ElToro") in eta:
-                # Energía = factor_conversión × caudal_turbinado
-                energia_toro += eta[("Embalse", "ElToro")] * x_toro_var.x
+    deficit_mensual_1R = {}
+    deficit_mensual_2R = {}
+    demanda_tucapel_mensual = {}
+    demanda_2R_mensual = {}
 
-            # Energía total del sistema en mes t (suma de todas las centrales)
-            for (i, j) in A_generacion:
-                x_var = model.getVarByName(f"x[{i},{j},{t}]")
-                if x_var and (i, j) in eta:
-                    energia_total += eta[(i, j)] * x_var.x
-    except Exception:
-        pass
+    for t in T:
+        # Demandas (Hm³ por mes) - convierten m³/s estacional -> Hm³
+        dt_tuc = TUCAPEL_MIN * FIRST_REGANTES_FACTOR.get(t, 1.0) * Conv
+        dt_aban = ABANICO_MIN * FIRST_REGANTES_FACTOR.get(t, 1.0) * Conv
+        dem_2r = SEGUNDOS_MIN * SECOND_REGANTES_FACTOR.get(t, 1.0) * Conv
 
-    # Calcular participación porcentual
-    participacion_toro_pct = (energia_toro / energia_total * 100.0 if energia_total > 0 else 0.0)
+        demanda_tucapel_mensual[t] = dt_tuc
+        demanda_2R_mensual[t] = dem_2r
+
+        # Extraer variables de déficit (Hm³) si existen
+        def_tuc = 0.0
+        def_aban = 0.0
+        def_2r = 0.0
+        try:
+            v = model.getVarByName(f"DeficitTucapel[{t}]")
+            if v:
+                def_tuc = v.x
+        except Exception:
+            pass
+        try:
+            v = model.getVarByName(f"DeficitAbanico[{t}]")
+            if v:
+                def_aban = v.x
+        except Exception:
+            pass
+        try:
+            v = model.getVarByName(f"Deficit2dosRegantes[{t}]")
+            if v:
+                def_2r = v.x
+        except Exception:
+            pass
+
+        # Primeros regantes: suma de déficits Tucapel + Abanico (Hm³)
+        deficit_mensual_1R[t] = def_tuc + def_aban
+        # Segundos regantes: variable dedicada
+        deficit_mensual_2R[t] = def_2r
+
+    # Sumar y obtener métricas
+    def1_values = list(deficit_mensual_1R.values())
+    def2_values = list(deficit_mensual_2R.values())
+
+    def1_sum = float(np.sum(def1_values)) if def1_values else 0.0
+    def2_sum = float(np.sum(def2_values)) if def2_values else 0.0
+    def1_prom = float(np.mean(def1_values)) if def1_values else 0.0
+    def2_prom = float(np.mean(def2_values)) if def2_values else 0.0
+    def1_max = float(np.max(def1_values)) if def1_values else 0.0
+    def2_max = float(np.max(def2_values)) if def2_values else 0.0
+
+    # Demandas totales de referencia (sumadas por mes)
+    demanda_tucapel_tot = float(np.sum(list(demanda_tucapel_mensual.values()))) if demanda_tucapel_mensual else 0.0
+    demanda_2R_tot = float(np.sum(list(demanda_2R_mensual.values()))) if demanda_2R_mensual else 0.0
+
+    pct_def1 = (def1_sum / demanda_tucapel_tot * 100.0) if demanda_tucapel_tot > 0 else 0.0
+    pct_def2 = (def2_sum / demanda_2R_tot * 100.0) if demanda_2R_tot > 0 else 0.0
 
     # ================================================
     # KPI 4: FACTOR DE UTILIZACIÓN ✅ MEJORADO
@@ -396,8 +448,16 @@ def _calculate_strategic_kpis(model) -> Dict[str, Any]:
         # KPIs estratégicos
         'tiempo_colchones_%': tiempo_colchones_pct,
         'uso_presupuestos_%': uso_presupuestos_pct,
-        'participacion_toro_%': participacion_toro_pct,
         'factor_utilizacion_%': factor_utilizacion,
+
+        # KPI de déficits (nuevo)
+        'deficit_max_hm3': {'1R': def1_max, '2R': def2_max},
+        'deficit_prom_hm3': {'1R': def1_prom, '2R': def2_prom},
+        'deficit_sum_hm3': {'1R': def1_sum, '2R': def2_sum},
+        'deficit_pct': {'1R': pct_def1, '2R': pct_def2},
+        'deficit_mensual_1R': deficit_mensual_1R,
+        'deficit_mensual_2R': deficit_mensual_2R,
+        'demand_totals_hm3': {'tucapel': demanda_tucapel_tot, '2R': demanda_2R_tot},
 
         # Nuevos campos para KPIs mejorados
         'uso_real_agua_hm3': uso_real_agua,
@@ -464,9 +524,35 @@ def aggregate_kpis(kpis_list: List[Dict[str, Any]]) -> Dict[str, Any]:
         "generacion": np.mean(gen_valores) if gen_valores else 0.0
     }
 
-    # KPI 3: Promedio de participación de El Toro
-    toro_valores = [kpi.get('participacion_toro_%', 0.0) for kpi in valid_kpis]
-    participacion_toro_agregada = np.mean(toro_valores) if toro_valores else 0.0
+    # KPI 3: Déficits para 1R y 2R (agregación)
+    # - Máximo worst-case entre todos los años/meses
+    # - Promedio mensual sobre todo el conjunto de años
+    # - Porcentaje respecto de la demanda estacional (suma total)
+    def1_max_vals = [kpi.get('deficit_max_hm3', {}).get('1R', 0.0) for kpi in valid_kpis]
+    def2_max_vals = [kpi.get('deficit_max_hm3', {}).get('2R', 0.0) for kpi in valid_kpis]
+    deficit_max_agregado = {
+        '1R': float(np.max(def1_max_vals)) if def1_max_vals else 0.0,
+        '2R': float(np.max(def2_max_vals)) if def2_max_vals else 0.0
+    }
+
+    # Totales acumulados para promedio y %
+    total_def1_sum = sum(kpi.get('deficit_sum_hm3', {}).get('1R', 0.0) for kpi in valid_kpis)
+    total_def2_sum = sum(kpi.get('deficit_sum_hm3', {}).get('2R', 0.0) for kpi in valid_kpis)
+    total_demand_tuc = sum(kpi.get('demand_totals_hm3', {}).get('tucapel', 0.0) for kpi in valid_kpis)
+    total_demand_2R = sum(kpi.get('demand_totals_hm3', {}).get('2R', 0.0) for kpi in valid_kpis)
+
+    from model import T
+    n_cases = len(valid_kpis)
+    months = len(T)
+    deficit_prom_agregado = {
+        '1R': (total_def1_sum / (n_cases * months)) if (n_cases > 0 and months > 0) else 0.0,
+        '2R': (total_def2_sum / (n_cases * months)) if (n_cases > 0 and months > 0) else 0.0
+    }
+
+    deficit_pct_agregado = {
+        '1R': (total_def1_sum / total_demand_tuc * 100.0) if total_demand_tuc > 0 else 0.0,
+        '2R': (total_def2_sum / total_demand_2R * 100.0) if total_demand_2R > 0 else 0.0
+    }
 
     # KPI 4: Promedio de factor de utilización del sistema
     fu_valores = [kpi['factor_utilizacion_%'].get('sistema', 0.0) for kpi in valid_kpis]
@@ -530,7 +616,11 @@ def aggregate_kpis(kpis_list: List[Dict[str, Any]]) -> Dict[str, Any]:
         # KPIs estratégicos agregados (sistema viejo para compatibilidad)
         'tiempo_colchones_%': colchones_agregados,
         'uso_presupuestos_%': uso_presupuestos_agregado,
-        'participacion_toro_%': participacion_toro_agregada,
+    # KPI: déficits agregados
+    'deficit_max_hm3': deficit_max_agregado,
+    'deficit_prom_hm3': deficit_prom_agregado,
+    'deficit_sum_hm3': {'1R': total_def1_sum, '2R': total_def2_sum},
+    'deficit_pct': deficit_pct_agregado,
         'factor_utilizacion_%': factor_utilizacion_agregado,
 
         # KPIs estratégicos nuevos (sistema mejorado)
@@ -617,11 +707,22 @@ def print_kpis(kpis: Dict[str, Any], context: str = "") -> None:
         print(f"   ⚡ Generación: "
               f"{presupuestos.get('generacion', 0):6.1f}%{sufijo}")
 
-    # KPI 3: Participación El Toro
-    print("\n🏭 KPI 3 - PARTICIPACIÓN PROMEDIO EL TORO:")
-    participacion = kpis.get('participacion_toro_%', 0.0)
+    # KPI 3: Déficits para primeros y segundos regantes
+    print("\n📉 KPI 3 - DÉFICITS PRIMEROS (1R) Y SEGUNDOS (2R) REGANTES:")
     sufijo = " (promedio histórico)" if "histórico" in context else ""
-    print(f"   ⚡ El Toro: {participacion:6.1f}% de energía total{sufijo}")
+    if 'deficit_max_hm3' in kpis:
+        dm = kpis.get('deficit_max_hm3', {})
+        dp = kpis.get('deficit_prom_hm3', {})
+        ds = kpis.get('deficit_sum_hm3', {})
+        pct = kpis.get('deficit_pct', {})
+        print(f"   🛑 Déficit máximo 1R: {dm.get('1R', 0.0):7.2f} Hm³{sufijo}")
+        print(f"   🛑 Déficit máximo 2R: {dm.get('2R', 0.0):7.2f} Hm³{sufijo}")
+        print(f"   📊 Déficit promedio 1R: {dp.get('1R', 0.0):7.3f} Hm³/mes{sufijo}")
+        print(f"   📊 Déficit promedio 2R: {dp.get('2R', 0.0):7.3f} Hm³/mes{sufijo}")
+        print(f"   📈 Déficit total anual 1R: {ds.get('1R', 0.0):7.2f} Hm³{sufijo} -> {pct.get('1R', 0.0):5.2f}% de la demanda")
+        print(f"   📈 Déficit total anual 2R: {ds.get('2R', 0.0):7.2f} Hm³{sufijo} -> {pct.get('2R', 0.0):5.2f}% de la demanda")
+    else:
+        print("   ⚠️ No hay información de déficits para mostrar")
 
     # KPI 4: Eficiencia energética (sistema mejorado) o factor utilización (compatibilidad)
     if 'eficiencia_energetica_mwh_hm3' in kpis:
@@ -743,13 +844,37 @@ def export_kpis_to_csv(kpis: Dict[str, Any],
             'unidad': '%'
         })
 
-    # KPI 3: Participación energética de El Toro
-    data.append({
-        'kpi_categoria': 'Participacion_ElToro',
-        'kpi_detalle': 'energia_total',
-        'valor': kpis.get('participacion_toro_%', 0.0),
-        'unidad': '%'
-    })
+    # KPI 3: Déficits para regantes (1R y 2R)
+    # Máximo (Hm³), Promedio (Hm³/mes), Total anual (Hm³) y % de demanda
+    def_max = kpis.get('deficit_max_hm3', {})
+    def_prom = kpis.get('deficit_prom_hm3', {})
+    def_sum = kpis.get('deficit_sum_hm3', {})
+    def_pct = kpis.get('deficit_pct', {})
+    for grp, label in [('1R', 'Primeros_Regantes'), ('2R', 'Segundos_Regantes')]:
+        data.append({
+            'kpi_categoria': 'Deficit_Max',
+            'kpi_detalle': label,
+            'valor': def_max.get(grp, 0.0),
+            'unidad': 'Hm3'
+        })
+        data.append({
+            'kpi_categoria': 'Deficit_Promedio',
+            'kpi_detalle': label,
+            'valor': def_prom.get(grp, 0.0),
+            'unidad': 'Hm3/mes'
+        })
+        data.append({
+            'kpi_categoria': 'Deficit_Total_Anual',
+            'kpi_detalle': label,
+            'valor': def_sum.get(grp, 0.0),
+            'unidad': 'Hm3'
+        })
+        data.append({
+            'kpi_categoria': 'Deficit_Pct_Demanda',
+            'kpi_detalle': label,
+            'valor': def_pct.get(grp, 0.0),
+            'unidad': '%'
+        })
 
     # KPI 4: Factor de utilización - Eficiencia hidráulica
     for tipo, valor in kpis.get('factor_utilizacion_%', {}).items():
@@ -971,14 +1096,30 @@ def extract_kpis_historicos_agregados(kpis_historicos: List[Dict[str, Any]]) -> 
         "generacion": sum(uso_gen_real_historico) / len(uso_gen_real_historico) if uso_gen_real_historico else 0.0
     }
     
-    # 3) KPI 3: Participación promedio de El Toro
-    participacion_toro_historico = []
-    
-    for kpis in kpis_historicos:
-        participacion_toro_historico.append(kpis.get("participacion_toro_%", 0.0))
-    
-    participacion_toro_promedio = (sum(participacion_toro_historico) / len(participacion_toro_historico)
-                                  if participacion_toro_historico else 0.0)
+    # 3) KPI 3: Déficits históricos agregados (1R y 2R)
+    # Máximo entre todos los años/meses, promedio mensual y % sobre demanda
+    def1_max_list = [k.get('deficit_max_hm3', {}).get('1R', 0.0) for k in kpis_historicos]
+    def2_max_list = [k.get('deficit_max_hm3', {}).get('2R', 0.0) for k in kpis_historicos]
+    def1_sum_total = sum(k.get('deficit_sum_hm3', {}).get('1R', 0.0) for k in kpis_historicos)
+    def2_sum_total = sum(k.get('deficit_sum_hm3', {}).get('2R', 0.0) for k in kpis_historicos)
+    demand_tuc_total = sum(k.get('demand_totals_hm3', {}).get('tucapel', 0.0) for k in kpis_historicos)
+    demand_2r_total = sum(k.get('demand_totals_hm3', {}).get('2R', 0.0) for k in kpis_historicos)
+
+    n_years = len(kpis_historicos)
+    months = len(next(iter(kpis_historicos)).get('cota_mensual', {})) if kpis_historicos else 12
+
+    deficit_max_historico = {
+        '1R': float(np.max(def1_max_list)) if def1_max_list else 0.0,
+        '2R': float(np.max(def2_max_list)) if def2_max_list else 0.0
+    }
+    deficit_prom_historico = {
+        '1R': (def1_sum_total / (n_years * months)) if (n_years > 0 and months > 0) else 0.0,
+        '2R': (def2_sum_total / (n_years * months)) if (n_years > 0 and months > 0) else 0.0
+    }
+    deficit_pct_historico = {
+        '1R': (def1_sum_total / demand_tuc_total * 100.0) if demand_tuc_total > 0 else 0.0,
+        '2R': (def2_sum_total / demand_2r_total * 100.0) if demand_2r_total > 0 else 0.0
+    }
     
     # 4) KPI 4: Eficiencia energética promedio (MWh/Hm³)
     eficiencia_energetica_historico = []
@@ -1030,9 +1171,11 @@ def extract_kpis_historicos_agregados(kpis_historicos: List[Dict[str, Any]]) -> 
     return {
         # KPIs estratégicos históricos mejorados
         "tiempo_colchones_%": tiempo_colchones_promedio,
-        "uso_real_agua_hm3": uso_real_agua_promedio,
-        "participacion_toro_%": participacion_toro_promedio,
-        "eficiencia_energetica_mwh_hm3": eficiencia_energetica_promedio,
+    "uso_real_agua_hm3": uso_real_agua_promedio,
+    "deficit_max_hm3": deficit_max_historico,
+    "deficit_prom_hm3": deficit_prom_historico,
+    "deficit_pct": deficit_pct_historico,
+    "eficiencia_energetica_mwh_hm3": eficiencia_energetica_promedio,
         
         # Resultados del modelo (históricos)
         "cota_mensual": cota_mensual_historica,
@@ -1077,10 +1220,17 @@ def print_kpis_historicos_agregados(kpis_agregados: Dict[str, Any]) -> None:
     print(f"   ⚡ Generación: {uso_gen:6.1f} Hm³/año (promedio histórico)")
     print(f"   🏭 Total:      {uso_total:6.1f} Hm³/año (promedio histórico)")
     
-    # KPI 3: Participación de El Toro
-    print(f"\n🏭 KPI 3 - PARTICIPACIÓN PROMEDIO EL TORO:")
-    participacion_toro = kpis_agregados.get("participacion_toro_%", 0.0)
-    print(f"   ⚡ El Toro: {participacion_toro:6.1f}% de energía total (promedio histórico)")
+    # KPI 3: Déficits históricos (1R y 2R)
+    print(f"\n📉 KPI 3 - DÉFICITS HISTÓRICOS (1R y 2R):")
+    dm = kpis_agregados.get('deficit_max_hm3', {})
+    dp = kpis_agregados.get('deficit_prom_hm3', {})
+    pct = kpis_agregados.get('deficit_pct', {})
+    print(f"   🛑 Déficit máximo 1R: {dm.get('1R', 0.0):6.2f} Hm³ (histórico)")
+    print(f"   🛑 Déficit máximo 2R: {dm.get('2R', 0.0):6.2f} Hm³ (histórico)")
+    print(f"   📊 Déficit promedio 1R: {dp.get('1R', 0.0):6.3f} Hm³/mes (histórico)")
+    print(f"   📊 Déficit promedio 2R: {dp.get('2R', 0.0):6.3f} Hm³/mes (histórico)")
+    print(f"   📈 Déficit como % demanda 1R: {pct.get('1R', 0.0):6.2f}%")
+    print(f"   📈 Déficit como % demanda 2R: {pct.get('2R', 0.0):6.2f}%")
     
     # KPI 4: Eficiencia energética
     print(f"\n⚡ KPI 4 - EFICIENCIA ENERGÉTICA PROMEDIO:")
