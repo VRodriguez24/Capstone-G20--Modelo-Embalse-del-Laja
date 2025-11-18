@@ -104,17 +104,13 @@ def print_monte_carlo_summary(
 
 def print_monte_carlo_kpis(results: Dict) -> None:
     """
-    Imprime KPIs agregados de la simulación Monte Carlo.
+    Imprime KPIs agregados de la simulación Monte Carlo en consola.
 
     Args:
         results: Diccionario con resultados de la simulación
     """
     if not results.get("successful_scenarios"):
         return
-
-    print("\n" + "=" * 60)
-    print("📋 KPIs ESTRATÉGICOS MONTE CARLO")
-    print("=" * 60)
 
     successful_scenarios = results["successful_scenarios"]
 
@@ -129,7 +125,7 @@ def print_monte_carlo_kpis(results: Dict) -> None:
         # Agregar KPIs usando la función del módulo kpi
         kpis_agregados = aggregate_kpis(all_kpis)
 
-        # Mostrar KPIs agregados
+        # Mostrar KPIs agregados en consola (sin exportar)
         print_kpis(kpis_agregados, "Monte Carlo")
     else:
         print("⚠️ No se pudieron calcular KPIs para los escenarios exitosos")
@@ -431,7 +427,7 @@ def run_monte_carlo():
             input_type=int
         )
 
-        print("   ✅ Usando bootstrap puro - sin ruido estocástico")
+        print("✅ Usando bootstrap puro - sin ruido estocástico\n")
 
         print("\n🚀 Iniciando simulación híbrida...")
 
@@ -474,13 +470,6 @@ def run_monte_carlo():
                     print(f"   📈 {Path(plot_file).name}")
             except Exception as e:
                 print(f"   ⚠️ Error generando gráficos: {e}")
-
-        print("\n💡 VENTAJAS DEL MÉTODO HÍBRIDO:")
-        print("   ✅ Variabilidad estocástica de Monte Carlo")
-        print("   ✅ Optimización robusta del modelo determinista")
-        print("   ✅ KPIs consistentes con análisis histórico")
-        print(f"  ✅ Alta tasa de éxito: {results['success_rate']:.1f}%")
-        print("   ✅ Resultados comparables y reproducibles")
 
         # Imprimir estadísticas de rendimiento
         performance_stats = get_performance_stats(start_time, process)

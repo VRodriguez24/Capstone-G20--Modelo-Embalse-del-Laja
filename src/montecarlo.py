@@ -24,7 +24,7 @@ from typing import Dict, Tuple, List, Optional
 # Importaciones del modelo
 from data_loader import CENTRAL_TO_INJ_ARC
 from embalse import A_inyeccion
-from model import build_model_for_one_year, T, Conv
+from model import build_model_for_one_year, T, Conv, V_max
 from kpi import extract_kpis
 
 # Detección automática de rutas de datos
@@ -257,14 +257,14 @@ class HybridSimulator:
         """
 
         if verbose:
-            print("🔄 SIMULACIÓN MONTE CARLO HÍBRIDA")
             print("=" * 60)
             print(f"📅 Periodo: {start_year}-{start_year + n_years - 1}")
             print(f"💧 V0: {V0:.1f} Hm³")
-            print(f"🎲 Escenarios multi-año: {n_scenarios}")
+            print(f"🎲 Escenarios: {n_scenarios}")
             print(f"🧩 Bloques: {block_len} meses")
-            print("🎛️ Bootstrap puro - sin ruido estocástico")
+            print("🎛️  Bootstrap puro - sin ruido estocástico")
             print("=" * 60)
+            print("\n🔄 Procesando escenarios...")
 
         successful_scenarios = []
         failed_scenarios = []
@@ -277,8 +277,14 @@ class HybridSimulator:
 
         for scenario_id in range(n_scenarios):
             if verbose:
-                print(f"\n🎲 Procesando escenario {scenario_id + 1}/"
-                      f"{n_scenarios}")
+                # Barra de progreso simple
+                progress_pct = (scenario_id + 1) / n_scenarios * 100
+                bar_len = 40
+                filled = int(bar_len * (scenario_id + 1) / n_scenarios)
+                bar = '█' * filled + '░' * (bar_len - filled)
+                msg = f"\r[{bar}] {progress_pct:5.1f}% "
+                msg += f"({scenario_id + 1}/{n_scenarios})"
+                print(msg, end='', flush=True)
 
             try:
                 # Generar escenario multi-año completo
@@ -288,7 +294,7 @@ class HybridSimulator:
 
                 # Simular escenario multi-año con continuidad
                 scenario_results = self._run_multiyear_scenario(
-                    multiyear_flows, V0, verbose=(scenario_id < 3)
+                    multiyear_flows, V0, verbose=False
                 )
 
                 # Organizar resultados por año para gráficos
@@ -309,6 +315,8 @@ class HybridSimulator:
                 })
 
             except Exception as e:
+                # Suprimir errores individuales durante simulación
+                pass
                 failed_scenarios.append({
                     "scenario_id": scenario_id + 1,
                     "error": str(e)
@@ -320,11 +328,10 @@ class HybridSimulator:
 
         if verbose:
             print("\n📊 ANÁLISIS FINAL MONTE CARLO:")
-            print("=" * 50)
-            print(f"🎯 Escenarios totales: {total_scenarios}")
-            print(f"✅ Escenarios exitosos: {len(successful_scenarios)}")
-            print(f"❌ Escenarios fallidos: {len(failed_scenarios)}")
-            print(f"📈 Tasa de éxito: {success_rate:.1f}%")
+            print(f"   🎯 Escenarios totales: {total_scenarios}")
+            print(f"   ✅ Escenarios exitosos: {len(successful_scenarios)}")
+            print(f"   ❌ Escenarios fallidos: {len(failed_scenarios)}")
+            print(f"   📈 Tasa de éxito: {success_rate:.1f}%")
 
         return {
             "success_rate": success_rate,
@@ -361,10 +368,39 @@ class HybridSimulator:
                     I_arc_override=year_flows
                 )
 
+                # Configurar parámetros para detectar infactibilidad
                 model.Params.OutputFlag = 0
+                # Ayuda a distinguir INF vs UNBD
+                model.Params.DualReductions = 0
+
                 model.optimize()
 
-                if model.status == 2:  # Óptimo
+                # Status codes: 2=OPTIMAL, 3=INFEASIBLE, 4=INF_OR_UNBD
+                if model.status == 4:  # Infactible o No acotado
+                    # Re-optimizar con DualReductions=0 para determinar cuál
+                    model.Params.DualReductions = 0
+                    model.optimize()
+
+                    if model.status == 3:  # Ahora sabemos que es INFEASIBLE
+                        # Computar IIS para diagnóstico
+                        model.computeIIS()
+                        raise Exception(
+                            f"Modelo infactible en año {year}. "
+                            f"V0={current_V0:.1f} Hm³"
+                        )
+                    else:
+                        raise Exception(
+                            f"Modelo no acotado en año {year}. "
+                            f"Status={model.status}"
+                        )
+
+                elif model.status == 3:  # Directamente infactible
+                    raise Exception(
+                        f"Modelo infactible en año {year}. "
+                        f"V0={current_V0:.1f} Hm³"
+                    )
+
+                elif model.status == 2:  # Óptimo
                     energy = model.objVal
                     V_vars = model._V
                     final_month = max(T)  # Noviembre (mes 11)
@@ -390,14 +426,17 @@ class HybridSimulator:
                     })
 
                     # CONTINUIDAD: V0 del próximo año = V_final de este año
-                    current_V0 = v_final
+                    # CORRECCIÓN: Limitar V0 a V_max (capacidad física)
+                    current_V0 = min(v_final, V_max)
 
                     if verbose:
                         print(f"      ✅ E: {energy:.1f} MWh, "
                               f"V_f: {v_final:.1f} Hm³, "
                               f"Toro: {toro_usage:.1f} Hm³")
                 else:
-                    raise Exception(f"Modelo no óptimo: status {model.status}")
+                    raise Exception(
+                        f"Modelo con status inesperado: {model.status}"
+                    )
 
                 model.dispose()
 

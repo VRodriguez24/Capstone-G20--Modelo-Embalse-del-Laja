@@ -1,8 +1,8 @@
 """
 ANÁLISIS DE SENSIBILIDAD DEL VOLUMEN INICIAL (V0)
 
-Evalúa cómo diferentes volúmenes iniciales afectan el desempeño del sistema
-usando simulación Monte Carlo multi-año.
+Evalúa cómo diferentes volúmenes iniciales afectan el desempeño
+del sistema usando simulación Monte Carlo multi-año.
 
 Características:
 - Rango configurable de V0 (ej: 500-5000 Hm³)
@@ -17,12 +17,18 @@ from __future__ import annotations
 
 import time
 import psutil
+import warnings
 import numpy as np
 import pandas as pd
+import matplotlib
 import matplotlib.pyplot as plt
 from pathlib import Path
 from typing import Dict, List, Tuple
 from dataclasses import dataclass, field
+
+# Suprimir warnings de matplotlib y unicode
+warnings.filterwarnings('ignore', category=UserWarning)
+matplotlib.rcParams['axes.unicode_minus'] = False
 
 # Importaciones del modelo
 from montecarlo import HybridSimulator
@@ -48,23 +54,10 @@ class SensitivityResult:
     std_final_volume: float
     kpis_agregados: Dict = field(default_factory=dict)
     scenarios_data: List[Dict] = field(default_factory=list)
-    
-    # KPIs estratégicos extraídos
-    tiempo_colchon_inferior: float = 0.0
-    tiempo_colchon_superior: float = 0.0
-    uso_presupuesto_riego: float = 0.0
-    uso_presupuesto_generacion: float = 0.0
-    deficit_max_1r: float = 0.0
-    deficit_max_2r: float = 0.0
-    deficit_prom_1r: float = 0.0
-    deficit_prom_2r: float = 0.0
-    factor_utilizacion: float = 0.0
-    cota_promedio: float = 0.0
-    eficiencia_energetica: float = 0.0
 
     def to_dict(self) -> Dict:
         """Convierte resultado a diccionario para análisis."""
-        base_dict = {
+        return {
             "V0": self.V0,
             "success_rate": self.success_rate,
             "avg_total_energy": self.avg_total_energy,
@@ -72,22 +65,8 @@ class SensitivityResult:
             "avg_toro_usage": self.avg_toro_usage,
             "avg_final_volume": self.avg_final_volume,
             "std_final_volume": self.std_final_volume,
-            # KPIs estratégicos
-            "tiempo_colchon_inferior_%": self.tiempo_colchon_inferior,
-            "tiempo_colchon_superior_%": self.tiempo_colchon_superior,
-            "uso_presupuesto_riego_%": self.uso_presupuesto_riego,
-            "uso_presupuesto_generacion_%": self.uso_presupuesto_generacion,
-            "deficit_max_1r_hm3": self.deficit_max_1r,
-            "deficit_max_2r_hm3": self.deficit_max_2r,
-            "deficit_prom_1r_hm3": self.deficit_prom_1r,
-            "deficit_prom_2r_hm3": self.deficit_prom_2r,
-            "factor_utilizacion_%": self.factor_utilizacion,
-            "cota_promedio_msnm": self.cota_promedio,
-            "eficiencia_energetica_mwh_hm3": self.eficiencia_energetica,
+            **self.kpis_agregados
         }
-        # Añadir KPIs agregados completos
-        base_dict.update(self.kpis_agregados)
-        return base_dict
 
 
 class SensitivityAnalyzer:
@@ -165,50 +144,39 @@ class SensitivityAnalyzer:
         # Ejecutar simulaciones para cada V0
         for idx, V0 in enumerate(V0_values):
             if verbose:
-                # Barra de progreso visual
-                progress = (idx + 1) / n_points
-                bar_length = 40
-                filled = int(bar_length * progress)
-                bar = "█" * filled + "░" * (bar_length - filled)
-                
-                print(f"\n{'─' * 70}")
-                print(f"🔄 PUNTO {idx+1}/{n_points}: V0 = {V0:.0f} Hm³")
-                print(f"{'─' * 70}")
-                print(f"   Progreso general: [{bar}] {progress*100:.1f}%")
-                print(f"   🎲 Ejecutando {self.n_scenarios} escenarios Monte Carlo...")
+                # Loader compacto - solo una línea que se actualiza
+                print(f"\r🔄 Progreso: [{idx+1}/{n_points}] V0={V0:.0f} Hm³ | "
+                      f"Simulando {self.n_scenarios} escenarios...",
+                      end='', flush=True)
 
             try:
                 # Ejecutar simulación Monte Carlo
+                # (sin verbose para output limpio)
                 result = self._evaluate_single_V0(V0, verbose=False)
                 self.results.append(result)
 
                 if verbose:
-                    # Mostrar resultado del punto
-                    status = "✅ ÉXITO" if result.success_rate > 0 else "⚠️ FALLO"
-                    print(f"\n   {status}")
-                    print(f"   📊 Tasa éxito: {result.success_rate:>6.1f}%")
-                    print(f"   ⚡ Energía:    {result.avg_annual_energy:>10,.0f} MWh/año")
-                    print(f"   💧 Déficit 1R: {result.deficit_prom_1r:>6.2f} Hm³/mes")
-                    print(f"   ⚠️  Riesgo:     {result.tiempo_colchon_inferior:>6.1f}% tiempo")
+                    # Mostrar resultado compacto en la misma línea
+                    status = "✅" if result.success_rate > 0 else "⚠️"
+                    print(f"\r{status} [{idx+1}/{n_points}] "
+                          f"V0={V0:.0f} Hm³ | "
+                          f"Éxito: {result.success_rate:.0f}% | "
+                          f"Energía: {result.avg_annual_energy:,.0f} MWh/año"
+                          + " " * 10)
 
             except Exception as e:
                 if verbose:
-                    error_msg = str(e)[:60]
-                    print(f"\n   ❌ ERROR: {error_msg}")
+                    error_msg = str(e)[:40]
+                    print(f"\r❌ [{idx+1}/{n_points}] "
+                          f"V0={V0:.0f} Hm³ | Error: {error_msg}"
+                          + " " * 10)
                 continue
 
         if verbose:
-            print("\n" + "═" * 70)
+            print("\n" + "=" * 70)
             print("✅ ANÁLISIS DE SENSIBILIDAD COMPLETADO")
-            print("═" * 70)
-            print(f"\n📊 Resumen de ejecución:")
-            print(f"   ✓ Puntos evaluados exitosamente: {len(self.results)}/{n_points}")
-            successful = sum(1 for r in self.results if r.success_rate > 0)
-            print(f"   ✓ Configuraciones con éxito: {successful}/{len(self.results)}")
-            if self.results:
-                avg_success = np.mean([r.success_rate for r in self.results])
-                print(f"   ✓ Tasa de éxito promedio: {avg_success:.1f}%")
-            print("═" * 70)
+            print("=" * 70)
+            print(f"📊 Puntos evaluados: {len(self.results)}/{n_points}")
 
         return self.results
 
@@ -277,20 +245,6 @@ class SensitivityAnalyzer:
         kpis_agregados = {}
         if all_kpis:
             kpis_agregados = aggregate_kpis(all_kpis)
-        
-        # Extraer KPIs estratégicos para acceso directo
-        tiempo_colchones = kpis_agregados.get('tiempo_colchones_%', {})
-        uso_presupuestos = kpis_agregados.get('uso_presupuestos_%', {})
-        deficit_max = kpis_agregados.get('deficit_max_hm3', {})
-        deficit_prom = kpis_agregados.get('deficit_prom_hm3', {})
-        factor_util = kpis_agregados.get('factor_utilizacion_%', {})
-        cota_mensual = kpis_agregados.get('cota_mensual', {})
-        
-        # Calcular cota promedio
-        cota_prom = np.mean(list(cota_mensual.values())) if cota_mensual else 0.0
-        
-        # Calcular eficiencia energética
-        eficiencia = kpis_agregados.get('eficiencia_energetica_mwh_hm3', 0.0)
 
         return SensitivityResult(
             V0=V0,
@@ -301,19 +255,7 @@ class SensitivityAnalyzer:
             avg_final_volume=avg_final_volume,
             std_final_volume=std_final_volume,
             kpis_agregados=kpis_agregados,
-            scenarios_data=successful,
-            # KPIs estratégicos
-            tiempo_colchon_inferior=tiempo_colchones.get('Inferior', 0.0),
-            tiempo_colchon_superior=tiempo_colchones.get('Superior', 0.0),
-            uso_presupuesto_riego=uso_presupuestos.get('riego', 0.0),
-            uso_presupuesto_generacion=uso_presupuestos.get('generacion', 0.0),
-            deficit_max_1r=deficit_max.get('1R', 0.0),
-            deficit_max_2r=deficit_max.get('2R', 0.0),
-            deficit_prom_1r=deficit_prom.get('1R', 0.0),
-            deficit_prom_2r=deficit_prom.get('2R', 0.0),
-            factor_utilizacion=factor_util.get('sistema', 0.0),
-            cota_promedio=cota_prom,
-            eficiencia_energetica=eficiencia
+            scenarios_data=successful
         )
 
     def export_results_to_csv(
@@ -341,142 +283,20 @@ class SensitivityAnalyzer:
         df.to_csv(output_path, index=False, float_format='%.2f')
 
         return output_path
-    
-    def export_edge_cases_analysis(
-        self,
-        output_path: str = "resultados/sensibilidad_v0_casos_borde.csv"
-    ) -> str:
-        """
-        Exporta análisis detallado de casos borde a CSV.
-        
-        Identifica y documenta escenarios críticos para evaluación de riesgos:
-        - V0 mínimo/máximo evaluado
-        - Peor caso de déficits
-        - Mayor riesgo operativo
-        - Mejor/peor tasa de éxito
-        - Mejor/peor eficiencia
-
-        Args:
-            output_path: Ruta del archivo CSV de salida
-
-        Returns:
-            Ruta del archivo creado
-        """
-        if not self.results:
-            print("⚠️ No hay resultados para exportar")
-            return ""
-
-        # Crear directorio si no existe
-        Path(output_path).parent.mkdir(parents=True, exist_ok=True)
-
-        # Identificar casos borde
-        casos_borde = []
-
-        # 1. V0 mínimo
-        min_v0 = min(self.results, key=lambda r: r.V0)
-        casos_borde.append({
-            "caso": "V0_minimo",
-            "descripcion": "Volumen inicial mínimo evaluado",
-            **min_v0.to_dict()
-        })
-
-        # 2. V0 máximo
-        max_v0 = max(self.results, key=lambda r: r.V0)
-        casos_borde.append({
-            "caso": "V0_maximo",
-            "descripcion": "Volumen inicial máximo evaluado",
-            **max_v0.to_dict()
-        })
-
-        # 3. Máxima energía
-        max_energy = max(self.results, key=lambda r: r.avg_annual_energy)
-        casos_borde.append({
-            "caso": "maxima_energia",
-            "descripcion": "Configuración óptima para generación energética",
-            **max_energy.to_dict()
-        })
-
-        # 4. Mínima energía (con éxito > 0)
-        successful_results = [r for r in self.results if r.success_rate > 0]
-        if successful_results:
-            min_energy = min(successful_results, key=lambda r: r.avg_annual_energy)
-            casos_borde.append({
-                "caso": "minima_energia",
-                "descripcion": "Peor desempeño energético (con éxito)",
-                **min_energy.to_dict()
-            })
-
-        # 5. Mayor déficit 1R
-        max_deficit_1r = max(self.results, key=lambda r: r.deficit_max_1r)
-        casos_borde.append({
-            "caso": "mayor_deficit_1R",
-            "descripcion": "Peor escenario para primeros regantes",
-            **max_deficit_1r.to_dict()
-        })
-
-        # 6. Mayor déficit 2R
-        max_deficit_2r = max(self.results, key=lambda r: r.deficit_max_2r)
-        casos_borde.append({
-            "caso": "mayor_deficit_2R",
-            "descripcion": "Peor escenario para segundos regantes",
-            **max_deficit_2r.to_dict()
-        })
-
-        # 7. Mayor riesgo operativo
-        max_risk = max(self.results, key=lambda r: r.tiempo_colchon_inferior)
-        casos_borde.append({
-            "caso": "mayor_riesgo_operativo",
-            "descripcion": "Máximo tiempo en colchón inferior",
-            **max_risk.to_dict()
-        })
-
-        # 8. Menor riesgo operativo
-        min_risk = min(self.results, key=lambda r: r.tiempo_colchon_inferior)
-        casos_borde.append({
-            "caso": "menor_riesgo_operativo",
-            "descripcion": "Mínimo tiempo en colchón inferior",
-            **min_risk.to_dict()
-        })
-
-        # 9. Máxima eficiencia
-        max_efficiency = max(self.results, key=lambda r: r.eficiencia_energetica)
-        casos_borde.append({
-            "caso": "maxima_eficiencia",
-            "descripcion": "Mejor relación energía/agua",
-            **max_efficiency.to_dict()
-        })
-
-        # 10. Mejor tasa de éxito
-        max_success = max(self.results, key=lambda r: r.success_rate)
-        casos_borde.append({
-            "caso": "mejor_exito",
-            "descripcion": "Mayor probabilidad de operación exitosa",
-            **max_success.to_dict()
-        })
-
-        # Crear DataFrame y exportar
-        df = pd.DataFrame(casos_borde)
-        df.to_csv(output_path, index=False, float_format='%.3f')
-
-        print(f"✅ Análisis de casos borde exportado: {output_path}")
-        print(f"   📊 {len(casos_borde)} casos críticos documentados")
-
-        return output_path
 
     def generate_sensitivity_plots(
         self,
-        output_dir: str = "resultados"
+        output_dir: str = "resultados/analisis_sensibilidad"
     ) -> List[str]:
         """
-        Genera visualizaciones de análisis de sensibilidad.
+        Genera visualizaciones profesionales de análisis de sensibilidad.
 
-        Crea gráficos mostrando:
-        - V0 vs Energía promedio anual
-        - V0 vs Tasa de éxito
-        - V0 vs KPIs estratégicos (tiempo en colchones, déficits, eficiencia)
-        - V0 vs Uso de presupuestos
-        - V0 vs Factor de utilización
-        - V0 vs Volumen final promedio
+        Crea 5 gráficos especializados:
+        1. V0 vs Generación Energética
+        2. V0 vs Dependencia del Embalse
+        3. V0 vs Uso de Presupuestos
+        4. Sensibilidad Comparativa de KPIs
+        5. Panel de KPIs (sin radar chart)
 
         Args:
             output_dir: Directorio para guardar gráficos
@@ -491,871 +311,721 @@ class SensitivityAnalyzer:
 
         # Crear directorio de salida
         output_path = Path(output_dir)
-        output_path.mkdir(exist_ok=True)
+        output_path.mkdir(parents=True, exist_ok=True)
         files_created = []
 
         # Extraer datos para gráficos
-        V0_values = [r.V0 for r in self.results]
-        success_rates = [r.success_rate for r in self.results]
-        avg_energies = [r.avg_annual_energy for r in self.results]
-        
-        # KPIs estratégicos
-        tiempo_inferior = [r.tiempo_colchon_inferior for r in self.results]
-        tiempo_superior = [r.tiempo_colchon_superior for r in self.results]
-        uso_riego = [r.uso_presupuesto_riego for r in self.results]
-        uso_generacion = [r.uso_presupuesto_generacion for r in self.results]
-        deficit_max_1r = [r.deficit_max_1r for r in self.results]
-        deficit_max_2r = [r.deficit_max_2r for r in self.results]
-        deficit_prom_1r = [r.deficit_prom_1r for r in self.results]
-        deficit_prom_2r = [r.deficit_prom_2r for r in self.results]
-        factor_util = [r.factor_utilizacion for r in self.results]
-        cota_prom = [r.cota_promedio for r in self.results]
-        eficiencia = [r.eficiencia_energetica for r in self.results]
-        
-        avg_final_vol = [r.avg_final_volume for r in self.results]
-        std_final_vol = [r.std_final_volume for r in self.results]
+        V0_values = np.array([r.V0 for r in self.results])
+        success_rates = np.array([r.success_rate for r in self.results])
+        avg_energies = np.array([r.avg_annual_energy for r in self.results])
+        avg_toro = np.array([r.avg_toro_usage for r in self.results])
 
-        # Configurar estilo
-        plt.rcParams['font.size'] = 9
-        plt.rcParams['figure.figsize'] = (20, 16)
-
-        # ==================================================================
-        # FIGURA 1: MÉTRICAS PRINCIPALES (3x3 grid)
-        # ==================================================================
-        fig1, axes1 = plt.subplots(3, 3, figsize=(20, 16))
+        # Extraer KPIs estratégicos según especificación
+        # KPI 1: Tiempo en colchones operativos
+        tiempo_inferior = []
+        tiempo_transicion = []
+        tiempo_intermedio = []
+        tiempo_superior = []
         
-        # --- FILA 1: RENDIMIENTO ENERGÉTICO Y ÉXITO ---
+        # KPI 2: Uso de presupuestos
+        uso_presupuesto_riego = []
+        uso_presupuesto_gen = []
         
-        # Plot 1.1: V0 vs Energía Promedio Anual
-        ax = axes1[0, 0]
-        ax.plot(V0_values, avg_energies, 'b-o', linewidth=2, markersize=6)
-        ax.set_xlabel('Volumen Inicial V0 [Hm³]', fontweight='bold')
-        ax.set_ylabel('Energía Promedio Anual [MWh/año]', fontweight='bold')
-        ax.set_title('V0 vs Generación Energética', fontweight='bold', fontsize=11)
-        ax.grid(True, alpha=0.3)
-        # Marcar máximo
-        if avg_energies:
-            max_idx = np.argmax(avg_energies)
-            ax.plot(V0_values[max_idx], avg_energies[max_idx], 'r*', 
-                   markersize=15, label=f'Máximo: V0={V0_values[max_idx]:.0f} Hm³')
-            ax.legend()
-
-        # Plot 1.2: V0 vs Tasa de Éxito
-        ax = axes1[0, 1]
-        ax.plot(V0_values, success_rates, 'g-o', linewidth=2, markersize=6)
-        ax.set_xlabel('Volumen Inicial V0 [Hm³]', fontweight='bold')
-        ax.set_ylabel('Tasa de Éxito [%]', fontweight='bold')
-        ax.set_title('V0 vs Tasa de Éxito Monte Carlo', fontweight='bold', fontsize=11)
-        ax.set_ylim(0, 105)
-        ax.grid(True, alpha=0.3)
-
-        # Plot 1.3: V0 vs Eficiencia Energética
-        ax = axes1[0, 2]
-        if any(eficiencia):
-            ax.plot(V0_values, eficiencia, 'purple', marker='o', linewidth=2, markersize=6)
-            ax.set_xlabel('Volumen Inicial V0 [Hm³]', fontweight='bold')
-            ax.set_ylabel('Eficiencia [MWh/Hm³]', fontweight='bold')
-            ax.set_title('V0 vs Eficiencia Energética', fontweight='bold', fontsize=11)
-            ax.grid(True, alpha=0.3)
-            # Marcar máximo
-            max_idx = np.argmax(eficiencia)
-            ax.plot(V0_values[max_idx], eficiencia[max_idx], 'r*', 
-                   markersize=15, label=f'Máximo: V0={V0_values[max_idx]:.0f} Hm³')
-            ax.legend()
-        else:
-            ax.text(0.5, 0.5, 'Sin datos', ha='center', va='center', transform=ax.transAxes)
-
-        # --- FILA 2: TIEMPO EN COLCHONES Y USO DE PRESUPUESTOS ---
+        # KPI 3: Déficits de riego
+        deficits_1r = []  # Primeros regantes
+        deficits_2r = []  # Segundos regantes
+        deficit_pct_1r = []  # Porcentaje de demanda 1R
         
-        # Plot 2.1: V0 vs Tiempo en Colchón Inferior
-        ax = axes1[1, 0]
-        ax.plot(V0_values, tiempo_inferior, 'orange', marker='o', linewidth=2, markersize=6)
-        ax.set_xlabel('Volumen Inicial V0 [Hm³]', fontweight='bold')
-        ax.set_ylabel('Tiempo en Colchón Inferior [%]', fontweight='bold')
-        ax.set_title('V0 vs Riesgo Operativo (Colchón Inferior)', fontweight='bold', fontsize=11)
-        ax.set_ylim(0, 105)
-        ax.grid(True, alpha=0.3)
-        # Destacar zona crítica (>50%)
-        ax.axhline(y=50, color='red', linestyle='--', alpha=0.5, label='Límite crítico (50%)')
-        ax.legend()
-
-        # Plot 2.2: V0 vs Tiempo en Colchón Superior
-        ax = axes1[1, 1]
-        ax.plot(V0_values, tiempo_superior, 'darkgreen', marker='o', linewidth=2, markersize=6)
-        ax.set_xlabel('Volumen Inicial V0 [Hm³]', fontweight='bold')
-        ax.set_ylabel('Tiempo en Colchón Superior [%]', fontweight='bold')
-        ax.set_title('V0 vs Disponibilidad Hídrica Alta', fontweight='bold', fontsize=11)
-        ax.set_ylim(0, 105)
-        ax.grid(True, alpha=0.3)
-        # Marcar máximo
-        if tiempo_superior:
-            max_idx = np.argmax(tiempo_superior)
-            ax.plot(V0_values[max_idx], tiempo_superior[max_idx], 'r*', 
-                   markersize=15, label=f'Máximo: V0={V0_values[max_idx]:.0f} Hm³')
-            ax.legend()
-
-        # Plot 2.3: V0 vs Uso de Presupuestos (Dual)
-        ax = axes1[1, 2]
-        ax.plot(V0_values, uso_riego, 'blue', marker='o', linewidth=2, 
-               markersize=6, label='Riego')
-        ax.plot(V0_values, uso_generacion, 'green', marker='s', linewidth=2, 
-               markersize=6, label='Generación')
-        ax.set_xlabel('Volumen Inicial V0 [Hm³]', fontweight='bold')
-        ax.set_ylabel('Uso de Presupuesto [%]', fontweight='bold')
-        ax.set_title('V0 vs Uso de Presupuestos (Riego y Generación)', fontweight='bold', fontsize=11)
-        ax.axhline(y=100, color='red', linestyle='--', alpha=0.5, label='Presupuesto (100%)')
-        ax.grid(True, alpha=0.3)
-        ax.legend()
-
-        # --- FILA 3: DÉFICITS Y FACTOR DE UTILIZACIÓN ---
+        # KPI 4: Factor de utilización
+        factor_utilizacion = []
         
-        # Plot 3.1: V0 vs Déficits Máximos (1R y 2R)
-        ax = axes1[2, 0]
-        ax.plot(V0_values, deficit_max_1r, 'red', marker='o', linewidth=2, 
-               markersize=6, label='1R (Primeros Regantes)')
-        ax.plot(V0_values, deficit_max_2r, 'darkred', marker='s', linewidth=2, 
-               markersize=6, label='2R (Segundos Regantes)')
-        ax.set_xlabel('Volumen Inicial V0 [Hm³]', fontweight='bold')
-        ax.set_ylabel('Déficit Máximo [Hm³]', fontweight='bold')
-        ax.set_title('V0 vs Déficits Máximos (Peor Caso)', fontweight='bold', fontsize=11)
-        ax.grid(True, alpha=0.3)
-        ax.legend()
-
-        # Plot 3.2: V0 vs Déficits Promedio (1R y 2R)
-        ax = axes1[2, 1]
-        ax.plot(V0_values, deficit_prom_1r, 'coral', marker='o', linewidth=2, 
-               markersize=6, label='1R (Primeros Regantes)')
-        ax.plot(V0_values, deficit_prom_2r, 'salmon', marker='s', linewidth=2, 
-               markersize=6, label='2R (Segundos Regantes)')
-        ax.set_xlabel('Volumen Inicial V0 [Hm³]', fontweight='bold')
-        ax.set_ylabel('Déficit Promedio [Hm³/mes]', fontweight='bold')
-        ax.set_title('V0 vs Déficits Promedio Mensual', fontweight='bold', fontsize=11)
-        ax.grid(True, alpha=0.3)
-        ax.legend()
-
-        # Plot 3.3: V0 vs Factor de Utilización
-        ax = axes1[2, 2]
-        if any(factor_util):
-            ax.plot(V0_values, factor_util, 'teal', marker='o', linewidth=2, markersize=6)
-            ax.set_xlabel('Volumen Inicial V0 [Hm³]', fontweight='bold')
-            ax.set_ylabel('Factor de Utilización [%]', fontweight='bold')
-            ax.set_title('V0 vs Eficiencia Hidráulica del Sistema', fontweight='bold', fontsize=11)
-            ax.grid(True, alpha=0.3)
-            # Marcar máximo
-            max_idx = np.argmax(factor_util)
-            ax.plot(V0_values[max_idx], factor_util[max_idx], 'r*', 
-                   markersize=15, label=f'Máximo: V0={V0_values[max_idx]:.0f} Hm³')
-            ax.legend()
-        else:
-            ax.text(0.5, 0.5, 'Sin datos', ha='center', va='center', transform=ax.transAxes)
-
-        plt.tight_layout()
-        plot_file1 = output_path / "sensibilidad_v0_kpis_estrategicos.png"
-        plt.savefig(plot_file1, dpi=300, bbox_inches='tight')
-        plt.close()
-        files_created.append(str(plot_file1))
-
-        # ==================================================================
-        # FIGURA 2: ANÁLISIS COMPLEMENTARIO (2x2 grid)
-        # ==================================================================
-        fig2, axes2 = plt.subplots(2, 2, figsize=(16, 12))
-        
-        # Plot 2.1: V0 vs Cota Promedio
-        ax = axes2[0, 0]
-        if any(cota_prom):
-            ax.plot(V0_values, cota_prom, 'm-o', linewidth=2, markersize=6)
-            ax.set_xlabel('Volumen Inicial V0 [Hm³]', fontweight='bold')
-            ax.set_ylabel('Cota Promedio [msnm]', fontweight='bold')
-            ax.set_title('V0 vs Cota del Lago', fontweight='bold', fontsize=12)
-            ax.grid(True, alpha=0.3)
-        else:
-            ax.text(0.5, 0.5, 'Sin datos', ha='center', va='center', transform=ax.transAxes)
-
-        # Plot 2.2: V0 vs Volumen Final (con banda de desviación)
-        ax = axes2[0, 1]
-        ax.fill_between(
-            V0_values,
-            np.array(avg_final_vol) - np.array(std_final_vol),
-            np.array(avg_final_vol) + np.array(std_final_vol),
-            alpha=0.3,
-            color='lightblue',
-            label='±1 desviación estándar'
-        )
-        ax.plot(V0_values, avg_final_vol, 'b-o', linewidth=2, markersize=6,
-               label='Volumen final promedio')
-        ax.plot(V0_values, V0_values, 'k--', alpha=0.5, linewidth=1,
-               label='Equilibrio (V_final = V0)')
-        ax.set_xlabel('Volumen Inicial V0 [Hm³]', fontweight='bold')
-        ax.set_ylabel('Volumen Final Promedio [Hm³]', fontweight='bold')
-        ax.set_title('V0 vs Volumen Final', fontweight='bold', fontsize=12)
-        ax.grid(True, alpha=0.3)
-        ax.legend()
-
-        # Plot 2.3: Trade-off: Energía vs Déficit 1R
-        ax = axes2[1, 0]
-        scatter = ax.scatter(deficit_prom_1r, avg_energies, c=V0_values, 
-                            cmap='viridis', s=100, alpha=0.7, edgecolors='black')
-        ax.set_xlabel('Déficit Promedio 1R [Hm³/mes]', fontweight='bold')
-        ax.set_ylabel('Energía Promedio Anual [MWh/año]', fontweight='bold')
-        ax.set_title('Trade-off: Energía vs Déficit (1R)', fontweight='bold', fontsize=12)
-        ax.grid(True, alpha=0.3)
-        cbar = plt.colorbar(scatter, ax=ax)
-        cbar.set_label('V0 [Hm³]', fontweight='bold')
-
-        # Plot 2.4: Trade-off: Tasa de Éxito vs Tiempo en Colchón Inferior
-        ax = axes2[1, 1]
-        scatter = ax.scatter(tiempo_inferior, success_rates, c=V0_values, 
-                            cmap='plasma', s=100, alpha=0.7, edgecolors='black')
-        ax.set_xlabel('Tiempo en Colchón Inferior [%]', fontweight='bold')
-        ax.set_ylabel('Tasa de Éxito [%]', fontweight='bold')
-        ax.set_title('Trade-off: Éxito vs Riesgo Operativo', fontweight='bold', fontsize=12)
-        ax.grid(True, alpha=0.3)
-        cbar = plt.colorbar(scatter, ax=ax)
-        cbar.set_label('V0 [Hm³]', fontweight='bold')
-
-        plt.tight_layout()
-        plot_file2 = output_path / "sensibilidad_v0_analisis_complementario.png"
-        plt.savefig(plot_file2, dpi=300, bbox_inches='tight')
-        plt.close()
-        files_created.append(str(plot_file2))
-
-        # ==================================================================
-        # FIGURA 3: DASHBOARD EJECUTIVO (2x2 grid)
-        # ==================================================================
-        fig3 = plt.figure(figsize=(18, 14))
-        gs = fig3.add_gridspec(3, 2, hspace=0.3, wspace=0.25)
-        
-        # Plot 3.1: Radar Chart - Comparación Multi-dimensional (TOP)
-        ax_radar = fig3.add_subplot(gs[0, :], projection='polar')
-        
-        # Seleccionar 3-5 configuraciones representativas
-        if len(self.results) >= 5:
-            indices = [0, len(self.results)//4, len(self.results)//2, 
-                      3*len(self.results)//4, -1]
-            labels_configs = ['V0 Mín', 'V0 25%', 'V0 50%', 'V0 75%', 'V0 Máx']
-        else:
-            indices = range(len(self.results))
-            labels_configs = [f'V0={self.results[i].V0:.0f}' for i in indices]
-        
-        selected_results = [self.results[i] for i in indices]
-        
-        # Preparar datos para radar (normalizar 0-100)
-        categories = ['Energía', 'Éxito', 'Eficiencia', 
-                     'Seguridad\nHídrica', 'Estabilidad\nOperativa']
-        
-        def normalize_to_100(values):
-            min_val, max_val = min(values), max(values)
-            if max_val == min_val:
-                return [50] * len(values)
-            return [(v - min_val) / (max_val - min_val) * 100 for v in values]
-        
-        all_energies = [r.avg_annual_energy for r in self.results]
-        all_success = [r.success_rate for r in self.results]
-        all_efficiency = [r.eficiencia_energetica for r in self.results]
-        all_deficits = [r.deficit_prom_1r for r in self.results]
-        all_risks = [r.tiempo_colchon_inferior for r in self.results]
-        
-        norm_energies = normalize_to_100(all_energies)
-        norm_deficits_inv = [100 - v for v in normalize_to_100(all_deficits)]
-        norm_risks_inv = [100 - v for v in normalize_to_100(all_risks)]
-        
-        angles = np.linspace(0, 2 * np.pi, len(categories), endpoint=False).tolist()
-        angles += angles[:1]
-        
-        ax_radar.set_theta_offset(np.pi / 2)
-        ax_radar.set_theta_direction(-1)
-        ax_radar.set_xticks(angles[:-1])
-        ax_radar.set_xticklabels(categories, size=10, weight='bold')
-        ax_radar.set_ylim(0, 100)
-        ax_radar.set_yticks([25, 50, 75, 100])
-        ax_radar.set_yticklabels(['25', '50', '75', '100'], size=8)
-        ax_radar.grid(True, linestyle='--', alpha=0.3)
-        
-        colors = ['#1f77b4', '#ff7f0e', '#2ca02c', '#d62728', '#9467bd']
-        
-        for idx, (result, label, color) in enumerate(zip(selected_results, labels_configs, colors)):
-            result_idx = self.results.index(result)
-            values = [
-                norm_energies[result_idx],
-                all_success[result_idx],
-                normalize_to_100(all_efficiency)[result_idx],
-                norm_deficits_inv[result_idx],
-                norm_risks_inv[result_idx]
-            ]
-            values += values[:1]
-            
-            ax_radar.plot(angles, values, 'o-', linewidth=2, 
-                         label=f'{label} ({result.V0:.0f} Hm³)', 
-                         color=color, markersize=6)
-            ax_radar.fill(angles, values, alpha=0.15, color=color)
-        
-        ax_radar.set_title('Comparación Multi-dimensional de Configuraciones V0', 
-                          fontweight='bold', fontsize=14, pad=20)
-        ax_radar.legend(loc='upper right', bbox_to_anchor=(1.3, 1.1), fontsize=10)
-        
-        # Plot 3.2: Heatmap Déficits vs Riesgo
-        ax_heat = fig3.add_subplot(gs[1, 0])
-        
-        # Crear matriz de calor
-        deficit_bins = np.linspace(min(deficit_prom_1r), max(deficit_prom_1r), 10)
-        risk_bins = np.linspace(min(tiempo_inferior), max(tiempo_inferior), 10)
-        
-        # Agrupar puntos por bins y calcular energía promedio
-        heat_matrix = np.zeros((len(risk_bins)-1, len(deficit_bins)-1))
-        count_matrix = np.zeros((len(risk_bins)-1, len(deficit_bins)-1))
+        # KPI adicional: Cota promedio (indicador de estado)
+        cotas_prom = []
         
         for r in self.results:
-            d_idx = np.digitize(r.deficit_prom_1r, deficit_bins) - 1
-            r_idx = np.digitize(r.tiempo_colchon_inferior, risk_bins) - 1
+            kpis = r.kpis_agregados if r.kpis_agregados else {}
             
-            if 0 <= d_idx < len(deficit_bins)-1 and 0 <= r_idx < len(risk_bins)-1:
-                heat_matrix[r_idx, d_idx] += r.avg_annual_energy
-                count_matrix[r_idx, d_idx] += 1
-        
-        # Promedio
-        with np.errstate(divide='ignore', invalid='ignore'):
-            heat_matrix = np.where(count_matrix > 0, heat_matrix / count_matrix, np.nan)
-        
-        im = ax_heat.imshow(heat_matrix, cmap='RdYlGn', aspect='auto', origin='lower')
-        ax_heat.set_xlabel('Déficit Promedio 1R [Hm³/mes]', fontweight='bold')
-        ax_heat.set_ylabel('Riesgo Operativo [% tiempo]', fontweight='bold')
-        ax_heat.set_title('Mapa de Generación: Déficit vs Riesgo', fontweight='bold', fontsize=12)
-        
-        # Etiquetas
-        ax_heat.set_xticks(np.arange(len(deficit_bins)-1))
-        ax_heat.set_yticks(np.arange(len(risk_bins)-1))
-        ax_heat.set_xticklabels([f'{v:.2f}' for v in deficit_bins[:-1]], rotation=45, ha='right', fontsize=8)
-        ax_heat.set_yticklabels([f'{v:.1f}' for v in risk_bins[:-1]], fontsize=8)
-        
-        cbar = plt.colorbar(im, ax=ax_heat)
-        cbar.set_label('Energía [MWh/año]', fontweight='bold', rotation=270, labelpad=20)
-        
-        # Plot 3.3: Pareto Front - Energía vs Déficit
-        ax_pareto = fig3.add_subplot(gs[1, 1])
-        
-        # Scatter con color por V0
-        scatter = ax_pareto.scatter(deficit_prom_1r, avg_energies, 
-                                   c=V0_values, s=200, alpha=0.7, 
-                                   cmap='viridis', edgecolors='black', linewidth=1.5)
-        
-        # Identificar frontera de Pareto (maximizar energía, minimizar déficit)
-        # Puntos no dominados
-        pareto_points = []
-        for i, r1 in enumerate(self.results):
-            is_pareto = True
-            for j, r2 in enumerate(self.results):
-                if i != j:
-                    # r2 domina r1 si tiene mayor energía Y menor déficit
-                    if (r2.avg_annual_energy >= r1.avg_annual_energy and 
-                        r2.deficit_prom_1r <= r1.deficit_prom_1r and
-                        (r2.avg_annual_energy > r1.avg_annual_energy or 
-                         r2.deficit_prom_1r < r1.deficit_prom_1r)):
-                        is_pareto = False
-                        break
-            if is_pareto:
-                pareto_points.append(i)
-        
-        # Dibujar frontera de Pareto
-        if pareto_points:
-            pareto_deficits = [deficit_prom_1r[i] for i in pareto_points]
-            pareto_energies = [avg_energies[i] for i in pareto_points]
+            # KPI 1: Tiempo en colchones
+            colchones = kpis.get("tiempo_colchones_%", {})
+            tiempo_inferior.append(colchones.get("Inferior", 0))
+            tiempo_transicion.append(colchones.get("Transicion", 0))
+            tiempo_intermedio.append(colchones.get("Intermedio", 0))
+            tiempo_superior.append(colchones.get("Superior", 0))
             
-            # Ordenar para línea
-            sorted_pairs = sorted(zip(pareto_deficits, pareto_energies))
-            pareto_deficits_sorted, pareto_energies_sorted = zip(*sorted_pairs)
+            # KPI 2: Uso de presupuestos
+            presupuestos = kpis.get("uso_presupuestos_%", {})
+            uso_presupuesto_riego.append(presupuestos.get("riego", 0))
+            uso_presupuesto_gen.append(presupuestos.get("generacion", 0))
             
-            ax_pareto.plot(pareto_deficits_sorted, pareto_energies_sorted, 
-                          'r--', linewidth=2, label='Frontera de Pareto', alpha=0.7)
+            # KPI 3: Déficits de riego
+            deficit_prom = kpis.get("deficit_prom_hm3", {})
+            deficits_1r.append(deficit_prom.get("1R", 0))
+            deficits_2r.append(deficit_prom.get("2R", 0))
             
-            # Marcar puntos Pareto
-            ax_pareto.scatter([deficit_prom_1r[i] for i in pareto_points],
-                            [avg_energies[i] for i in pareto_points],
-                            marker='*', s=400, c='red', edgecolors='darkred', 
-                            linewidth=2, label='Configuraciones Pareto-óptimas', zorder=5)
+            deficit_pct = kpis.get("deficit_pct", {})
+            deficit_pct_1r.append(deficit_pct.get("1R", 0))
+            
+            # KPI 4: Factor de utilización
+            fu = kpis.get("factor_utilizacion_%", {})
+            factor_utilizacion.append(fu.get("sistema", 0))
+            
+            # Cota promedio (indicador adicional)
+            cota_data = kpis.get("cota_mensual", {})
+            if cota_data:
+                cota_prom = sum(cota_data.values()) / len(cota_data)
+            else:
+                cota_prom = 0
+            cotas_prom.append(cota_prom)
+
+        # Convertir a arrays
+        tiempo_inferior = np.array(tiempo_inferior)
+        tiempo_transicion = np.array(tiempo_transicion)
+        tiempo_intermedio = np.array(tiempo_intermedio)
+        tiempo_superior = np.array(tiempo_superior)
+        uso_presupuesto_riego = np.array(uso_presupuesto_riego)
+        uso_presupuesto_gen = np.array(uso_presupuesto_gen)
+        deficits_1r = np.array(deficits_1r)
+        deficits_2r = np.array(deficits_2r)
+        deficit_pct_1r = np.array(deficit_pct_1r)
+        factor_utilizacion = np.array(factor_utilizacion)
+        cotas_prom = np.array(cotas_prom)
+
+        # Configurar estilo profesional
+        plt.rcParams['font.size'] = 11
+        plt.rcParams['axes.labelsize'] = 12
+        plt.rcParams['axes.titlesize'] = 14
+        plt.rcParams['xtick.labelsize'] = 10
+        plt.rcParams['ytick.labelsize'] = 10
+        plt.rcParams['legend.fontsize'] = 10
+        plt.rcParams['figure.titlesize'] = 16
+        plt.rcParams['text.color'] = 'black'
+        plt.rcParams['axes.labelcolor'] = 'black'
+        plt.rcParams['xtick.color'] = 'black'
+        plt.rcParams['ytick.color'] = 'black'
         
-        ax_pareto.set_xlabel('Déficit Promedio 1R [Hm³/mes]', fontweight='bold')
-        ax_pareto.set_ylabel('Energía Promedio Anual [MWh/año]', fontweight='bold')
-        ax_pareto.set_title('Frontera de Pareto: Energía vs Seguridad Hídrica', 
-                           fontweight='bold', fontsize=12)
-        ax_pareto.grid(True, alpha=0.3)
-        ax_pareto.legend(loc='best', fontsize=9)
-        
-        cbar2 = plt.colorbar(scatter, ax=ax_pareto)
-        cbar2.set_label('V0 [Hm³]', fontweight='bold', rotation=270, labelpad=20)
-        
-        # Plot 3.4: Sensibilidad Normalizada (todas las métricas)
-        ax_sens = fig3.add_subplot(gs[2, :])
-        
-        # Normalizar todas las métricas a escala 0-1
-        metrics = {
-            'Energía': normalize_to_100([r.avg_annual_energy for r in self.results]),
-            'Tasa Éxito': [r.success_rate for r in self.results],
-            'Eficiencia': normalize_to_100([r.eficiencia_energetica for r in self.results]),
-            'Seguridad (inv)': [100 - v for v in normalize_to_100([r.deficit_prom_1r for r in self.results])],
-            'Estabilidad (inv)': [100 - v for v in normalize_to_100([r.tiempo_colchon_inferior for r in self.results])]
+        # Paleta de colores profesional
+        colors = {
+            'primary': '#1f77b4',    # Azul científico
+            'success': '#2ca02c',    # Verde
+            'warning': '#ff7f0e',    # Naranja
+            'danger': '#d62728',     # Rojo
+            'azul': '#2e5f8a',       # Azul oscuro
+            'cyan': '#17becf'        # Cyan
         }
+
+        # ================================================================
+        # GRÁFICO 1: V0 VS GENERACIÓN ENERGÉTICA
+        # ================================================================
+        fig1, ax1 = plt.subplots(figsize=(12, 7))
         
-        for name, values in metrics.items():
-            ax_sens.plot(V0_values, values, marker='o', linewidth=2, 
-                        markersize=6, label=name, alpha=0.8)
+        # Línea principal con marcadores
+        ax1.plot(V0_values, avg_energies, 'o-',
+                 color=colors['primary'], linewidth=2.5, markersize=8,
+                 label='Energía anual promedio', zorder=3)
         
-        ax_sens.set_xlabel('Volumen Inicial V0 [Hm³]', fontweight='bold', fontsize=12)
-        ax_sens.set_ylabel('Índice Normalizado [0-100]', fontweight='bold', fontsize=12)
-        ax_sens.set_title('Sensibilidad Comparativa de Todos los KPIs (Normalizado)', 
-                         fontweight='bold', fontsize=13)
-        ax_sens.grid(True, alpha=0.3, linestyle='--')
-        ax_sens.legend(loc='best', fontsize=10, ncol=5)
-        ax_sens.set_ylim(-5, 105)
+        # Área sombreada bajo la curva
+        ax1.fill_between(V0_values, 0, avg_energies,
+                         alpha=0.2, color=colors['primary'])
         
-        # Zona óptima (percentiles 25-75)
-        p25 = np.percentile(V0_values, 25)
-        p75 = np.percentile(V0_values, 75)
-        ax_sens.axvspan(p25, p75, alpha=0.1, color='green', 
-                       label='Rango conservador recomendado')
-        
-        # Usar bbox_inches='tight' en lugar de tight_layout() para evitar warning con polar
-        plot_file3 = output_path / "sensibilidad_v0_dashboard_ejecutivo.png"
-        plt.savefig(plot_file3, dpi=300, bbox_inches='tight')
+        # Marcar valor máximo
+        max_energy_idx = np.argmax(avg_energies)
+        ax1.plot(V0_values[max_energy_idx], avg_energies[max_energy_idx], '*',
+                 color=colors['warning'], markersize=20,
+                 markeredgecolor='black', markeredgewidth=1.5,
+                 label=f'Óptimo: {V0_values[max_energy_idx]:.0f} Hm³',
+                 zorder=5)
+
+        # Configuración de ejes
+        ax1.set_xlabel('Volumen Inicial (V0) [Hm³]', fontweight='bold', color='black')
+        ax1.set_ylabel('Energía Promedio Anual [MWh/año]', fontweight='bold', color='black')
+        ax1.set_title('Sensibilidad: Volumen Inicial vs Generación Energética',
+                      fontweight='bold', pad=25, color='black')
+        ax1.grid(True, alpha=0.3, linestyle='--')
+        ax1.legend(loc='best', framealpha=0.95)
+
+        # Formato de números en eje Y
+        ax1.yaxis.set_major_formatter(
+            plt.FuncFormatter(lambda x, p: f'{x:,.0f}')
+        )
+
+        plt.tight_layout()
+        plot1_file = output_path / "sensibilidad_energia.png"
+        plt.savefig(plot1_file, dpi=300, bbox_inches='tight')
         plt.close()
-        files_created.append(str(plot_file3))
+        files_created.append(str(plot1_file))
+
+        # ================================================================
+        # GRÁFICO 2: V0 VS DEPENDENCIA DEL EMBALSE
+        # ================================================================
+        fig2, ax2 = plt.subplots(figsize=(12, 7))
+
+        # Calcular dependencia normalizada
+        dependencia_pct = (avg_toro / self.n_years)  # Uso promedio anual
+
+        # Gráfico de barras con nuevo color (morado/púrpura)
+        ax2.bar(V0_values, dependencia_pct,
+                width=(V0_values.max() - V0_values.min()) / (len(V0_values) * 1.5),
+                color=colors['azul'], alpha=0.7, edgecolor='black',
+                linewidth=1.5)
+
+        # Línea de tendencia
+        ax2_line = ax2.twinx()
+        ax2_line.plot(V0_values, dependencia_pct, 'o-',
+                      color=colors['danger'], linewidth=2.5, markersize=8,
+                      label='Tendencia')
+
+        ax2.set_xlabel('Volumen Inicial (V0) [Hm³]', fontweight='bold', color='black')
+        ax2.set_ylabel('Uso Promedio Anual del Embalse [Hm³/año]',
+                       fontweight='bold', color='black')
+        ax2_line.set_ylabel('', fontsize=0)  # Ocultar label derecho
+        ax2.set_title('Sensibilidad: Volumen Inicial vs Dependencia del Embalse',
+                      fontweight='bold', pad=15, color='black')
+        ax2.grid(True, alpha=0.3, linestyle='--', linewidth=0.8, axis='y')
+        ax2.tick_params(axis='y', labelcolor='black')
+
+        # Leyenda combinada
+        lines2, labels2 = ax2_line.get_legend_handles_labels()
+        if lines2:
+            ax2_line.legend(lines2, labels2, loc='best',
+                            fontsize=11, framealpha=0.9)
+
+        plt.tight_layout()
+        plot2_file = output_path / "sensibilidad_dependencia.png"
+        plt.savefig(plot2_file, dpi=300, bbox_inches='tight')
+        plt.close()
+        files_created.append(str(plot2_file))
+
+        # ================================================================
+        # GRÁFICO 3: V0 VS USO DE PRESUPUESTOS (SIN LÍNEA 100%)
+        # ================================================================
+        fig3, ax3 = plt.subplots(figsize=(12, 7))
+
+        x = np.arange(len(V0_values))
+        width = 0.35
+
+        # Barras agrupadas
+        ax3.bar(x - width/2, uso_presupuesto_riego, width,
+                label='Presupuesto Riego', color=colors['success'],
+                alpha=0.8, edgecolor='black', linewidth=1.2)
+        ax3.bar(x + width/2, uso_presupuesto_gen, width,
+                label='Presupuesto Generación', color=colors['primary'],
+                alpha=0.8, edgecolor='black', linewidth=1.2)
+
+        ax3.set_xlabel('Volumen Inicial (V0) [Hm³]', fontweight='bold',
+                       color='black')
+        ax3.set_ylabel('Uso de Presupuesto [%]', fontweight='bold',
+                       color='black')
+        ax3.set_title('Sensibilidad: Volumen Inicial vs Uso de Presupuestos',
+                      fontweight='bold', pad=15, color='black')
+        ax3.set_xticks(x)
+        ax3.set_xticklabels([f'{v:.0f}' for v in V0_values],
+                            rotation=45, ha='right')
+        ax3.legend(loc='upper left', fontsize=11, framealpha=0.9)
+        ax3.grid(True, alpha=0.3, linestyle='--', linewidth=0.8, axis='y')
+        ax3.set_ylim(0, max(uso_presupuesto_riego.max(),
+                            uso_presupuesto_gen.max()) * 1.1)
+
+        plt.tight_layout()
+        plot3_file = output_path / "sensibilidad_presupuestos.png"
+        plt.savefig(plot3_file, dpi=300, bbox_inches='tight')
+        plt.close()
+        files_created.append(str(plot3_file))
+
+        # ================================================================
+        # GRÁFICO 4: SENSIBILIDAD DE LOS 4 KPIs ESTRATÉGICOS
+        # ================================================================
+        fig4, ax4 = plt.subplots(figsize=(12, 7))
+
+        # Normalizar KPIs (0-100, mayor es mejor)
+        def normalize_kpi(values, invert=False):
+            if len(values) == 0 or np.std(values) == 0:
+                return np.ones_like(values) * 50
+            vmin = values.min()
+            vmax = values.max()
+            norm = (values - vmin) / (vmax - vmin) * 100
+            return 100 - norm if invert else norm
+
+        # Normalizar los 4 KPIs estratégicos
+        # KPI 1: Estabilidad (menos tiempo en inferior = mejor)
+        kpi1_norm = normalize_kpi(tiempo_inferior, invert=True)
+        
+        # KPI 2: Eficiencia presupuesto riego (cerca de 100% = mejor)
+        kpi2_norm = normalize_kpi(
+            np.abs(100 - uso_presupuesto_riego), invert=True
+        )
+        
+        # KPI 3: Seguridad hídrica (menos déficit = mejor)
+        kpi3_norm = normalize_kpi(deficits_1r, invert=True)
+        
+        # KPI 4: Factor de utilización (mayor = mejor)
+        kpi4_norm = normalize_kpi(factor_utilizacion)
+
+        # Graficar los 4 KPIs
+        ax4.plot(V0_values, kpi1_norm, '-',
+                 color=colors['warning'], linewidth=2.5,
+                 label='KPI 1: Estabilidad Operativa')
+        ax4.plot(V0_values, kpi2_norm, '-',
+                 color=colors['success'], linewidth=2.5,
+                 label='KPI 2: Eficiencia Presupuesto Riego')
+        ax4.plot(V0_values, kpi3_norm, '-',
+                 color=colors['danger'], linewidth=2.5,
+                 label='KPI 3: Seguridad Hídrica')
+        ax4.plot(V0_values, kpi4_norm, '-',
+                 color=colors['primary'], linewidth=2.5,
+                 label='KPI 4: Factor de Utilización')
+
+        ax4.set_xlabel('Volumen Inicial (V0) [Hm³]', fontweight='bold',
+                       color='black')
+        ax4.set_ylabel('Desempeño Normalizado [0-100]', fontweight='bold',
+                       color='black')
+        ax4.set_title('Sensibilidad de los 4 KPIs Estratégicos',
+                      fontweight='bold', pad=15, color='black')
+        ax4.set_ylim(0, 105)
+        ax4.grid(True, alpha=0.3, linestyle='--')
+        ax4.legend(loc='best', fontsize=10, framealpha=0.95)
+
+        plt.tight_layout()
+        plot4_file = output_path / "sensibilidad_kpis_estrategicos.png"
+        plt.savefig(plot4_file, dpi=300, bbox_inches='tight')
+        plt.close()
+        files_created.append(str(plot4_file))
+
+        # ================================================================
+        # GRÁFICO 5: PANEL DETALLADO DE LOS 4 KPIs ESTRATÉGICOS
+        # ================================================================
+        fig5 = plt.figure(figsize=(16, 12))
+        gs = fig5.add_gridspec(3, 3, hspace=0.35, wspace=0.3)
+
+        # Ya tenemos normalize_kpi definido arriba
+
+        # =================================================================
+        # FILA 1: KPI 1 - TIEMPO EN COLCHONES OPERATIVOS (3 subplots)
+        # =================================================================
+        
+        # Subplot 1.1: Distribución por colchones (stacked area)
+        ax51 = fig5.add_subplot(gs[0, :])
+        ax51.fill_between(V0_values, 0, tiempo_inferior,
+                          alpha=0.7, color='#d62728', label='Inferior')
+        ax51.fill_between(V0_values, tiempo_inferior,
+                          tiempo_inferior + tiempo_transicion,
+                          alpha=0.7, color='#ff7f0e', label='Transición')
+        ax51.fill_between(V0_values,
+                          tiempo_inferior + tiempo_transicion,
+                          tiempo_inferior + tiempo_transicion + tiempo_intermedio,
+                          alpha=0.7, color='#2ca02c', label='Intermedio')
+        ax51.fill_between(V0_values,
+                          tiempo_inferior + tiempo_transicion + tiempo_intermedio,
+                          100, alpha=0.7, color='#1f77b4',
+                          label='Superior')
+        ax51.set_title('KPI 1: Distribución de Tiempo en Colchones Operativos',
+                       fontweight='bold', color='black', fontsize=12)
+        ax51.set_ylabel('Tiempo [%]', fontsize=10, color='black')
+        ax51.set_xlabel('V0 [Hm³]', fontsize=10, color='black')
+        ax51.set_ylim(0, 100)
+        ax51.legend(loc='upper right', fontsize=9, ncol=4)
+        ax51.grid(True, alpha=0.3, axis='y')
+        
+        # =================================================================
+        # FILA 2: KPI 2 Y KPI 3
+        # =================================================================
+        
+        # Subplot 2.1: KPI 2 - Uso de Presupuestos
+        ax52 = fig5.add_subplot(gs[1, 0])
+        x_pos = np.arange(len(V0_values))
+        width = 0.35
+        ax52.bar(x_pos - width/2, uso_presupuesto_riego, width,
+                 label='Riego', color=colors['success'], alpha=0.8)
+        ax52.bar(x_pos + width/2, uso_presupuesto_gen, width,
+                 label='Generación', color=colors['primary'], alpha=0.8)
+        ax52.axhline(y=100, color='red', linestyle='--', linewidth=1,
+                     alpha=0.5, label='Presupuesto 100%')
+        ax52.set_title('KPI 2: Uso de Presupuestos', fontweight='bold',
+                       color='black', fontsize=11)
+        ax52.set_ylabel('Uso [%]', fontsize=9, color='black')
+        ax52.set_xlabel('V0 [Hm³]', fontsize=9, color='black')
+        ax52.set_xticks(x_pos[::2])
+        ax52.set_xticklabels([f'{v:.0f}' for v in V0_values[::2]],
+                              rotation=45, ha='right', fontsize=8)
+        ax52.legend(fontsize=8)
+        ax52.grid(True, alpha=0.3, axis='y')
+        
+        # Subplot 2.2: KPI 3 - Déficits de Riego (valores absolutos)
+        ax53 = fig5.add_subplot(gs[1, 1])
+        ax53.plot(V0_values, deficits_1r, 'o-',
+                  color=colors['danger'], linewidth=2, markersize=6,
+                  label='Déficit 1R')
+        ax53.fill_between(V0_values, 0, deficits_1r,
+                          alpha=0.3, color=colors['danger'])
+        ax53.set_title('KPI 3: Déficit Primeros Regantes',
+                       fontweight='bold', color='black', fontsize=11)
+        ax53.set_ylabel('Déficit Promedio [Hm³/mes]', fontsize=9,
+                        color='black')
+        ax53.set_xlabel('V0 [Hm³]', fontsize=9, color='black')
+        ax53.grid(True, alpha=0.3)
+        ax53.legend(fontsize=8)
+        
+        # Subplot 2.3: KPI 3 - Déficit como % de demanda
+        ax54 = fig5.add_subplot(gs[1, 2])
+        ax54.plot(V0_values, deficit_pct_1r, 's-',
+                  color=colors['danger'], linewidth=2, markersize=6)
+        ax54.fill_between(V0_values, 0, deficit_pct_1r,
+                          alpha=0.3, color=colors['danger'])
+        ax54.set_title('KPI 3: Déficit como % Demanda',
+                       fontweight='bold', color='black', fontsize=11)
+        ax54.set_ylabel('Déficit [% demanda]', fontsize=9, color='black')
+        ax54.set_xlabel('V0 [Hm³]', fontsize=9, color='black')
+        ax54.grid(True, alpha=0.3)
+        
+        # =================================================================
+        # FILA 3: KPI 4 Y MÉTRICAS COMPLEMENTARIAS
+        # =================================================================
+        
+        # Subplot 3.1: KPI 4 - Factor de Utilización
+        ax55 = fig5.add_subplot(gs[2, 0])
+        ax55.plot(V0_values, factor_utilizacion, 'o-',
+                  color=colors['primary'], linewidth=2, markersize=6)
+        ax55.fill_between(V0_values, 0, factor_utilizacion,
+                          alpha=0.3, color=colors['primary'])
+        ax55.set_title('KPI 4: Factor de Utilización Sistema',
+                       fontweight='bold', color='black', fontsize=11)
+        ax55.set_ylabel('Factor Utilización [%]', fontsize=9, color='black')
+        ax55.set_xlabel('V0 [Hm³]', fontsize=9, color='black')
+        ax55.grid(True, alpha=0.3)
+        
+        # Subplot 3.2: Nivel del Lago (métrica complementaria)
+        ax56 = fig5.add_subplot(gs[2, 1])
+        ax56.plot(V0_values, cotas_prom, 'o-',
+                  color=colors['azul'], linewidth=2, markersize=6)
+        ax56.fill_between(V0_values, cotas_prom.min(), cotas_prom,
+                          alpha=0.3, color=colors['azul'])
+        ax56.set_title('Nivel Promedio del Lago',
+                       fontweight='bold', color='black', fontsize=11)
+        ax56.set_ylabel('Cota [msnm]', fontsize=9, color='black')
+        ax56.set_xlabel('V0 [Hm³]', fontsize=9, color='black')
+        ax56.grid(True, alpha=0.3)
+        
+        # Subplot 3.3: Confiabilidad del Sistema
+        ax57 = fig5.add_subplot(gs[2, 2])
+        ax57.plot(V0_values, success_rates, 'o-',
+                  color=colors['success'], linewidth=2, markersize=6)
+        ax57.fill_between(V0_values, 0, success_rates,
+                          alpha=0.3, color=colors['success'])
+        ax57.axhline(y=100, color='green', linestyle='--',
+                     linewidth=1, alpha=0.5)
+        ax57.set_title('Confiabilidad del Sistema',
+                       fontweight='bold', color='black', fontsize=11)
+        ax57.set_ylabel('Tasa de Éxito [%]', fontsize=9, color='black')
+        ax57.set_xlabel('V0 [Hm³]', fontsize=9, color='black')
+        ax57.set_ylim(0, 105)
+        ax57.grid(True, alpha=0.3)
+        
+        # Título general
+        fig5.suptitle(
+            'Panel de los 4 KPIs Estratégicos: '
+            'Análisis de Sensibilidad al Volumen Inicial',
+            fontsize=15, fontweight='bold', y=0.995, color='black'
+        )
+
+        plt.savefig(output_path / "panel_kpis_multivariado.png",
+                    dpi=300, bbox_inches='tight')
+        plt.close()
+        files_created.append(str(output_path / "panel_kpis_multivariado.png"))
 
         return files_created
 
     def print_summary(self):
-        """Imprime resumen de análisis de sensibilidad con insights de KPIs."""
+        """
+        Imprime resumen conciso del análisis de sensibilidad hidrológica.
+
+        Muestra:
+        - Rango analizado y configuración
+        - Métricas clave: energía, cotas, confiabilidad
+        - Evaluación rápida de sensibilidad
+        - V0 óptimo recomendado
+        """
 
         if not self.results:
             print("⚠️ No hay resultados para mostrar")
             return
 
-        print("\n" + "=" * 80)
-        print("📊 RESUMEN DE ANÁLISIS DE SENSIBILIDAD V0")
-        print("=" * 80)
+        # Extraer datos
+        V0_values = [r.V0 for r in self.results]
+        energies = [r.avg_annual_energy for r in self.results]
+        success_rates = [r.success_rate for r in self.results]
 
-        # Crear tabla de resultados
-        print(f"\n{'V0':>6} {'Éxito':>7} {'Energía':>10} {'T.Inf%':>7} "
-              f"{'Def1R':>8} {'Def2R':>8} {'F.Util':>7} {'Efic':>8}")
-        print(f"{'[Hm³]':>6} {'[%]':>7} {'[MWh/a]':>10} {'':>7} "
-              f"{'[Hm³]':>8} {'[Hm³]':>8} {'[%]':>7} {'[MWh/Hm³]':>8}")
-        print("-" * 80)
-
+        # Extraer cotas promedio de KPIs
+        cotas_prom = []
         for r in self.results:
-            print(f"{r.V0:>6.0f} {r.success_rate:>7.1f} "
-                  f"{r.avg_annual_energy:>10.0f} {r.tiempo_colchon_inferior:>7.1f} "
-                  f"{r.deficit_prom_1r:>8.2f} {r.deficit_prom_2r:>8.2f} "
-                  f"{r.factor_utilizacion:>7.1f} {r.eficiencia_energetica:>8.2f}")
+            if r.kpis_agregados:
+                cotas_prom.append(r.kpis_agregados.get("cota_prom_msnm", 0))
+            else:
+                cotas_prom.append(0)
 
-        # =====================================================================
-        # PUNTOS ÓPTIMOS POR OBJETIVO
-        # =====================================================================
-        print("\n" + "=" * 80)
-        print("🎯 PUNTOS ÓPTIMOS IDENTIFICADOS POR OBJETIVO")
-        print("=" * 80)
+        print("\n" + "═" * 80)
+        print(
+            "📊 RESUMEN: ANÁLISIS DE SENSIBILIDAD "
+            "HIDROLÓGICA - VOLUMEN INICIAL"
+        )
+        print("═" * 80)
 
-        # 1. Máxima energía
-        max_energy_result = max(self.results, key=lambda r: r.avg_annual_energy)
-        print("\n⚡ MÁXIMA GENERACIÓN ENERGÉTICA:")
-        print(f"   V0 óptimo: {max_energy_result.V0:.0f} Hm³")
-        print(f"   Energía: {max_energy_result.avg_annual_energy:,.0f} MWh/año")
-        print(f"   Eficiencia: {max_energy_result.eficiencia_energetica:.2f} MWh/Hm³")
-        print(f"   Tasa éxito: {max_energy_result.success_rate:.1f}%")
-        print(f"   Déficit 1R: {max_energy_result.deficit_prom_1r:.2f} Hm³/mes")
+        # Contexto resumido
+        v0_min = min(V0_values)
+        v0_max = max(V0_values)
+        print("\n📌 Configuración:")
+        print(
+            f"   • Rango V0: {v0_min:.0f} - {v0_max:.0f} Hm³ "
+            f"({len(self.results)} puntos)"
+        )
+        print(
+            f"   • Período: {self.start_year}-"
+            f"{self.start_year + self.n_years - 1} "
+            f"({self.n_years} años)"
+        )
+        print(f"   • Escenarios/punto: {self.n_scenarios}")
 
-        # 2. Máxima tasa de éxito
-        max_success_result = max(self.results, key=lambda r: r.success_rate)
-        print("\n✅ MÁXIMA TASA DE ÉXITO:")
-        print(f"   V0 óptimo: {max_success_result.V0:.0f} Hm³")
-        print(f"   Tasa éxito: {max_success_result.success_rate:.1f}%")
-        print(f"   Energía: {max_success_result.avg_annual_energy:,.0f} MWh/año")
-        print(f"   Tiempo colchón superior: {max_success_result.tiempo_colchon_superior:.1f}%")
+        # Métricas clave
+        print("\n📈 Métricas Clave:")
+        print(
+            f"   • Energía: {min(energies):,.0f} - "
+            f"{max(energies):,.0f} MWh/año"
+        )
 
-        # 3. Mínimo déficit para primeros regantes
-        min_deficit_result = min(self.results, key=lambda r: r.deficit_prom_1r)
-        print("\n💧 MÍNIMO DÉFICIT PRIMEROS REGANTES (1R):")
-        print(f"   V0 óptimo: {min_deficit_result.V0:.0f} Hm³")
-        print(f"   Déficit promedio 1R: {min_deficit_result.deficit_prom_1r:.2f} Hm³/mes")
-        print(f"   Déficit máximo 1R: {min_deficit_result.deficit_max_1r:.2f} Hm³")
-        print(f"   Energía: {min_deficit_result.avg_annual_energy:,.0f} MWh/año")
+        if any(cotas_prom):
+            min_cota = min([c for c in cotas_prom if c > 0])
+            max_cota = max(cotas_prom)
+            print(f"   • Cota: {min_cota:.1f} - {max_cota:.1f} msnm")
+        print(
+            f"   • Confiabilidad: {min(success_rates):.1f}% - "
+            f"{max(success_rates):.1f}%"
+        )
 
-        # 4. Máxima eficiencia energética
-        max_efficiency_result = max(self.results, key=lambda r: r.eficiencia_energetica)
-        print("\n🔋 MÁXIMA EFICIENCIA ENERGÉTICA:")
-        print(f"   V0 óptimo: {max_efficiency_result.V0:.0f} Hm³")
-        print(f"   Eficiencia: {max_efficiency_result.eficiencia_energetica:.2f} MWh/Hm³")
-        print(f"   Energía: {max_efficiency_result.avg_annual_energy:,.0f} MWh/año")
-        print(f"   Factor utilización: {max_efficiency_result.factor_utilizacion:.1f}%")
+        # Métricas adicionales del modelo
+        volumenes_finales = [r.avg_final_volume for r in self.results]
+        uso_toro = [r.avg_toro_usage for r in self.results]
 
-        # 5. Mínimo riesgo operativo (menor tiempo en colchón inferior)
-        min_risk_result = min(self.results, key=lambda r: r.tiempo_colchon_inferior)
-        print("\n🛡️ MÍNIMO RIESGO OPERATIVO:")
-        print(f"   V0 óptimo: {min_risk_result.V0:.0f} Hm³")
-        print(f"   Tiempo colchón inferior: {min_risk_result.tiempo_colchon_inferior:.1f}%")
-        print(f"   Tiempo colchón superior: {min_risk_result.tiempo_colchon_superior:.1f}%")
-        print(f"   Cota promedio: {min_risk_result.cota_promedio:.1f} msnm")
+        print("\n📊 Métricas del Sistema:")
+        print(
+            f"   • Volumen final: {min(volumenes_finales):.0f} - "
+            f"{max(volumenes_finales):.0f} Hm³"
+        )
+        print(
+            f"   • Uso El Toro: {min(uso_toro):.0f} - "
+            f"{max(uso_toro):.0f} Hm³ (acumulado)"
+        )
 
-        # =====================================================================
-        # CASOS BORDE Y ANÁLISIS CRÍTICO
-        # =====================================================================
-        print("\n" + "=" * 80)
-        print("⚠️ CASOS BORDE Y ESCENARIOS CRÍTICOS")
-        print("=" * 80)
-
-        # Caso borde 1: V0 mínimo evaluado
-        min_v0_result = min(self.results, key=lambda r: r.V0)
-        print("\n📉 CASO BORDE: V0 MÍNIMO")
-        print(f"   V0: {min_v0_result.V0:.0f} Hm³")
-        print(f"   Tasa éxito: {min_v0_result.success_rate:.1f}%")
-        print(f"   Energía: {min_v0_result.avg_annual_energy:,.0f} MWh/año")
-        print(f"   Tiempo colchón inferior: {min_v0_result.tiempo_colchon_inferior:.1f}%")
-        print(f"   Déficit máx 1R: {min_v0_result.deficit_max_1r:.2f} Hm³")
-        print(f"   Déficit máx 2R: {min_v0_result.deficit_max_2r:.2f} Hm³")
-        if min_v0_result.tiempo_colchon_inferior > 50:
-            print(f"   ⚠️ ALERTA: Alto riesgo operativo ({min_v0_result.tiempo_colchon_inferior:.1f}% en colchón inferior)")
-
-        # Caso borde 2: V0 máximo evaluado
-        max_v0_result = max(self.results, key=lambda r: r.V0)
-        print("\n📈 CASO BORDE: V0 MÁXIMO")
-        print(f"   V0: {max_v0_result.V0:.0f} Hm³")
-        print(f"   Tasa éxito: {max_v0_result.success_rate:.1f}%")
-        print(f"   Energía: {max_v0_result.avg_annual_energy:,.0f} MWh/año")
-        print(f"   Tiempo colchón superior: {max_v0_result.tiempo_colchon_superior:.1f}%")
-        print(f"   Uso presupuesto riego: {max_v0_result.uso_presupuesto_riego:.1f}%")
-        print(f"   Uso presupuesto generación: {max_v0_result.uso_presupuesto_generacion:.1f}%")
-
-        # Caso crítico: Mayor déficit para regantes
-        max_deficit_result = max(self.results, key=lambda r: r.deficit_max_1r)
-        print("\n🚨 CASO CRÍTICO: MAYOR DÉFICIT HÍDRICO")
-        print(f"   V0: {max_deficit_result.V0:.0f} Hm³")
-        print(f"   Déficit máx 1R: {max_deficit_result.deficit_max_1r:.2f} Hm³")
-        print(f"   Déficit máx 2R: {max_deficit_result.deficit_max_2r:.2f} Hm³")
-        print(f"   Déficit prom 1R: {max_deficit_result.deficit_prom_1r:.2f} Hm³/mes")
-        print(f"   Déficit prom 2R: {max_deficit_result.deficit_prom_2r:.2f} Hm³/mes")
-        print(f"   Energía: {max_deficit_result.avg_annual_energy:,.0f} MWh/año")
-
-        # Caso crítico: Mayor tiempo en colchón inferior
-        max_risk_result = max(self.results, key=lambda r: r.tiempo_colchon_inferior)
-        print("\n⚠️ CASO CRÍTICO: MAYOR RIESGO OPERATIVO")
-        print(f"   V0: {max_risk_result.V0:.0f} Hm³")
-        print(f"   Tiempo colchón inferior: {max_risk_result.tiempo_colchon_inferior:.1f}%")
-        print(f"   Tasa éxito: {max_risk_result.success_rate:.1f}%")
-        print(f"   Cota promedio: {max_risk_result.cota_promedio:.1f} msnm")
-
-        # =====================================================================
-        # TRADE-OFFS Y RECOMENDACIONES
-        # =====================================================================
-        print("\n" + "=" * 80)
-        print("⚖️ TRADE-OFFS IDENTIFICADOS")
-        print("=" * 80)
-
-        # Analizar correlaciones
-        v0_vals = [r.V0 for r in self.results]
-        energy_vals = [r.avg_annual_energy for r in self.results]
-        deficit_vals = [r.deficit_prom_1r for r in self.results]
-        risk_vals = [r.tiempo_colchon_inferior for r in self.results]
+        # Evaluación de sensibilidad
+        print("\n🔍 Evaluación de Sensibilidad:")
 
         # Correlación V0 vs Energía
-        corr_energy = np.corrcoef(v0_vals, energy_vals)[0, 1]
-        print(f"\n📊 V0 vs Energía: correlación = {corr_energy:.3f}")
-        if corr_energy > 0.5:
-            print("   → Mayor V0 tiende a generar MÁS energía")
-        elif corr_energy < -0.5:
-            print("   → Mayor V0 tiende a generar MENOS energía")
+        corr_energia = safe_correlation(V0_values, energies)
+        if corr_energia is None:
+            print("   • Energía: Sin variación (todos los valores iguales)")
         else:
-            print("   → Relación débil o no lineal")
+            if abs(corr_energia) > 0.7:
+                sens_energia = "ALTA"
+            elif abs(corr_energia) > 0.4:
+                sens_energia = "MODERADA"
+            else:
+                sens_energia = "BAJA"
+            print(
+                f"   • Energía: Sensibilidad {sens_energia} "
+                f"(corr: {corr_energia:+.2f})"
+            )
 
-        # Correlación V0 vs Déficit
-        corr_deficit = np.corrcoef(v0_vals, deficit_vals)[0, 1]
-        print(f"\n💧 V0 vs Déficit 1R: correlación = {corr_deficit:.3f}")
-        if corr_deficit > 0.5:
-            print("   → Mayor V0 tiende a AUMENTAR déficits (contraintuitivo)")
-        elif corr_deficit < -0.5:
-            print("   → Mayor V0 tiende a REDUCIR déficits (esperado)")
+        # Correlación V0 vs Cotas
+        if any(cotas_prom):
+            cotas_validas = [c for c in cotas_prom if c > 0]
+            if len(cotas_validas) == len(V0_values):
+                corr_cota = safe_correlation(V0_values, cotas_validas)
+                if corr_cota is None:
+                    print(
+                        "   • Cota: Sin variación "
+                        "(todos los valores iguales)"
+                    )
+                else:
+                    if abs(corr_cota) > 0.7:
+                        sens_cota = "ALTA"
+                    elif abs(corr_cota) > 0.4:
+                        sens_cota = "MODERADA"
+                    else:
+                        sens_cota = "BAJA"
+                    print(
+                        f"   • Cota: Sensibilidad {sens_cota} "
+                        f"(corr: {corr_cota:+.2f})"
+                    )
+
+        # Correlación V0 vs Confiabilidad
+        corr_conf = safe_correlation(V0_values, success_rates)
+        if corr_conf is None:
+            print(
+                "   • Confiabilidad: Sin variación (100% éxito en todos "
+                "los casos)"
+            )
         else:
-            print("   → Relación débil o no lineal")
+            if abs(corr_conf) > 0.7:
+                sens_conf = "ALTA"
+            elif abs(corr_conf) > 0.4:
+                sens_conf = "MODERADA"
+            else:
+                sens_conf = "BAJA"
+            print(
+                f"   • Confiabilidad: Sensibilidad {sens_conf} "
+                f"(corr: {corr_conf:+.2f})"
+            )
 
-        # Correlación V0 vs Riesgo
-        corr_risk = np.corrcoef(v0_vals, risk_vals)[0, 1]
-        print(f"\n⚠️ V0 vs Riesgo Operativo: correlación = {corr_risk:.3f}")
-        if corr_risk > 0.5:
-            print("   → Mayor V0 tiende a AUMENTAR riesgo (contraintuitivo)")
-        elif corr_risk < -0.5:
-            print("   → Mayor V0 tiende a REDUCIR riesgo (esperado)")
+        # Interpretación general
+        print("\n💡 Interpretación General:")
+        sensibilidades = []
+        if corr_energia is not None and abs(corr_energia) > 0.4:
+            sensibilidades.append("energía")
+        cotas_validas_count = len([c for c in cotas_prom if c > 0])
+        if any(cotas_prom) and cotas_validas_count == len(V0_values):
+            if corr_cota is not None and abs(corr_cota) > 0.4:
+                sensibilidades.append("nivel del lago")
+        if corr_conf is not None and abs(corr_conf) > 0.4:
+            sensibilidades.append("confiabilidad")
+
+        if sensibilidades:
+            sens_str = ', '.join(sensibilidades)
+            print(
+                f"   • El sistema muestra sensibilidad significativa "
+                f"al V0 en: {sens_str}"
+            )
         else:
-            print("   → Relación débil o no lineal")
+            print(
+                "   • El sistema es relativamente estable "
+                "frente a cambios en V0"
+            )
 
-        # =====================================================================
-        # RECOMENDACIONES
-        # =====================================================================
+        if corr_energia is not None:
+            if corr_energia > 0.4:
+                print(
+                    "   • Mayor V0 tiende a aumentar "
+                    "la generación energética"
+                )
+            elif corr_energia < -0.4:
+                print(
+                    "   • Mayor V0 tiende a reducir "
+                    "la generación energética"
+                )
+
+        # V0 óptimo
+        print("\n🎯 V0 Óptimo Recomendado:")
+
+        # Determinar V0 óptimo por energía
+        max_energy_idx = np.argmax(energies)
+        v0_max_energia = V0_values[max_energy_idx]
+
+        print(f"   • V0 = {v0_max_energia:.0f} Hm³")
+        print(
+            f"     - Energía esperada: "
+            f"{energies[max_energy_idx]:,.0f} MWh/año"
+        )
+        if any(cotas_prom) and cotas_prom[max_energy_idx] > 0:
+            print(
+                f"     - Cota promedio: "
+                f"{cotas_prom[max_energy_idx]:.1f} msnm"
+            )
+        print(
+            f"     - Confiabilidad: "
+            f"{success_rates[max_energy_idx]:.1f}%"
+        )
+
+        print("\n" + "═" * 80)
+
+        # Resumen ejecutivo final
         print("\n" + "=" * 80)
-        print("💡 RECOMENDACIONES BASADAS EN ANÁLISIS")
+        print("" + " " * 25 + "📋 RESUMEN EJECUTIVO FINAL")
         print("=" * 80)
 
-        # Encontrar V0 balanceado (buena energía + bajo déficit + bajo riesgo)
-        # Normalizar métricas (0-1) para comparación
-        def normalize(vals):
-            min_val, max_val = min(vals), max(vals)
-            if max_val == min_val:
-                return [0.5] * len(vals)
-            return [(v - min_val) / (max_val - min_val) for v in vals]
+        # Hallazgo principal
+        print("\n🎯 HALLAZGO PRINCIPAL:")
+        max_idx = np.argmax(energies)
+        min_idx = np.argmin(energies)
+        delta_energia = energies[max_idx] - energies[min_idx]
+        pct_mejora = (delta_energia / energies[min_idx]) * 100
 
-        # Invertir déficit y riesgo (menor es mejor)
-        norm_energy = normalize(energy_vals)
-        norm_deficit = [1 - v for v in normalize(deficit_vals)]
-        norm_risk = [1 - v for v in normalize(risk_vals)]
+        print(
+            f"   Un aumento de V0 desde {V0_values[min_idx]:.0f} Hm³ "
+            f"hasta {V0_values[max_idx]:.0f} Hm³"
+        )
+        print(
+            f"   incrementa la energía anual en {delta_energia:,.0f} "
+            f"MWh/año ({pct_mejora:.1f}%)"
+        )
 
-        # Score balanceado (ponderado: 40% energía, 30% déficit, 30% riesgo)
-        balanced_scores = [
-            0.40 * e + 0.30 * d + 0.30 * r
-            for e, d, r in zip(norm_energy, norm_deficit, norm_risk)
-        ]
+        # Recomendación operativa
+        print("\n🎯 RECOMENDACIÓN OPERATIVA:")
+        print(
+            f"   V0 óptimo para máxima energía: "
+            f"{V0_values[max_idx]:.0f} Hm³"
+        )
 
-        best_balanced_idx = np.argmax(balanced_scores)
-        best_balanced = self.results[best_balanced_idx]
+        # Rango óptimo
+        if len(energies) >= 5:
+            # Encontrar valores cercanos al máximo (>95% del máximo)
+            threshold = energies[max_idx] * 0.95
+            optimos_idx = [i for i, e in enumerate(energies) if e >= threshold]
+            if len(optimos_idx) > 1:
+                v0_min_opt = V0_values[min(optimos_idx)]
+                v0_max_opt = V0_values[max(optimos_idx)]
+                print(
+                    f"   Rango óptimo (>95% energía máxima): "
+                    f"{v0_min_opt:.0f} - {v0_max_opt:.0f} Hm³"
+                )
 
-        print("\n🎯 V0 BALANCEADO RECOMENDADO (40% energía, 30% déficit, 30% riesgo):")
-        print(f"   V0: {best_balanced.V0:.0f} Hm³")
-        print(f"   Score balanceado: {balanced_scores[best_balanced_idx]:.3f}")
-        print(f"   Energía: {best_balanced.avg_annual_energy:,.0f} MWh/año")
-        print(f"   Déficit prom 1R: {best_balanced.deficit_prom_1r:.2f} Hm³/mes")
-        print(f"   Tiempo colchón inferior: {best_balanced.tiempo_colchon_inferior:.1f}%")
-        print(f"   Tasa éxito: {best_balanced.success_rate:.1f}%")
+        # Confiabilidad del sistema
+        avg_success = np.mean(success_rates)
+        if avg_success == 100.0:
+            print(
+                "\n✅ CONFIABILIDAD: Sistema robusto - 100% éxito "
+                "en todo el rango analizado"
+            )
+        elif avg_success >= 80:
+            print(
+                f"\n✅ CONFIABILIDAD: Sistema confiable - "
+                f"{avg_success:.1f}% éxito promedio"
+            )
+        else:
+            print(
+                f"\n⚠️  CONFIABILIDAD: Sistema variable - "
+                f"{avg_success:.1f}% éxito promedio"
+            )
 
-        # Rango operativo recomendado
-        percentile_25 = np.percentile(v0_vals, 25)
-        percentile_75 = np.percentile(v0_vals, 75)
-        print(f"\n📏 RANGO OPERATIVO RECOMENDADO:")
-        print(f"   V0 mínimo conservador: {percentile_25:.0f} Hm³ (percentil 25)")
-        print(f"   V0 máximo conservador: {percentile_75:.0f} Hm³ (percentil 75)")
-        print(f"   V0 balanceado óptimo: {best_balanced.V0:.0f} Hm³")
+        # Balance hídrico
+        delta_vol = np.mean(volumenes_finales) - np.mean(V0_values)
+        if abs(delta_vol) < 100:
+            balance = "EQUILIBRADO"
+        elif delta_vol > 0:
+            balance = "POSITIVO (acumula agua)"
+        else:
+            balance = "NEGATIVO (pierde agua)"
+        print(f"   Balance hídrico promedio: {balance}")
 
         print("\n" + "=" * 80)
 
-    def print_interpretive_report(self):
-        """
-        Imprime reporte interpretativo con conclusiones claras y accionables.
-        Diseñado para verificación rápida de coherencia y resultados principales.
-        """
-        if not self.results:
-            print("⚠️ No hay resultados para el reporte")
-            return
 
-        print("\n" + "=" * 80)
-        print("📋 REPORTE INTERPRETATIVO - ANÁLISIS DE SENSIBILIDAD V0")
-        print("=" * 80)
+# =============================================================================
+# HELPERS INTERNOS
+# =============================================================================
 
-        # Extraer datos clave
-        v0_values = [r.V0 for r in self.results]
-        v0_min, v0_max = min(v0_values), max(v0_values)
-        
-        # Resultados con mejor desempeño
-        max_energy = max(self.results, key=lambda r: r.avg_annual_energy)
-        max_success = max(self.results, key=lambda r: r.success_rate)
-        min_deficit = min(self.results, key=lambda r: r.deficit_prom_1r)
-        min_risk = min(self.results, key=lambda r: r.tiempo_colchon_inferior)
-        
-        # Calcular rangos y variabilidad
-        energies = [r.avg_annual_energy for r in self.results]
-        deficits = [r.deficit_prom_1r for r in self.results]
-        risks = [r.tiempo_colchon_inferior for r in self.results]
-        
-        energy_range = max(energies) - min(energies)
-        energy_cv = (np.std(energies) / np.mean(energies) * 100) if energies else 0
-        
-        print("\n┌─────────────────────────────────────────────────────────────────────────┐")
-        print("│ 🔍 CONTEXTO DEL ANÁLISIS                                                │")
-        print("└─────────────────────────────────────────────────────────────────────────┘")
-        print(f"\n✓ Rango V0 evaluado: {v0_min:.0f} - {v0_max:.0f} Hm³")
-        print(f"✓ Número de configuraciones: {len(self.results)}")
-        print(f"✓ Escenarios Monte Carlo por configuración: {self.n_scenarios}")
-        print(f"✓ Período simulado: {self.n_years} años ({self.start_year}-{self.start_year + self.n_years - 1})")
+def safe_correlation(x, y):
+    """
+    Calcula correlación de Pearson manejando casos especiales.
 
-        print("\n┌─────────────────────────────────────────────────────────────────────────┐")
-        print("│ 📊 HALLAZGOS PRINCIPALES                                                │")
-        print("└─────────────────────────────────────────────────────────────────────────┘")
+    Args:
+        x, y: Arrays de valores
 
-        # 1. SENSIBILIDAD ENERGÉTICA
-        print("\n1️⃣  GENERACIÓN ENERGÉTICA")
-        print(f"   • Rango de producción: {min(energies):,.0f} - {max(energies):,.0f} MWh/año")
-        print(f"   • Variabilidad: ±{energy_range/2:,.0f} MWh/año ({energy_cv:.1f}% CV)")
-        print(f"   • Configuración óptima: V0 = {max_energy.V0:.0f} Hm³ → {max_energy.avg_annual_energy:,.0f} MWh/año")
-        
-        if energy_cv < 5:
-            print("   ✓ INTERPRETACIÓN: Generación ESTABLE - poco sensible a V0")
-        elif energy_cv < 15:
-            print("   ⚠ INTERPRETACIÓN: Generación MODERADAMENTE sensible a V0")
-        else:
-            print("   ⚠️ INTERPRETACIÓN: Generación MUY sensible a V0 - requiere control estricto")
+    Returns:
+        Correlación o None si no se puede calcular
+    """
+    # Verificar si hay variación en ambas variables
+    if np.std(x) == 0 or np.std(y) == 0:
+        return None
 
-        # 2. CONFIABILIDAD OPERATIVA
-        print("\n2️⃣  CONFIABILIDAD Y ÉXITO")
-        success_rates = [r.success_rate for r in self.results]
-        print(f"   • Tasa de éxito promedio: {np.mean(success_rates):.1f}%")
-        print(f"   • Rango: {min(success_rates):.1f}% - {max(success_rates):.1f}%")
-        print(f"   • Mejor configuración: V0 = {max_success.V0:.0f} Hm³ → {max_success.success_rate:.1f}% éxito")
-        
-        if min(success_rates) < 50:
-            print("   ⚠️ INTERPRETACIÓN: ALERTA - Algunos V0 tienen baja confiabilidad (<50%)")
-        elif min(success_rates) < 80:
-            print("   ⚠ INTERPRETACIÓN: Confiabilidad VARIABLE - V0 bajo reduce éxito")
-        else:
-            print("   ✓ INTERPRETACIÓN: Sistema ROBUSTO - alta confiabilidad en todo el rango")
-
-        # 3. SEGURIDAD HÍDRICA
-        print("\n3️⃣  SEGURIDAD HÍDRICA (Déficits)")
-        print(f"   • Déficit 1R promedio: {np.mean(deficits):.2f} Hm³/mes")
-        print(f"   • Rango déficit: {min(deficits):.2f} - {max(deficits):.2f} Hm³/mes")
-        print(f"   • Mejor configuración: V0 = {min_deficit.V0:.0f} Hm³ → {min_deficit.deficit_prom_1r:.2f} Hm³/mes")
-        
-        max_deficit_val = max(deficits)
-        if max_deficit_val > 1.0:
-            print(f"   ⚠️ INTERPRETACIÓN: CRÍTICO - V0 bajo genera déficits significativos (>{max_deficit_val:.2f} Hm³/mes)")
-        elif max_deficit_val > 0.5:
-            print(f"   ⚠ INTERPRETACIÓN: V0 bajo puede generar déficits moderados (~{max_deficit_val:.2f} Hm³/mes)")
-        else:
-            print(f"   ✓ INTERPRETACIÓN: Déficits CONTROLADOS en todo el rango (<0.5 Hm³/mes)")
-
-        # 4. RIESGO OPERATIVO
-        print("\n4️⃣  RIESGO OPERATIVO (Tiempo en Colchón Inferior)")
-        print(f"   • Riesgo promedio: {np.mean(risks):.1f}% del tiempo")
-        print(f"   • Rango: {min(risks):.1f}% - {max(risks):.1f}%")
-        print(f"   • Mejor configuración: V0 = {min_risk.V0:.0f} Hm³ → {min_risk.tiempo_colchon_inferior:.1f}% riesgo")
-        
-        max_risk_val = max(risks)
-        if max_risk_val > 50:
-            print(f"   ⚠️ INTERPRETACIÓN: ALTO RIESGO - V0 bajo pasa >{max_risk_val:.0f}% en zona crítica")
-        elif max_risk_val > 30:
-            print(f"   ⚠ INTERPRETACIÓN: Riesgo MODERADO - V0 bajo aumenta tensión operativa")
-        else:
-            print(f"   ✓ INTERPRETACIÓN: Riesgo BAJO - operación mayormente en zonas seguras")
-
-        print("\n┌─────────────────────────────────────────────────────────────────────────┐")
-        print("│ 🎯 RELACIONES CLAVE IDENTIFICADAS                                       │")
-        print("└─────────────────────────────────────────────────────────────────────────┘")
-
-        # Correlaciones
-        corr_v0_energy = np.corrcoef(v0_values, energies)[0, 1]
-        corr_v0_deficit = np.corrcoef(v0_values, deficits)[0, 1]
-        corr_v0_risk = np.corrcoef(v0_values, risks)[0, 1]
-
-        print("\n📈 V0 vs Generación Energética:")
-        print(f"   Correlación: {corr_v0_energy:+.3f}")
-        if abs(corr_v0_energy) > 0.7:
-            direction = "AUMENTA" if corr_v0_energy > 0 else "DISMINUYE"
-            print(f"   ✓ Relación FUERTE: Mayor V0 → {direction} energía significativamente")
-        elif abs(corr_v0_energy) > 0.4:
-            direction = "aumenta" if corr_v0_energy > 0 else "disminuye"
-            print(f"   → Relación MODERADA: Mayor V0 → {direction} energía moderadamente")
-        else:
-            print(f"   → Relación DÉBIL: V0 tiene poco impacto directo en energía")
-
-        print("\n💧 V0 vs Déficit Hídrico (1R):")
-        print(f"   Correlación: {corr_v0_deficit:+.3f}")
-        if corr_v0_deficit < -0.7:
-            print(f"   ✓ Relación FUERTE NEGATIVA: Mayor V0 → REDUCE déficits significativamente")
-        elif corr_v0_deficit < -0.4:
-            print(f"   → Relación MODERADA: Mayor V0 → reduce déficits moderadamente")
-        else:
-            print(f"   ⚠ ATENCIÓN: V0 no reduce déficits como se esperaría (revisar restricciones)")
-
-        print("\n⚠️ V0 vs Riesgo Operativo:")
-        print(f"   Correlación: {corr_v0_risk:+.3f}")
-        if corr_v0_risk < -0.7:
-            print(f"   ✓ Relación FUERTE NEGATIVA: Mayor V0 → REDUCE riesgo significativamente")
-        elif corr_v0_risk < -0.4:
-            print(f"   → Relación MODERADA: Mayor V0 → reduce riesgo moderadamente")
-        else:
-            print(f"   ⚠ ATENCIÓN: Mayor V0 no reduce riesgo como se esperaría")
-
-        print("\n┌─────────────────────────────────────────────────────────────────────────┐")
-        print("│ 💡 RECOMENDACIÓN OPERATIVA                                              │")
-        print("└─────────────────────────────────────────────────────────────────────────┘")
-
-        # Calcular V0 balanceado
-        norm_energy = [(e - min(energies)) / (max(energies) - min(energies)) if max(energies) != min(energies) else 0.5 for e in energies]
-        norm_deficit = [1 - ((d - min(deficits)) / (max(deficits) - min(deficits))) if max(deficits) != min(deficits) else 0.5 for d in deficits]
-        norm_risk = [1 - ((r - min(risks)) / (max(risks) - min(risks))) if max(risks) != min(risks) else 0.5 for r in risks]
-        
-        balanced_scores = [0.40 * e + 0.30 * d + 0.30 * r for e, d, r in zip(norm_energy, norm_deficit, norm_risk)]
-        best_idx = np.argmax(balanced_scores)
-        best_result = self.results[best_idx]
-
-        print(f"\n🎯 V0 ÓPTIMO BALANCEADO: {best_result.V0:.0f} Hm³")
-        print(f"   (Ponderación: 40% energía, 30% déficit, 30% riesgo)")
-        print(f"\n   Desempeño esperado:")
-        print(f"   • Energía anual: {best_result.avg_annual_energy:,.0f} MWh/año")
-        print(f"   • Tasa de éxito: {best_result.success_rate:.1f}%")
-        print(f"   • Déficit 1R: {best_result.deficit_prom_1r:.2f} Hm³/mes")
-        print(f"   • Riesgo operativo: {best_result.tiempo_colchon_inferior:.1f}% del tiempo")
-        print(f"   • Eficiencia: {best_result.eficiencia_energetica:.2f} MWh/Hm³")
-
-        # Rango recomendado
-        percentile_25 = np.percentile(v0_values, 25)
-        percentile_75 = np.percentile(v0_values, 75)
-        
-        print(f"\n📊 RANGO OPERATIVO CONSERVADOR:")
-        print(f"   • Mínimo recomendado: {percentile_25:.0f} Hm³ (evita riesgos altos)")
-        print(f"   • Óptimo balanceado:  {best_result.V0:.0f} Hm³ (mejor trade-off)")
-        print(f"   • Máximo recomendado: {percentile_75:.0f} Hm³ (maximiza seguridad)")
-
-        print("\n┌─────────────────────────────────────────────────────────────────────────┐")
-        print("│ ✅ VERIFICACIÓN DE COHERENCIA                                           │")
-        print("└─────────────────────────────────────────────────────────────────────────┘")
-
-        coherence_checks = []
-        
-        # Check 1: Mayor V0 → Mayor energía
-        if corr_v0_energy > 0:
-            coherence_checks.append("✓ Mayor V0 aumenta energía (esperado)")
-        else:
-            coherence_checks.append("⚠ Mayor V0 NO aumenta energía (revisar)")
-        
-        # Check 2: Mayor V0 → Menor déficit
-        if corr_v0_deficit < 0:
-            coherence_checks.append("✓ Mayor V0 reduce déficits (esperado)")
-        else:
-            coherence_checks.append("⚠ Mayor V0 NO reduce déficits (revisar)")
-        
-        # Check 3: Mayor V0 → Menor riesgo
-        if corr_v0_risk < 0:
-            coherence_checks.append("✓ Mayor V0 reduce riesgo (esperado)")
-        else:
-            coherence_checks.append("⚠ Mayor V0 NO reduce riesgo (revisar)")
-        
-        # Check 4: Energía en rango razonable
-        if 50000 < np.mean(energies) < 200000:
-            coherence_checks.append(f"✓ Energía en rango razonable (~{np.mean(energies)/1000:.0f} GWh/año)")
-        else:
-            coherence_checks.append(f"⚠ Energía fuera de rango esperado ({np.mean(energies)/1000:.0f} GWh/año)")
-        
-        # Check 5: Déficits razonables
-        if np.mean(deficits) < 2.0:
-            coherence_checks.append("✓ Déficits en rango aceptable (<2 Hm³/mes)")
-        else:
-            coherence_checks.append(f"⚠ Déficits elevados ({np.mean(deficits):.2f} Hm³/mes)")
-
-        # Check 6: Tasa de éxito razonable
-        if np.mean(success_rates) > 70:
-            coherence_checks.append(f"✓ Tasa de éxito alta ({np.mean(success_rates):.1f}%)")
-        elif np.mean(success_rates) > 50:
-            coherence_checks.append(f"→ Tasa de éxito moderada ({np.mean(success_rates):.1f}%)")
-        else:
-            coherence_checks.append(f"⚠️ Tasa de éxito baja ({np.mean(success_rates):.1f}%)")
-
-        print()
-        for check in coherence_checks:
-            print(f"   {check}")
-
-        # Conclusión final
-        warnings = sum(1 for check in coherence_checks if '⚠' in check)
-        
-        print("\n" + "=" * 80)
-        if warnings == 0:
-            print("✅ COHERENCIA TOTAL: Todos los resultados son consistentes con el comportamiento esperado")
-        elif warnings <= 2:
-            print(f"⚠️ COHERENCIA PARCIAL: {warnings} verificaciones requieren atención")
-        else:
-            print(f"⚠️⚠️ REVISAR MODELO: {warnings} verificaciones indican posibles inconsistencias")
-        print("=" * 80)
+    # Calcular correlación
+    corr_matrix = np.corrcoef(x, y)
+    return corr_matrix[0, 1]
 
 
 # =============================================================================
@@ -1368,100 +1038,72 @@ class SensitivityAnalyzer:
 def main():
     """Función principal - interfaz interactiva."""
 
-    print("\n" + "╔" + "═" * 68 + "╗")
-    print("║" + " " * 68 + "║")
-    print("║" + "  🔬 ANÁLISIS DE SENSIBILIDAD DEL VOLUMEN INICIAL (V0)".center(68) + "║")
-    print("║" + " " * 68 + "║")
-    print("╚" + "═" * 68 + "╝")
-    print("\n📋 Descripción:")
-    print("   Evalúa cómo diferentes volúmenes iniciales afectan el desempeño")
-    print("   del sistema usando simulaciones Monte Carlo multi-año.")
-    print("\n🎯 Objetivos:")
-    print("   • Identificar V0 óptimo para diferentes prioridades")
-    print("   • Cuantificar trade-offs entre energía, déficit y riesgo")
-    print("   • Generar recomendaciones operativas basadas en datos")
-    print("\n" + "─" * 70)
+    print("=" * 70)
+    print(" 🔬 ANÁLISIS DE SENSIBILIDAD DEL VOLUMEN INICIAL (V0)")
+    print("=" * 70)
+    print("Evalúa cómo diferentes V0 afectan el desempeño del sistema")
+    print("usando simulaciones Monte Carlo multi-año.")
+    print("=" * 70)
 
     try:
         # Parámetros de simulación
-        print("\n" + "╔" + "═" * 68 + "╗")
-        print("║  📋 CONFIGURACIÓN DEL ANÁLISIS" + " " * 37 + "║")
-        print("╚" + "═" * 68 + "╝")
+        print("\n📋 CONFIGURACIÓN DEL ANÁLISIS")
+        print("-" * 70)
 
-        print("\n⏰ Parámetros Temporales:")
         start_year = get_input(
-            "   📅 Año inicial",
+            "📅 Año inicial",
             default=1960,
             input_type=int
         )
         n_years = get_input(
-            "   📆 Número de años por escenario",
+            "📆 Número de años por escenario",
             default=64,
             input_type=int
         )
         n_scenarios = get_input(
-            "   🎲 Escenarios Monte Carlo por V0",
+            "🎲 Escenarios Monte Carlo por V0",
             default=50,
             input_type=int
         )
 
-        print("\n� Rango de Volumen Inicial:")
-        V0_min = get_input(
-            "   � V0 mínimo (Hm³)",
-            default=500,
-            input_type=float
-        )
-        V0_max = get_input(
-            "   � V0 máximo (Hm³)",
-            default=5000,
-            input_type=float
-        )
+        print("\n📏 RANGO DE VOLUMEN INICIAL")
+        print("-" * 70)
+        V0_min = get_input("💧 V0 mínimo (Hm³)", default=500, input_type=float)
+        V0_max = get_input("💧 V0 máximo (Hm³)", default=5000, input_type=float)
 
-        print("\n� Resolución del Análisis:")
-        print("   �💡 Los puntos se distribuyen uniformemente en el rango.")
-        print(f"   💡 Ejemplo: 5 puntos en [{V0_min:.0f}-{V0_max:.0f}] → ", end="")
-        example_points = np.linspace(V0_min, V0_max, 5)
-        print(f"[{', '.join([f'{p:.0f}' for p in example_points])}]")
-        
+        print("\n💡 Los puntos se distribuyen uniformemente en el rango.")
+        print(
+            "Ejemplo: 5 puntos en [500-5000] → "
+            "[500, 1625, 2750, 3875, 5000]"
+        )
         n_points = get_input(
-            "   🎯 Número de puntos a evaluar",
+            "📍 Número de puntos a evaluar",
             default=10,
             input_type=int
         )
 
-        # Resumen de configuración
+        # Advertencia si el análisis será extenso
         total_simulations = n_points * n_scenarios
+        # ~0.5 seg por simulación
         estimated_time = total_simulations * 0.5 / 60
 
-        print("\n" + "─" * 70)
-        print("📊 RESUMEN DE CONFIGURACIÓN")
-        print("─" * 70)
-        print(f"   Simulaciones totales:  {total_simulations:,}")
-        print(f"   Estructura:            {n_points} puntos × {n_scenarios} escenarios")
-        print(f"   Período:               {n_years} años ({start_year}-{start_year + n_years - 1})")
-        print(f"   ⏱️  Tiempo estimado:     ~{estimated_time:.1f} minutos")
-        print("─" * 70)
-
-        print("\n💭 Mientras esperas, puedes:")
+        print(f"\n⚠️ Se ejecutarán {total_simulations} simulaciones totales")
+        print(f"   ({n_points} puntos × {n_scenarios} escenarios)")
+        print(f"⏱️ Tiempo estimado: {estimated_time:.1f} minutos")
+        print("\n💭 Esto va a demorar un poco... perfecto para:")
         print("   ☕ Prepararte un café")
-        print("   📧 Revisar tus emails")
+        print("   🍕 Pedir una pizza")
         print("   🧘 Meditar sobre el sentido de la vida")
-        print("   📊 Revisar la documentación del modelo")
 
         confirm = get_input(
-            "\n❓ ¿Continuar con el análisis? [s/N]",
+            "\n¿Continuar con el análisis? [s/N]",
             default="N"
         )
         if confirm.lower() not in ['s', 'sí', 'si', 'y', 'yes']:
-            print("\n" + "─" * 70)
-            print("❌ Análisis cancelado por el usuario")
-            print("💡 Tip: Puedes reducir n_points o n_scenarios para análisis más rápido")
-            print("─" * 70)
+            print("❌ Análisis cancelado. Quizás la próxima vez 😢")
             return
 
-        print("\n" + "╔" + "═" * 68 + "╗")
-        print("║  🚀 INICIANDO ANÁLISIS DE SENSIBILIDAD" + " " * 29 + "║")
-        print("╚" + "═" * 68 + "╝")
+        print("\n🚀 Iniciando análisis de sensibilidad...")
 
         # Medición de rendimiento
         start_time = time.time()
@@ -1483,90 +1125,39 @@ def main():
             verbose=True
         )
 
-        # Imprimir resumen detallado
+        # Imprimir resumen
         analyzer.print_summary()
 
         # Exportar resultados
-        print("\n" + "═" * 70)
-        print("💾 EXPORTANDO RESULTADOS")
-        print("═" * 70)
-        
+        print("\n💾 Exportando resultados...")
         csv_path = analyzer.export_results_to_csv()
-        print(f"\n✅ Datos completos:")
-        print(f"   📄 {Path(csv_path).name}")
-        print(f"   📍 {csv_path}")
-        
-        # Exportar análisis de casos borde
-        edge_cases_path = analyzer.export_edge_cases_analysis()
-        if edge_cases_path:
-            print(f"\n✅ Casos borde (10 escenarios críticos):")
-            print(f"   📄 {Path(edge_cases_path).name}")
-            print(f"   📍 {edge_cases_path}")
+        print(f"   ✅ CSV guardado: {csv_path}")
 
         # Generar gráficos
-        print("\n" + "═" * 70)
-        print("📊 GENERANDO VISUALIZACIONES")
-        print("═" * 70)
-        print("\nCreando gráficos de alta calidad (300 DPI)...")
-        
+        print("\n📊 Generando visualizaciones...")
         plot_files = analyzer.generate_sensitivity_plots()
-        
-        print(f"\n✅ {len(plot_files)} gráficos generados exitosamente:")
-        for i, plot_file in enumerate(plot_files, 1):
-            filename = Path(plot_file).name
-            if 'estrategicos' in filename:
-                print(f"\n   {i}. 📈 {filename}")
-                print(f"      └─ 9 gráficos de KPIs estratégicos (grid 3x3)")
-            elif 'complementario' in filename:
-                print(f"\n   {i}. 📊 {filename}")
-                print(f"      └─ 4 análisis de trade-offs (grid 2x2)")
-            elif 'dashboard' in filename:
-                print(f"\n   {i}. 🎯 {filename}")
-                print(f"      └─ Dashboard ejecutivo multi-dimensional")
-            else:
-                print(f"\n   {i}. 📉 {filename}")
+        print(f"   ✅ Gráficos generados: {len(plot_files)} archivos")
+        for plot_file in plot_files:
+            print(f"      📈 {Path(plot_file).name}")
 
         # Estadísticas de rendimiento
         execution_time = time.time() - start_time
         memory_mb = process.memory_info().rss / (1024 * 1024)
 
-        print("\n" + "╔" + "═" * 68 + "╗")
-        print("║  ⚡ ESTADÍSTICAS DE RENDIMIENTO" + " " * 36 + "║")
-        print("╚" + "═" * 68 + "╝")
-        
-        print(f"\n⏱️  Tiempo de ejecución:")
-        print(f"   └─ Total: {format_time(execution_time)}")
-        print(f"   └─ Por simulación: {execution_time / total_simulations:.3f}s")
-        print(f"   └─ Por punto V0: {execution_time / n_points:.1f}s")
-        
-        print(f"\n💾 Uso de memoria:")
-        print(f"   └─ RAM utilizada: {memory_mb:.1f} MB")
-        
-        print(f"\n📊 Productividad:")
-        print(f"   └─ Simulaciones completadas: {total_simulations:,}")
-        print(f"   └─ Tasa: {total_simulations / (execution_time / 60):.1f} sim/min")
-        
-        print("\n" + "─" * 70)
+        print("\n" + "=" * 70)
+        print("⚡ RENDIMIENTO")
+        print("=" * 70)
+        print(f"🕒 Tiempo total: {format_time(execution_time)}")
+        print(f"💾 Memoria utilizada: {memory_mb:.1f} MB")
+        print(f"📊 Simulaciones completadas: {total_simulations}")
+        avg_time_per_sim = execution_time / total_simulations
+        print(
+            f"⏱️ Tiempo promedio por simulación: "
+            f"{avg_time_per_sim:.2f}s"
+        )
+        print("=" * 70)
 
-        # REPORTE FINAL INTERPRETATIVO
-        analyzer.print_interpretive_report()
-
-        print("\n" + "╔" + "═" * 68 + "╗")
-        print("║" + " " * 68 + "║")
-        print("║" + "  ✅ ANÁLISIS COMPLETADO EXITOSAMENTE".center(68) + "║")
-        print("║" + " " * 68 + "║")
-        print("╚" + "═" * 68 + "╝")
-        
-        print("\n📁 Archivos generados:")
-        print(f"   📄 {len(plot_files)} gráficos PNG")
-        print(f"   📊 2 archivos CSV")
-        print(f"   📍 Ubicación: {Path('resultados').absolute()}")
-        
-        print("\n💡 Próximos pasos:")
-        print("   1. Revisar gráficos en la carpeta 'resultados'")
-        print("   2. Analizar CSV de casos borde para escenarios críticos")
-        print("   3. Usar V0 balanceado recomendado en simulaciones futuras")
-        print("\n" + "─" * 70 + "\n")
+        print("\n✅ Análisis de sensibilidad completado exitosamente")
 
     except KeyboardInterrupt:
         print("\n\n👋 Análisis interrumpido por el usuario")

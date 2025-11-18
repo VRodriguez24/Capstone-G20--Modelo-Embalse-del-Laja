@@ -6,7 +6,7 @@ from gurobipy import GRB
 # --- Conjuntos/red ---
 from embalse import (
     NODES, ARCS, A_inyeccion, A_generacion, A_conectividad,
-    A_vertimiento, IN, OUT
+    IN, OUT
 )
 # --- Datos (CSV) ---
 from data_loader import load_caudalmax, load_injections_for_year
@@ -163,6 +163,8 @@ def build_model_for_one_year(
     V = m.addVars(T, lb=V_min, ub=V_max, name="V")
     Filtr = m.addVars(T, lb=0.0, name="Filtr")
     G = m.addVars(T, lb=0.0, name="G")
+    beta = m.addVars(A_generacion, T, vtype=GRB.BINARY, name="beta")
+    gamma = m.addVars(A_conectividad, T, vtype=GRB.BINARY, name="gamma")
 
     # Déficits y binarias (primeros regantes)
     # Tucapel: max{0, 90*factor1_t - Filtr_t - A_naturales_t}
@@ -241,26 +243,87 @@ def build_model_for_one_year(
             )
 
     # (R3) Capacidad máxima y control de vertimientos
-    # Vertimiento solo permitido si arco de origen está al máximo
+    # Binaria que permite vertimiento solo si generación está al máximo
 
     # R3a: Generación usa exclusivamente arcos x (y=0)
     for (i, j) in A_generacion:
         for t in T:
-            m.addConstr(y[i, j, t] == 0.0, name=f"R3a_y0_{i}_{j}_{t}")
+            m.addConstr(y[i, j, t] == 0.0, name=f"R3a_y0_{i}{j}{t}")
 
-    # R3b: Capacidad en generación
+    # R3b: Capacidad en generación con binaria de vertimiento
+    # beta[i,j,t] = 1 si y solo si x[i,j,t] = cap (al máximo exacto)
+    beta = m.addVars(A_generacion, T, vtype=GRB.BINARY, name="beta")
+
     for (i, j) in A_generacion:
         cap = cap_max.get((i, j))
         if cap is not None:
             for t in T:
-                m.addConstr(x[i, j, t] <= cap, name=f"R3b_cap_{i}_{j}_{t}")
+                # Capacidad normal (límite superior)
+                m.addConstr(x[i, j, t] <= cap, name=f"R3b_cap_{i}{j}{t}")
 
-    # R3c: Capacidad en conectividad
+                # Linearización Big-M para beta=1 <=> x=cap
+                # Si beta=1 => cap - M*(1-1) <= x <= cap + M*(1-1)
+                #           => cap <= x <= cap  (es decir, x = cap)
+                # Si beta=0 => cap - M <= x <= cap + M
+                #           => sin restricción adicional (ya tiene x <= cap)
+                m.addConstr(
+                    x[i, j, t] >= cap - M * (1 - beta[i, j, t]),
+                    name=f"R3b_beta_lb_{i}{j}{t}"
+                )
+                m.addConstr(
+                    x[i, j, t] <= cap + M * (1 - beta[i, j, t]),
+                    name=f"R3b_beta_ub_{i}{j}{t}"
+                )
+
+    # R3c: Capacidad en conectividad con binarias gamma para saturación
     for (i, j) in A_conectividad:
         cap = cap_max.get((i, j))
         if cap is not None and cap < 9000:
             for t in T:
-                m.addConstr(y[i, j, t] <= cap, name=f"R3c_cap_{i}_{j}_{t}")
+                # Capacidad normal (límite superior)
+                m.addConstr(y[i, j, t] <= cap, name=f"R3c_cap_{i}{j}{t}")
+
+                # Linearización Big-M para gamma=1 <=> y=cap
+                # Similar a beta pero para arcos de conectividad
+                m.addConstr(
+                    y[i, j, t] >= cap - M * (1 - gamma[i, j, t]),
+                    name=f"R3c_gamma_lb_{i}{j}{t}"
+                )
+                m.addConstr(
+                    y[i, j, t] <= cap + M * (1 - gamma[i, j, t]),
+                    name=f"R3c_gamma_ub_{i}{j}{t}"
+                )
+
+    # # R3d: Vertimiento solo permitido si hay capacidad saturada
+    # # Verifica tanto generación como conectividad desde el mismo nodo origen
+    # for (i, j) in A_vertimiento:
+    #     # Buscar arcos de generación desde el mismo nodo origen
+    #     gen_arcs_from_i = [
+    #         (ii, jj) for (ii, jj) in A_generacion if ii == i
+    #     ]
+    #     # Buscar arcos de conectividad con capacidad limitada
+    #     conn_arcs_from_i = [
+    #         (ii, jj) for (ii, jj) in A_conectividad
+    #         if ii == i and cap_max.get((ii, jj)) is not None
+    #         and cap_max.get((ii, jj)) < 9000
+    #     ]
+
+    #     # Si hay arcos de generación o conectividad que puedan saturarse
+    #     if gen_arcs_from_i or conn_arcs_from_i:
+    #         for t in T:
+    #             # Vertimiento solo si al menos UN arco está al máximo
+    #             # Suma de betas (generación) + gammas (conectividad)
+    #             beta_sum = gp.quicksum(
+    #                 beta[ig, jg, t] for (ig, jg) in gen_arcs_from_i
+    #             )
+    #             gamma_sum = gp.quicksum(
+    #                 gamma[ic, jc, t] for (ic, jc) in conn_arcs_from_i
+    #             )
+
+    #             m.addConstr(
+    #                 y[i, j, t] <= M * (beta_sum + gamma_sum),
+    #                 name=f"R3d_vert_{i}{j}{t}"
+    #             )
 
     # (R4) Energía mensual: G_t = sum{ eta_e * x_e,t }
     for t in T:
@@ -384,7 +447,7 @@ def build_model_for_one_year(
         # - compensar déficit consolidado de primeros (Def1)
         # - más déficit de segundos (Def2)
         m.addConstr(
-            x["Embalse", "ElToro", t] >= Def1[t] + Def2[t],
+            x["Embalse", "ElToro", t] * Conv >= Def1[t] + Def2[t],
             name=f"R6_4a_cobertura_ElToro_{t}"
         )
 
@@ -498,9 +561,25 @@ def build_model_for_one_year(
     m._G = G
     m._meta = {
         "eta": eta,
+        "cap_max": cap_max,
         "Conv": Conv,
         "A_generacion": A_generacion,
-        "ARCS": ARCS
+        "ARCS": ARCS,
+        # Agregar demandas mensuales para KPIs (extracción exacta)
+        "demandas_mensuales": {
+            "tucapel": {
+                t: TUCAPEL_MIN * FIRST_REGANTES_FACTOR.get(t, 1.0) * Conv
+                for t in T
+            },
+            "abanico": {
+                t: ABANICO_MIN * FIRST_REGANTES_FACTOR.get(t, 1.0) * Conv
+                for t in T
+            },
+            "segundos": {
+                t: SEGUNDOS_MIN * SECOND_REGANTES_FACTOR.get(t, 1.0) * Conv
+                for t in T
+            }
+        }
     }
 
     return m

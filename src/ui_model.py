@@ -21,6 +21,7 @@ Uso típico:
 import sys
 import time
 import psutil
+from pathlib import Path
 from typing import Callable, List
 from collections import defaultdict
 
@@ -33,6 +34,7 @@ from kpi import (
     extract_kpis,
     aggregate_kpis,
     print_kpis,
+    export_kpis_to_csv,
     generate_historical_plots
 )
 
@@ -161,59 +163,81 @@ def run_custom_range(
             model.optimize()
 
             if model.status == 2:  # Óptimo
-                energy = model.objVal
+                # Detectar tipo por variables de generación
+                is_energy_model = hasattr(model, '_G')
+                obj_val = model.objVal
+                
                 V_vars = model._V
                 final_month = max(time_periods)
                 v_final = V_vars[final_month].x
 
-                # Calcular uso del Toro (si existe en el modelo)
-                x_vars = model._x
+                # Calcular uso del Toro (verificar si existe _x o usar _y)
                 toro_usage = 0
-                # x_vars tiene claves (origen, destino, periodo)
-                # Verificar si existe alguna clave con ("Embalse", "ElToro")
-                if any(k[:2] == ("Embalse", "ElToro") for k in x_vars.keys()):
-                    toro_usage = sum(
-                        x_vars["Embalse", "ElToro", t].x
-                        for t in time_periods
-                    ) * conv_factor
+                if hasattr(model, '_x'):
+                    x_vars = model._x
+                    toro_key = ("Embalse", "ElToro")
+                    if any(k[:2] == toro_key for k in x_vars.keys()):
+                        toro_usage = sum(
+                            x_vars["Embalse", "ElToro", t].x
+                            for t in time_periods
+                        ) * conv_factor
+                elif hasattr(model, '_y'):
+                    y_vars = model._y
+                    toro_key = ("Embalse", "ElToro")
+                    if any(k[:2] == toro_key for k in y_vars.keys()):
+                        toro_usage = sum(
+                            y_vars["Embalse", "ElToro", t].x
+                            for t in time_periods
+                        ) * conv_factor
 
-                print(
-                    f"✅ Energía: {energy:,.1f} MWh | "
-                    f"V_final: {v_final:,.1f} Hm³ | "
-                    f"Uso Toro: {toro_usage:,.1f} Hm³"
-                )
+                # Reportar según tipo de modelo
+                if is_energy_model:
+                    print(
+                        f"✅ Energía: {obj_val:,.1f} MWh | "
+                        f"V_final: {v_final:,.1f} Hm³ | "
+                        f"Uso Toro: {toro_usage:,.1f} Hm³"
+                    )
+                else:
+                    print(
+                        f"✅ Déficit: {obj_val:,.2f} Hm³ | "
+                        f"V_final: {v_final:,.1f} Hm³ | "
+                        f"Uso Toro: {toro_usage:,.1f} Hm³"
+                    )
 
-                total_energy += energy
+                total_energy += obj_val
                 total_toro_usage += toro_usage
                 current_V0 = v_final  # Recursivo
                 results.append({
                     'year': year,
-                    'energy': energy,
+                    'obj_value': obj_val,
                     'v_final': v_final,
                     'toro_usage': toro_usage,
-                    'status': 'OK'
+                    'status': 'OK',
+                    'is_energy': is_energy_model
                 })
             else:
                 print("❌ No factible - usando V0 de seguridad (1400 Hm³)")
                 current_V0 = 1400.0
                 results.append({
                     'year': year,
-                    'energy': 0,
+                    'obj_value': 0,
                     'v_final': None,
                     'toro_usage': 0,
-                    'status': 'FAIL'
+                    'status': 'FAIL',
+                    'is_energy': False
                 })
 
             model.dispose()
 
         except Exception as e:
-            print(f"❌ Error en año {year}: {e}")
+            print(f"❌ Error ({year}): {e}")
             results.append({
                 'year': year,
-                'energy': 0,
+                'obj_value': 0,
                 'v_final': None,
                 'toro_usage': 0,
-                'status': 'ERROR'
+                'status': 'ERROR',
+                'is_energy': False
             })
 
     # Resumen
@@ -229,13 +253,26 @@ def run_custom_range(
 
     print(f"🎯 Años procesados: {years_count}")
     print(f"✅ Años exitosos: {len(successful)} ({success_rate:.1f}%)")
-    print(f"⚡ Energía total: {total_energy:,.1f} MWh")
+    
+    # Detectar tipo de modelo del primer resultado exitoso
+    is_energy_model = successful[0]['is_energy'] if successful else False
+    
+    if is_energy_model:
+        print(f"⚡ Energía total: {total_energy:,.1f} MWh")
+    else:
+        print(f"🛑 Déficit total acumulado: {total_energy:,.2f} Hm³")
+    
     print(f"🌊 Uso total El Toro: {total_toro_usage:,.1f} Hm³")
 
     if successful:
-        avg_energy = total_energy / len(successful)
+        avg_value = total_energy / len(successful)
         avg_toro = total_toro_usage / len(successful)
-        print(f"📊 Energía promedio: {avg_energy:,.1f} MWh/año")
+        
+        if is_energy_model:
+            print(f"📊 Energía promedio: {avg_value:,.1f} MWh/año")
+        else:
+            print(f"📊 Déficit promedio: {avg_value:,.2f} Hm³/año")
+        
         print(f"📊 Uso promedio El Toro: {avg_toro:,.1f} Hm³/año")
 
         # Balance volumétrico
@@ -266,6 +303,28 @@ def run_custom_range(
                     # Mostrar KPIs para primer año
                     if len(kpis_list) == 1:
                         print_kpis(kpis, f"Año {year}")
+                        # Exportar KPIs con nombre personalizado
+                        try:
+                            if len(years) > 1:
+                                scenario = f"rango_{years[0]}-{years[-1]}"
+                            else:
+                                scenario = "individual"
+                            csv_files = export_kpis_to_csv(
+                                kpis,
+                                output_dir="resultados/kpis",
+                                year=year,
+                                scenario=scenario
+                            )
+                            if csv_files:
+                                num_files = len(csv_files)
+                                print(
+                                    f"\n💾 KPIs exportados: "
+                                    f"{num_files} archivos"
+                                )
+                                for f in csv_files:
+                                    print(f"   📄 {Path(f).name}")
+                        except Exception as e:
+                            print(f"   ⚠️ Error exportando KPIs: {e}")
 
                 model.dispose()
             except Exception as e:
@@ -325,11 +384,29 @@ def run_custom_range(
                     f"{confiabilidad_prom:8.1f}%"
                 )
 
+            # Mostrar KPIs agregados en consola
+            print("\n📊 KPIs AGREGADOS:")
+            try:
+                kpis_agregados = aggregate_kpis(kpis_list)
+                print_kpis(
+                    kpis_agregados,
+                    context=f"Rango {years[0]}-{years[-1]}"
+                )
+            except Exception as e:
+                print(f"⚠️ Error mostrando KPIs agregados: {e}")
+
     # Tabla detallada
     if years_count > 1:
         print("\n📊 DETALLE POR AÑO:")
         print("━" * 80)
-        print("Año   Estado  Energía (MWh)  V_final (Hm³)  Uso Toro (Hm³)")
+        
+        # Header adaptativo según tipo de modelo
+        if is_energy_model:
+            obj_header = "Energía (MWh)"
+        else:
+            obj_header = "Déficit (Hm³)"
+        
+        print(f"Año   Estado  {obj_header:>14}  V_final (Hm³)  Uso Toro (Hm³)")
         print("━" * 80)
 
         for r in results:
@@ -337,7 +414,7 @@ def run_custom_range(
             if r['status'] == 'OK':
                 print(
                     f"{r['year']}   {status_icon}    "
-                    f"{r['energy']:>12,.1f}  {r['v_final']:>13,.1f}  "
+                    f"{r['obj_value']:>12,.1f}  {r['v_final']:>13,.1f}  "
                     f"{r['toro_usage']:>14,.1f}"
                 )
             else:
@@ -402,6 +479,7 @@ def run_all_years(
     current_V0 = V0
     total_energy = 0
     total_toro_usage = 0
+    failed_years = []  # Rastrear años fallidos
 
     for year in range(min_year, max_year + 1):
         year_num = year - min_year + 1
@@ -413,57 +491,107 @@ def run_all_years(
             model.optimize()
 
             if model.status == 2:  # Óptimo
-                energy = model.objVal
+                # Detectar tipo por variables de generación
+                is_energy_model = hasattr(model, '_G')
+                obj_val = model.objVal
+                
                 V_vars = model._V
                 final_month = max(time_periods)
                 v_final = V_vars[final_month].x
 
-                x_vars = model._x
                 toro_usage = 0
-                # Verificar existencia del arco El Toro
-                if any(k[:2] == ("Embalse", "ElToro") for k in x_vars.keys()):
-                    toro_usage = sum(
-                        x_vars["Embalse", "ElToro", t].x
-                        for t in time_periods
-                    ) * conv_factor
+                # Verificar existencia del arco El Toro (_x o _y)
+                if hasattr(model, '_x'):
+                    x_vars = model._x
+                    toro_key = ("Embalse", "ElToro")
+                    if any(k[:2] == toro_key for k in x_vars.keys()):
+                        toro_usage = sum(
+                            x_vars["Embalse", "ElToro", t].x
+                            for t in time_periods
+                        ) * conv_factor
+                elif hasattr(model, '_y'):
+                    y_vars = model._y
+                    toro_key = ("Embalse", "ElToro")
+                    if any(k[:2] == toro_key for k in y_vars.keys()):
+                        toro_usage = sum(
+                            y_vars["Embalse", "ElToro", t].x
+                            for t in time_periods
+                        ) * conv_factor
 
-                print(
-                    f"✅ E: {energy:,.0f} MWh | "
-                    f"V_f: {v_final:,.0f} | "
-                    f"Toro: {toro_usage:,.1f} Hm³"
-                )
+                # Reportar según tipo de modelo
+                if is_energy_model:
+                    print(
+                        f"✅ E: {obj_val:,.0f} MWh | "
+                        f"V_f: {v_final:,.0f} | "
+                        f"Toro: {toro_usage:,.0f} Hm³"
+                    )
+                else:
+                    # Caso base: calcular vertimiento si existe
+                    vertimiento_total = 0.0
+                    if hasattr(model, '_Vertimiento'):
+                        vert_vars = model._Vertimiento
+                        vertimiento_total = sum(
+                            vert_vars[t].x for t in time_periods
+                        )
+                    
+                    if vertimiento_total > 0.01:  # Mostrar si > 10,000 m³
+                        print(
+                            f"✅ D: {obj_val:,.2f} Hm³ | "
+                            f"V_f: {v_final:,.0f} | "
+                            f"Toro: {toro_usage:,.0f} Hm³ "
+                            f"(Vert: {vertimiento_total:,.1f})"
+                        )
+                    else:
+                        print(
+                            f"✅ D: {obj_val:,.2f} Hm³ | "
+                            f"V_f: {v_final:,.0f} | "
+                            f"Toro: {toro_usage:,.0f} Hm³"
+                        )
 
-                total_energy += energy
+                total_energy += obj_val
                 total_toro_usage += toro_usage
                 current_V0 = v_final
                 results.append({
                     'year': year,
-                    'energy': energy,
+                    'obj_value': obj_val,
                     'v_final': v_final,
                     'toro_usage': toro_usage,
-                    'status': 'OK'
+                    'status': 'OK',
+                    'is_energy': is_energy_model
                 })
             else:
-                print("❌ No factible - reset a 1400 Hm³")
+                status_msg = {
+                    3: "INFEASIBLE",
+                    4: "INF_OR_UNBD",
+                    5: "UNBOUNDED"
+                }.get(model.status, f"STATUS_{model.status}")
+                print(
+                    f"❌ {status_msg} (V0={current_V0:,.0f}) "
+                    f"- reiniciando a 1400 Hm³"
+                )
+                failed_years.append((year, status_msg, current_V0))
                 current_V0 = 1400.0
                 results.append({
                     'year': year,
-                    'energy': 0,
+                    'obj_value': 0,
                     'v_final': None,
                     'toro_usage': 0,
-                    'status': 'FAIL'
+                    'status': 'FAIL',
+                    'is_energy': False
                 })
 
             model.dispose()
 
         except Exception as e:
             print(f"❌ Error: {e}")
+            failed_years.append((year, f"ERROR: {e}", current_V0))
             results.append({
                 'year': year,
-                'energy': 0,
+                'obj_value': 0,
                 'v_final': None,
                 'toro_usage': 0,
-                'status': 'ERROR'
+                'status': 'ERROR',
+                'is_energy': False
             })
 
     # Resumen completo
@@ -476,13 +604,26 @@ def run_all_years(
 
     print(f"🎯 Años procesados: {total_years}")
     print(f"✅ Años exitosos: {len(successful)} ({success_rate:.1f}%)")
-    print(f"⚡ Energía total: {total_energy:,.1f} MWh")
+    
+    # Detectar tipo de modelo
+    is_energy_model = successful[0]['is_energy'] if successful else False
+    
+    if is_energy_model:
+        print(f"⚡ Energía total: {total_energy:,.1f} MWh")
+    else:
+        print(f"🛑 Déficit total acumulado: {total_energy:,.2f} Hm³")
+    
     print(f"🌊 Uso total El Toro: {total_toro_usage:,.1f} Hm³")
 
     if successful:
-        avg_energy = total_energy / len(successful)
+        avg_value = total_energy / len(successful)
         avg_toro = total_toro_usage / len(successful)
-        print(f"📊 Energía promedio: {avg_energy:,.1f} MWh/año")
+        
+        if is_energy_model:
+            print(f"📊 Energía promedio: {avg_value:,.1f} MWh/año")
+        else:
+            print(f"📊 Déficit promedio: {avg_value:,.2f} Hm³/año")
+        
         print(f"📊 Uso promedio El Toro: {avg_toro:,.1f} Hm³/año")
 
         # Balance volumétrico histórico
@@ -496,11 +637,22 @@ def run_all_years(
         print(f"   Final (Nov'23): {v_final_last:,.1f} Hm³")
         print(f"   {change_sign} Cambio neto: {volume_change:+,.1f} Hm³")
 
+        # Mostrar años fallidos si existen
+        if failed_years:
+            print("\n⚠️  AÑOS CON PROBLEMAS DE CONVERGENCIA:")
+            print("━" * 60)
+            print(f"{'Año':<8} {'Estado':<15} {'V0 (Hm³)':<12}")
+            print("━" * 60)
+            for year, status, v0 in failed_years:
+                print(f"{year:<8} {status:<15} {v0:>10,.1f}")
+            print("━" * 60)
+
         # KPIs históricos detallados
         print("\n🔄 Calculando KPIs históricos detallados...")
-        print("   (Esto puede tomar varios minutos)")
+        print("   (Esto puede tomar varios segúndos)\n")
 
         kpis_historicos = []
+        years_exitosos = []  # Rastrear años que convergieron
         all_years = list(range(min_year, max_year + 1))
         current_V0_sample = V0
 
@@ -516,6 +668,7 @@ def run_all_years(
                 if model.status == 2:
                     kpis = extract_kpis(model)
                     kpis_historicos.append(kpis)
+                    years_exitosos.append(year)  # Registrar año exitoso
 
                     if hasattr(model, '_V'):
                         final_month = max(time_periods)
@@ -528,15 +681,27 @@ def run_all_years(
         if kpis_historicos:
             kpis_agregados = aggregate_kpis(kpis_historicos)
             print_kpis(kpis_agregados, "Histórico")
-
+            
+            # Generar gráficos de evolución histórica
             try:
+                print("\n📊 Generando gráficos de evolución histórica...")
+                
+                # Nombre del gráfico según tipo de modelo
+                if is_energy_model:
+                    plot_name = "evolucion_historica_lago"
+                else:
+                    plot_name = "evolucion_historica_lago_caso_base"
+                
+                # CORRECCIÓN: Usar solo años exitosos
                 plot_files = generate_historical_plots(
                     kpis_historicos,
-                    all_years,
+                    years_exitosos,  # Usar lista filtrada
                     output_dir="resultados",
-                    plot_name="evolucion_historica_lago"
+                    plot_name=plot_name
                 )
-                print(f"📊 Gráficos: {len(plot_files)} PNG")
+                print(f"📊 Gráficos generados: {len(plot_files)} archivos PNG")
+                for file_path in plot_files:
+                    print(f"   ✓ {Path(file_path).name}")
             except Exception as e:
                 print(f"   ⚠️ Error generando gráficos: {e}")
         else:
