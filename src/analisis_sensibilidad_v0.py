@@ -26,10 +26,6 @@ from pathlib import Path
 from typing import Dict, List, Tuple
 from dataclasses import dataclass, field
 
-# Suprimir warnings de matplotlib y unicode
-warnings.filterwarnings('ignore', category=UserWarning)
-matplotlib.rcParams['axes.unicode_minus'] = False
-
 # Importaciones del modelo
 from montecarlo import HybridSimulator
 from kpi import aggregate_kpis
@@ -39,6 +35,10 @@ from ui_helpers import (
     get_input,
     format_time
 )
+
+# Suprimir warnings de matplotlib y unicode
+warnings.filterwarnings('ignore', category=UserWarning)
+matplotlib.rcParams['axes.unicode_minus'] = False
 
 
 @dataclass
@@ -139,15 +139,34 @@ class SensitivityAnalyzer:
             print(f"🎲 Escenarios por punto: {self.n_scenarios}")
             print(f"📅 Años por escenario: {self.n_years}")
             print("=" * 70)
+
+            # Inicializar Gurobi silenciosamente
+            # (muestra warnings antes del progreso)
+            try:
+                import gurobipy as gp
+                dummy = gp.Model()
+                dummy.Params.OutputFlag = 0
+                dummy.optimize()
+                del dummy
+            except Exception:
+                pass
+
             print()
+
+        if verbose:
+            print("\n🔄 Procesando puntos V0...\n")
 
         # Ejecutar simulaciones para cada V0
         for idx, V0 in enumerate(V0_values):
             if verbose:
-                # Loader compacto - solo una línea que se actualiza
-                print(f"\r🔄 Progreso: [{idx+1}/{n_points}] V0={V0:.0f} Hm³ | "
-                      f"Simulando {self.n_scenarios} escenarios...",
-                      end='', flush=True)
+                # Barra de progreso estilo montecarlo
+                progress_pct = (idx + 1) / n_points * 100
+                bar_len = 40
+                filled = int(bar_len * (idx + 1) / n_points)
+                bar = '█' * filled + '░' * (bar_len - filled)
+                msg = f"\r[{bar}] {progress_pct:5.1f}% "
+                msg += f"({idx + 1}/{n_points}) V0={V0:.0f} Hm³\n"
+                print(msg, end='', flush=True)
 
             try:
                 # Ejecutar simulación Monte Carlo
@@ -155,28 +174,52 @@ class SensitivityAnalyzer:
                 result = self._evaluate_single_V0(V0, verbose=False)
                 self.results.append(result)
 
+                # Mostrar estadísticas de éxito inmediatamente
                 if verbose:
-                    # Mostrar resultado compacto en la misma línea
-                    status = "✅" if result.success_rate > 0 else "⚠️"
-                    print(f"\r{status} [{idx+1}/{n_points}] "
-                          f"V0={V0:.0f} Hm³ | "
-                          f"Éxito: {result.success_rate:.0f}% | "
-                          f"Energía: {result.avg_annual_energy:,.0f} MWh/año"
-                          + " " * 10)
+                    # Contar modelos exitosos
+                    n_modelos_exitosos = sum(
+                        len(s.get("results", []))
+                        for s in result.scenarios_data
+                    )
+                    n_modelos_totales = (
+                        len(result.scenarios_data) * self.n_years
+                    )
+                    pct_modelos = (
+                        (n_modelos_exitosos / n_modelos_totales * 100)
+                        if n_modelos_totales > 0 else 0
+                    )
+
+                    # Contar escenarios exitosos
+                    n_escenarios_exitosos = len(result.scenarios_data)
+                    n_escenarios_totales = self.n_scenarios
+                    pct_escenarios = (
+                        (n_escenarios_exitosos / n_escenarios_totales * 100)
+                        if n_escenarios_totales > 0 else 0
+                    )
+
+                    print(
+                        f"🎯 Escenarios: {n_escenarios_exitosos}/"
+                        f"{n_escenarios_totales} "
+                        f"({pct_escenarios:.1f}%) | "
+                        f"Modelos: {n_modelos_exitosos}/"
+                        f"{n_modelos_totales} "
+                        f"({pct_modelos:.1f}%)\n"
+                    )
 
             except Exception as e:
                 if verbose:
-                    error_msg = str(e)[:40]
-                    print(f"\r❌ [{idx+1}/{n_points}] "
-                          f"V0={V0:.0f} Hm³ | Error: {error_msg}"
-                          + " " * 10)
+                    error_msg = str(e)
+                    # Extraer año crítico si está en el mensaje
+                    if "año" in error_msg.lower():
+                        print(f"\n⚠️ {error_msg}")
+                    else:
+                        msg_truncado = error_msg[:60]
+                        print(f"\n❌ Error en V0={V0:.0f} Hm³: {msg_truncado}")
                 continue
 
         if verbose:
-            print("\n" + "=" * 70)
             print("✅ ANÁLISIS DE SENSIBILIDAD COMPLETADO")
-            print("=" * 70)
-            print(f"📊 Puntos evaluados: {len(self.results)}/{n_points}")
+            print(f"\t📊 Puntos evaluados: {len(self.results)}/{n_points}")
 
         return self.results
 
@@ -318,7 +361,6 @@ class SensitivityAnalyzer:
         V0_values = np.array([r.V0 for r in self.results])
         success_rates = np.array([r.success_rate for r in self.results])
         avg_energies = np.array([r.avg_annual_energy for r in self.results])
-        avg_toro = np.array([r.avg_toro_usage for r in self.results])
 
         # Extraer KPIs estratégicos según especificación
         # KPI 1: Tiempo en colchones operativos
@@ -326,49 +368,64 @@ class SensitivityAnalyzer:
         tiempo_transicion = []
         tiempo_intermedio = []
         tiempo_superior = []
-        
+
         # KPI 2: Uso de presupuestos
         uso_presupuesto_riego = []
         uso_presupuesto_gen = []
-        
+
         # KPI 3: Déficits de riego
         deficits_1r = []  # Primeros regantes
         deficits_2r = []  # Segundos regantes
         deficit_pct_1r = []  # Porcentaje de demanda 1R
-        
+
         # KPI 4: Factor de utilización
         factor_utilizacion = []
-        
+
         # KPI adicional: Cota promedio (indicador de estado)
         cotas_prom = []
-        
+
         for r in self.results:
             kpis = r.kpis_agregados if r.kpis_agregados else {}
-            
+
             # KPI 1: Tiempo en colchones
             colchones = kpis.get("tiempo_colchones_%", {})
             tiempo_inferior.append(colchones.get("Inferior", 0))
             tiempo_transicion.append(colchones.get("Transicion", 0))
             tiempo_intermedio.append(colchones.get("Intermedio", 0))
             tiempo_superior.append(colchones.get("Superior", 0))
-            
-            # KPI 2: Uso de presupuestos
+
+            # KPI 2: Uso de presupuestos (convertir strings "X.X%" a float)
             presupuestos = kpis.get("uso_presupuestos_%", {})
-            uso_presupuesto_riego.append(presupuestos.get("riego", 0))
-            uso_presupuesto_gen.append(presupuestos.get("generacion", 0))
-            
+            riego_val = presupuestos.get("riego", 0)
+            gen_val = presupuestos.get("generacion", 0)
+
+            # Convertir strings "X.X%" o "N/A" a float
+            if isinstance(riego_val, str):
+                if riego_val.upper() == 'N/A':
+                    riego_val = 0.0
+                else:
+                    riego_val = float(riego_val.replace('%', ''))
+            if isinstance(gen_val, str):
+                if gen_val.upper() == 'N/A':
+                    gen_val = 0.0
+                else:
+                    gen_val = float(gen_val.replace('%', ''))
+
+            uso_presupuesto_riego.append(float(riego_val))
+            uso_presupuesto_gen.append(float(gen_val))
+
             # KPI 3: Déficits de riego
             deficit_prom = kpis.get("deficit_prom_hm3", {})
             deficits_1r.append(deficit_prom.get("1R", 0))
             deficits_2r.append(deficit_prom.get("2R", 0))
-            
+
             deficit_pct = kpis.get("deficit_pct", {})
             deficit_pct_1r.append(deficit_pct.get("1R", 0))
-            
+
             # KPI 4: Factor de utilización
             fu = kpis.get("factor_utilizacion_%", {})
             factor_utilizacion.append(fu.get("sistema", 0))
-            
+
             # Cota promedio (indicador adicional)
             cota_data = kpis.get("cota_mensual", {})
             if cota_data:
@@ -402,7 +459,7 @@ class SensitivityAnalyzer:
         plt.rcParams['axes.labelcolor'] = 'black'
         plt.rcParams['xtick.color'] = 'black'
         plt.rcParams['ytick.color'] = 'black'
-        
+
         # Paleta de colores profesional
         colors = {
             'primary': '#1f77b4',    # Azul científico
@@ -417,16 +474,16 @@ class SensitivityAnalyzer:
         # GRÁFICO 1: V0 VS GENERACIÓN ENERGÉTICA
         # ================================================================
         fig1, ax1 = plt.subplots(figsize=(12, 7))
-        
+
         # Línea principal con marcadores
         ax1.plot(V0_values, avg_energies, 'o-',
                  color=colors['primary'], linewidth=2.5, markersize=8,
                  label='Energía anual promedio', zorder=3)
-        
+
         # Área sombreada bajo la curva
         ax1.fill_between(V0_values, 0, avg_energies,
                          alpha=0.2, color=colors['primary'])
-        
+
         # Marcar valor máximo
         max_energy_idx = np.argmax(avg_energies)
         ax1.plot(V0_values[max_energy_idx], avg_energies[max_energy_idx], '*',
@@ -436,8 +493,14 @@ class SensitivityAnalyzer:
                  zorder=5)
 
         # Configuración de ejes
-        ax1.set_xlabel('Volumen Inicial (V0) [Hm³]', fontweight='bold', color='black')
-        ax1.set_ylabel('Energía Promedio Anual [MWh/año]', fontweight='bold', color='black')
+        ax1.set_xlabel(
+            'Volumen Inicial (V0) [Hm³]',
+            fontweight='bold', color='black'
+        )
+        ax1.set_ylabel(
+            'Energía Promedio Anual [MWh/año]',
+            fontweight='bold', color='black'
+        )
         ax1.set_title('Sensibilidad: Volumen Inicial vs Generación Energética',
                       fontweight='bold', pad=25, color='black')
         ax1.grid(True, alpha=0.3, linestyle='--')
@@ -455,42 +518,54 @@ class SensitivityAnalyzer:
         files_created.append(str(plot1_file))
 
         # ================================================================
-        # GRÁFICO 2: V0 VS DEPENDENCIA DEL EMBALSE
+        # GRÁFICO 2: V0 VS APORTE DE EL TORO A RIEGO
         # ================================================================
         fig2, ax2 = plt.subplots(figsize=(12, 7))
 
-        # Calcular dependencia normalizada
-        dependencia_pct = (avg_toro / self.n_years)  # Uso promedio anual
+        # Calcular aporte de El Toro EXCLUSIVAMENTE a riego
+        # (déficit consolidado Def1 + Def2) como % de demanda total
+        aporte_riego_pct = deficit_pct_1r  # Ya calculado arriba (% demanda)
 
-        # Gráfico de barras con nuevo color (morado/púrpura)
-        ax2.bar(V0_values, dependencia_pct,
-                width=(V0_values.max() - V0_values.min()) / (len(V0_values) * 1.5),
-                color=colors['azul'], alpha=0.7, edgecolor='black',
-                linewidth=1.5)
+        # Línea principal con marcadores
+        ax2.plot(V0_values, aporte_riego_pct, 'o-',
+                 color='#7b2cbf', linewidth=2.5, markersize=8,
+                 label='Dependencia de riego', zorder=3)
 
-        # Línea de tendencia
-        ax2_line = ax2.twinx()
-        ax2_line.plot(V0_values, dependencia_pct, 'o-',
-                      color=colors['danger'], linewidth=2.5, markersize=8,
-                      label='Tendencia')
+        # Área sombreada bajo la curva
+        ax2.fill_between(V0_values, 0, aporte_riego_pct,
+                         alpha=0.2, color='#7b2cbf')
 
-        ax2.set_xlabel('Volumen Inicial (V0) [Hm³]', fontweight='bold', color='black')
-        ax2.set_ylabel('Uso Promedio Anual del Embalse [Hm³/año]',
-                       fontweight='bold', color='black')
-        ax2_line.set_ylabel('', fontsize=0)  # Ocultar label derecho
-        ax2.set_title('Sensibilidad: Volumen Inicial vs Dependencia del Embalse',
-                      fontweight='bold', pad=15, color='black')
-        ax2.grid(True, alpha=0.3, linestyle='--', linewidth=0.8, axis='y')
-        ax2.tick_params(axis='y', labelcolor='black')
+        # Marcar valor óptimo (mínima dependencia = mejor)
+        min_dep_idx = np.argmin(aporte_riego_pct)
+        ax2.plot(V0_values[min_dep_idx], aporte_riego_pct[min_dep_idx], '*',
+                 color=colors['warning'], markersize=20,
+                 markeredgecolor='black', markeredgewidth=1.5,
+                 label=f'Óptimo: {V0_values[min_dep_idx]:.0f} Hm³',
+                 zorder=5)
 
-        # Leyenda combinada
-        lines2, labels2 = ax2_line.get_legend_handles_labels()
-        if lines2:
-            ax2_line.legend(lines2, labels2, loc='best',
-                            fontsize=11, framealpha=0.9)
+        # Configuración de ejes
+        ax2.set_xlabel(
+            'Volumen Inicial (V0) [Hm³]',
+            fontweight='bold', color='black'
+        )
+        ax2.set_ylabel(
+            'Aporte de El Toro a Riego [% de demanda total]',
+            fontweight='bold', color='black'
+        )
+        ax2.set_title(
+            'Sensibilidad: V0 vs Dependencia de Riego del Embalse',
+            fontweight='bold', pad=25, color='black'
+        )
+        ax2.grid(True, alpha=0.3, linestyle='--')
+        ax2.legend(loc='best', framealpha=0.95)
+
+        # Formato de porcentajes en eje Y
+        ax2.yaxis.set_major_formatter(
+            plt.FuncFormatter(lambda x, p: f'{x:.1f}%')
+        )
 
         plt.tight_layout()
-        plot2_file = output_path / "sensibilidad_dependencia.png"
+        plot2_file = output_path / "sensibilidad_aporte_riego.png"
         plt.savefig(plot2_file, dpi=300, bbox_inches='tight')
         plt.close()
         files_created.append(str(plot2_file))
@@ -532,195 +607,160 @@ class SensitivityAnalyzer:
         files_created.append(str(plot3_file))
 
         # ================================================================
-        # GRÁFICO 4: SENSIBILIDAD DE LOS 4 KPIs ESTRATÉGICOS
+        # GRÁFICO 4: PANEL DETALLADO DE LOS 4 KPIs ESTRATÉGICOS
         # ================================================================
-        fig4, ax4 = plt.subplots(figsize=(12, 7))
-
-        # Normalizar KPIs (0-100, mayor es mejor)
-        def normalize_kpi(values, invert=False):
-            if len(values) == 0 or np.std(values) == 0:
-                return np.ones_like(values) * 50
-            vmin = values.min()
-            vmax = values.max()
-            norm = (values - vmin) / (vmax - vmin) * 100
-            return 100 - norm if invert else norm
-
-        # Normalizar los 4 KPIs estratégicos
-        # KPI 1: Estabilidad (menos tiempo en inferior = mejor)
-        kpi1_norm = normalize_kpi(tiempo_inferior, invert=True)
-        
-        # KPI 2: Eficiencia presupuesto riego (cerca de 100% = mejor)
-        kpi2_norm = normalize_kpi(
-            np.abs(100 - uso_presupuesto_riego), invert=True
-        )
-        
-        # KPI 3: Seguridad hídrica (menos déficit = mejor)
-        kpi3_norm = normalize_kpi(deficits_1r, invert=True)
-        
-        # KPI 4: Factor de utilización (mayor = mejor)
-        kpi4_norm = normalize_kpi(factor_utilizacion)
-
-        # Graficar los 4 KPIs
-        ax4.plot(V0_values, kpi1_norm, '-',
-                 color=colors['warning'], linewidth=2.5,
-                 label='KPI 1: Estabilidad Operativa')
-        ax4.plot(V0_values, kpi2_norm, '-',
-                 color=colors['success'], linewidth=2.5,
-                 label='KPI 2: Eficiencia Presupuesto Riego')
-        ax4.plot(V0_values, kpi3_norm, '-',
-                 color=colors['danger'], linewidth=2.5,
-                 label='KPI 3: Seguridad Hídrica')
-        ax4.plot(V0_values, kpi4_norm, '-',
-                 color=colors['primary'], linewidth=2.5,
-                 label='KPI 4: Factor de Utilización')
-
-        ax4.set_xlabel('Volumen Inicial (V0) [Hm³]', fontweight='bold',
-                       color='black')
-        ax4.set_ylabel('Desempeño Normalizado [0-100]', fontweight='bold',
-                       color='black')
-        ax4.set_title('Sensibilidad de los 4 KPIs Estratégicos',
-                      fontweight='bold', pad=15, color='black')
-        ax4.set_ylim(0, 105)
-        ax4.grid(True, alpha=0.3, linestyle='--')
-        ax4.legend(loc='best', fontsize=10, framealpha=0.95)
-
-        plt.tight_layout()
-        plot4_file = output_path / "sensibilidad_kpis_estrategicos.png"
-        plt.savefig(plot4_file, dpi=300, bbox_inches='tight')
-        plt.close()
-        files_created.append(str(plot4_file))
-
-        # ================================================================
-        # GRÁFICO 5: PANEL DETALLADO DE LOS 4 KPIs ESTRATÉGICOS
-        # ================================================================
-        fig5 = plt.figure(figsize=(16, 12))
-        gs = fig5.add_gridspec(3, 3, hspace=0.35, wspace=0.3)
-
-        # Ya tenemos normalize_kpi definido arriba
+        fig4 = plt.figure(figsize=(16, 12))
+        gs = fig4.add_gridspec(3, 6, hspace=0.4, wspace=1.0)
 
         # =================================================================
-        # FILA 1: KPI 1 - TIEMPO EN COLCHONES OPERATIVOS (3 subplots)
+        # FILA 1: KPI 1 - TIEMPO EN COLCHONES OPERATIVOS
         # =================================================================
-        
+
         # Subplot 1.1: Distribución por colchones (stacked area)
-        ax51 = fig5.add_subplot(gs[0, :])
-        ax51.fill_between(V0_values, 0, tiempo_inferior,
+        ax41 = fig4.add_subplot(gs[0, :])
+        ax41.fill_between(V0_values, 0, tiempo_inferior,
                           alpha=0.7, color='#d62728', label='Inferior')
-        ax51.fill_between(V0_values, tiempo_inferior,
+        ax41.fill_between(V0_values, tiempo_inferior,
                           tiempo_inferior + tiempo_transicion,
                           alpha=0.7, color='#ff7f0e', label='Transición')
-        ax51.fill_between(V0_values,
-                          tiempo_inferior + tiempo_transicion,
-                          tiempo_inferior + tiempo_transicion + tiempo_intermedio,
+        # Calcular acumulados para evitar líneas demasiado largas
+        cum_trans = tiempo_inferior + tiempo_transicion
+        cum_inter = cum_trans + tiempo_intermedio
+        ax41.fill_between(V0_values, cum_trans,
+                          cum_inter,
                           alpha=0.7, color='#2ca02c', label='Intermedio')
-        ax51.fill_between(V0_values,
-                          tiempo_inferior + tiempo_transicion + tiempo_intermedio,
-                          100, alpha=0.7, color='#1f77b4',
-                          label='Superior')
-        ax51.set_title('KPI 1: Distribución de Tiempo en Colchones Operativos',
+        ax41.fill_between(V0_values, cum_inter, 100,
+                          alpha=0.7, color='#1f77b4', label='Superior')
+        ax41.set_title('KPI 1: Distribución de Tiempo en Colchones Operativos',
                        fontweight='bold', color='black', fontsize=12)
-        ax51.set_ylabel('Tiempo [%]', fontsize=10, color='black')
-        ax51.set_xlabel('V0 [Hm³]', fontsize=10, color='black')
-        ax51.set_ylim(0, 100)
-        ax51.legend(loc='upper right', fontsize=9, ncol=4)
-        ax51.grid(True, alpha=0.3, axis='y')
-        
+        ax41.set_ylabel('Tiempo [%]', fontsize=10, color='black')
+        ax41.set_xlabel('V0 [Hm³]', fontsize=10, color='black')
+        ax41.set_ylim(0, 100)
+        ax41.set_xlim(V0_values.min(), V0_values.max())  # Ajustar límites X
+        ax41.margins(x=0.01)  # Reducir margen horizontal
+
+        # Leyenda mejorada con porcentajes (promedio de todos los V0)
+        prom_inferior = tiempo_inferior.mean()
+        prom_transicion = tiempo_transicion.mean()
+        prom_intermedio = tiempo_intermedio.mean()
+        prom_superior = tiempo_superior.mean()
+
+        # Crear leyenda con colores y porcentajes
+        from matplotlib.patches import Patch
+        legend_elements = [
+            Patch(facecolor='#d62728', alpha=0.7,
+                  label=f'Inferior ({prom_inferior:.1f}%)'),
+            Patch(facecolor='#ff7f0e', alpha=0.7,
+                  label=f'Transición ({prom_transicion:.1f}%)'),
+            Patch(facecolor='#2ca02c', alpha=0.7,
+                  label=f'Intermedio ({prom_intermedio:.1f}%)'),
+            Patch(facecolor='#1f77b4', alpha=0.7,
+                  label=f'Superior ({prom_superior:.1f}%)')
+        ]
+        ax41.legend(handles=legend_elements, loc='upper right',
+                    fontsize=9, ncol=4, framealpha=0.95)
+        ax41.grid(True, alpha=0.3, axis='y')
+
         # =================================================================
-        # FILA 2: KPI 2 Y KPI 3
+        # FILA 2: KPI 2 Y KPI 3 (CENTRADOS)
         # =================================================================
-        
-        # Subplot 2.1: KPI 2 - Uso de Presupuestos
-        ax52 = fig5.add_subplot(gs[1, 0])
+
+        # Subplot 2.1: KPI 2 - Uso de Presupuestos (columnas 0-2)
+        ax42 = fig4.add_subplot(gs[1, 0:3])
         x_pos = np.arange(len(V0_values))
         width = 0.35
-        ax52.bar(x_pos - width/2, uso_presupuesto_riego, width,
-                 label='Riego', color=colors['success'], alpha=0.8)
-        ax52.bar(x_pos + width/2, uso_presupuesto_gen, width,
-                 label='Generación', color=colors['primary'], alpha=0.8)
-        ax52.axhline(y=100, color='red', linestyle='--', linewidth=1,
-                     alpha=0.5, label='Presupuesto 100%')
-        ax52.set_title('KPI 2: Uso de Presupuestos', fontweight='bold',
+        ax42.bar(x_pos - width/2, uso_presupuesto_riego, width,
+                 label='Riego', color=colors['success'], alpha=0.8,
+                 edgecolor='black', linewidth=0.8)
+        ax42.bar(x_pos + width/2, uso_presupuesto_gen, width,
+                 label='Generación', color=colors['primary'], alpha=0.8,
+                 edgecolor='black', linewidth=0.8)
+        # REMOVIDO: ax42.axhline(y=100, ...) según solicitud
+        ax42.set_title('KPI 2: Uso de Presupuestos', fontweight='bold',
                        color='black', fontsize=11)
-        ax52.set_ylabel('Uso [%]', fontsize=9, color='black')
-        ax52.set_xlabel('V0 [Hm³]', fontsize=9, color='black')
-        ax52.set_xticks(x_pos[::2])
-        ax52.set_xticklabels([f'{v:.0f}' for v in V0_values[::2]],
-                              rotation=45, ha='right', fontsize=8)
-        ax52.legend(fontsize=8)
-        ax52.grid(True, alpha=0.3, axis='y')
-        
-        # Subplot 2.2: KPI 3 - Déficits de Riego (valores absolutos)
-        ax53 = fig5.add_subplot(gs[1, 1])
-        ax53.plot(V0_values, deficits_1r, 'o-',
-                  color=colors['danger'], linewidth=2, markersize=6,
-                  label='Déficit 1R')
-        ax53.fill_between(V0_values, 0, deficits_1r,
-                          alpha=0.3, color=colors['danger'])
-        ax53.set_title('KPI 3: Déficit Primeros Regantes',
+        ax42.set_ylabel('Uso [%]', fontsize=9, color='black')
+        ax42.set_xlabel('V0 [Hm³]', fontsize=9, color='black')
+        ax42.set_xticks(x_pos)
+        ax42.set_xticklabels([f'{int(v)}' for v in V0_values],
+                             rotation=0, ha='center', fontsize=9)
+        ax42.legend(fontsize=9, loc='upper right', framealpha=0.95)
+        ax42.grid(True, alpha=0.3, axis='y')
+        ax42.set_ylim(0, max(uso_presupuesto_riego.max(),
+                             uso_presupuesto_gen.max()) * 1.15)
+
+        # Subplot 2.2: KPI 3 - Déficit de Riego Consolidado (columnas 3-5)
+        ax43 = fig4.add_subplot(gs[1, 3:6])
+
+        # Graficar déficit de primeros y segundos regantes
+        ax43.plot(V0_values, deficits_1r, linewidth=2.5,
+                  color='#dc2626', label='Déficit 1R (Primeros)',
+                  alpha=0.9)
+        ax43.plot(V0_values, deficits_2r, linewidth=2.5,
+                  color='#f97316', label='Déficit 2R (Segundos)',
+                  alpha=0.9)
+
+        # Área sombreada para déficit total
+        deficit_total = deficits_1r + deficits_2r
+        ax43.fill_between(V0_values, 0, deficit_total,
+                          color='#fecaca', alpha=0.3,
+                          label='Déficit Total')
+
+        ax43.set_title('KPI 3: Déficit de Riego (1R + 2R)',
                        fontweight='bold', color='black', fontsize=11)
-        ax53.set_ylabel('Déficit Promedio [Hm³/mes]', fontsize=9,
+        ax43.set_ylabel('Déficit [% de demanda]', fontsize=9,
                         color='black')
-        ax53.set_xlabel('V0 [Hm³]', fontsize=9, color='black')
-        ax53.grid(True, alpha=0.3)
-        ax53.legend(fontsize=8)
-        
-        # Subplot 2.3: KPI 3 - Déficit como % de demanda
-        ax54 = fig5.add_subplot(gs[1, 2])
-        ax54.plot(V0_values, deficit_pct_1r, 's-',
-                  color=colors['danger'], linewidth=2, markersize=6)
-        ax54.fill_between(V0_values, 0, deficit_pct_1r,
-                          alpha=0.3, color=colors['danger'])
-        ax54.set_title('KPI 3: Déficit como % Demanda',
-                       fontweight='bold', color='black', fontsize=11)
-        ax54.set_ylabel('Déficit [% demanda]', fontsize=9, color='black')
-        ax54.set_xlabel('V0 [Hm³]', fontsize=9, color='black')
-        ax54.grid(True, alpha=0.3)
-        
+        ax43.set_xlabel('V0 [Hm³]', fontsize=9, color='black')
+        ax43.grid(True, alpha=0.3)
+        ax43.legend(fontsize=8, loc='best', framealpha=0.9)
+        ax43.yaxis.set_major_formatter(
+            plt.FuncFormatter(lambda x, p: f'{x:.1f}%')
+        )
+
         # =================================================================
-        # FILA 3: KPI 4 Y MÉTRICAS COMPLEMENTARIAS
+        # FILA 3: KPI 4 Y MÉTRICAS COMPLEMENTARIAS (CENTRADOS)
         # =================================================================
-        
-        # Subplot 3.1: KPI 4 - Factor de Utilización
-        ax55 = fig5.add_subplot(gs[2, 0])
-        ax55.plot(V0_values, factor_utilizacion, 'o-',
+
+        # Subplot 3.1: KPI 4 - Factor de Utilización (columnas 0-1)
+        ax44 = fig4.add_subplot(gs[2, 0:2])
+        ax44.plot(V0_values, factor_utilizacion, 'o-',
                   color=colors['primary'], linewidth=2, markersize=6)
-        ax55.fill_between(V0_values, 0, factor_utilizacion,
+        ax44.fill_between(V0_values, 0, factor_utilizacion,
                           alpha=0.3, color=colors['primary'])
-        ax55.set_title('KPI 4: Factor de Utilización Sistema',
+        ax44.set_title('KPI 4: Factor de Utilización Sistema',
                        fontweight='bold', color='black', fontsize=11)
-        ax55.set_ylabel('Factor Utilización [%]', fontsize=9, color='black')
-        ax55.set_xlabel('V0 [Hm³]', fontsize=9, color='black')
-        ax55.grid(True, alpha=0.3)
-        
-        # Subplot 3.2: Nivel del Lago (métrica complementaria)
-        ax56 = fig5.add_subplot(gs[2, 1])
-        ax56.plot(V0_values, cotas_prom, 'o-',
+        ax44.set_ylabel('Factor Utilización [%]', fontsize=9, color='black')
+        ax44.set_xlabel('V0 [Hm³]', fontsize=9, color='black')
+        ax44.grid(True, alpha=0.3)
+
+        # Subplot 3.2: Nivel del Lago (columnas 2-3, centrado)
+        ax45 = fig4.add_subplot(gs[2, 2:4])
+        ax45.plot(V0_values, cotas_prom, 'o-',
                   color=colors['azul'], linewidth=2, markersize=6)
-        ax56.fill_between(V0_values, cotas_prom.min(), cotas_prom,
+        ax45.fill_between(V0_values, cotas_prom.min(), cotas_prom,
                           alpha=0.3, color=colors['azul'])
-        ax56.set_title('Nivel Promedio del Lago',
+        ax45.set_title('Nivel Promedio del Lago',
                        fontweight='bold', color='black', fontsize=11)
-        ax56.set_ylabel('Cota [msnm]', fontsize=9, color='black')
-        ax56.set_xlabel('V0 [Hm³]', fontsize=9, color='black')
-        ax56.grid(True, alpha=0.3)
-        
-        # Subplot 3.3: Confiabilidad del Sistema
-        ax57 = fig5.add_subplot(gs[2, 2])
-        ax57.plot(V0_values, success_rates, 'o-',
+        ax45.set_ylabel('Cota [msnm]', fontsize=9, color='black')
+        ax45.set_xlabel('V0 [Hm³]', fontsize=9, color='black')
+        ax45.grid(True, alpha=0.3)
+
+        # Subplot 3.3: Confiabilidad del Sistema (columnas 4-5)
+        ax46 = fig4.add_subplot(gs[2, 4:6])
+        ax46.plot(V0_values, success_rates, 'o-',
                   color=colors['success'], linewidth=2, markersize=6)
-        ax57.fill_between(V0_values, 0, success_rates,
+        ax46.fill_between(V0_values, 0, success_rates,
                           alpha=0.3, color=colors['success'])
-        ax57.axhline(y=100, color='green', linestyle='--',
+        ax46.axhline(y=100, color='green', linestyle='--',
                      linewidth=1, alpha=0.5)
-        ax57.set_title('Confiabilidad del Sistema',
+        ax46.set_title('Confiabilidad del Sistema',
                        fontweight='bold', color='black', fontsize=11)
-        ax57.set_ylabel('Tasa de Éxito [%]', fontsize=9, color='black')
-        ax57.set_xlabel('V0 [Hm³]', fontsize=9, color='black')
-        ax57.set_ylim(0, 105)
-        ax57.grid(True, alpha=0.3)
-        
+        ax46.set_ylabel('Tasa de Éxito [%]', fontsize=9, color='black')
+        ax46.set_xlabel('V0 [Hm³]', fontsize=9, color='black')
+        ax46.set_ylim(0, 105)
+        ax46.grid(True, alpha=0.3)
+
         # Título general
-        fig5.suptitle(
+        fig4.suptitle(
             'Panel de los 4 KPIs Estratégicos: '
             'Análisis de Sensibilidad al Volumen Inicial',
             fontsize=15, fontweight='bold', y=0.995, color='black'
@@ -1062,34 +1102,34 @@ def main():
         )
         n_scenarios = get_input(
             "🎲 Escenarios Monte Carlo por V0",
-            default=50,
+            default=100,
             input_type=int
         )
 
         print("\n📏 RANGO DE VOLUMEN INICIAL")
         print("-" * 70)
-        V0_min = get_input("💧 V0 mínimo (Hm³)", default=500, input_type=float)
-        V0_max = get_input("💧 V0 máximo (Hm³)", default=5000, input_type=float)
+        V0_min = get_input("💧 V0 mínimo (Hm³)", default=1000, input_type=float)
+        V0_max = get_input("💧 V0 máximo (Hm³)", default=3586, input_type=float)
 
         print("\n💡 Los puntos se distribuyen uniformemente en el rango.")
         print(
-            "Ejemplo: 5 puntos en [500-5000] → "
-            "[500, 1625, 2750, 3875, 5000]"
+            "Ejemplo: 5 puntos en [1000-3000] → "
+            "[1000, 1500, 2000, 2500, 3000]"
         )
         n_points = get_input(
             "📍 Número de puntos a evaluar",
-            default=10,
+            default=5,
             input_type=int
         )
 
         # Advertencia si el análisis será extenso
         total_simulations = n_points * n_scenarios
-        # ~0.5 seg por simulación
-        estimated_time = total_simulations * 0.5 / 60
+        # ~ 40 seg por simulación
+        estimated_time = total_simulations * 4 / 60
 
-        print(f"\n⚠️ Se ejecutarán {total_simulations} simulaciones totales")
-        print(f"   ({n_points} puntos × {n_scenarios} escenarios)")
-        print(f"⏱️ Tiempo estimado: {estimated_time:.1f} minutos")
+        print(f"\n⚠️  Se ejecutarán {total_simulations} simulaciones totales")
+        print(f"   ({n_points} puntos x {n_scenarios} escenarios)")
+        print(f"⏱️  Tiempo estimado: {estimated_time:.1f} minutos")
         print("\n💭 Esto va a demorar un poco... perfecto para:")
         print("   ☕ Prepararte un café")
         print("   🍕 Pedir una pizza")

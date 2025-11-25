@@ -83,15 +83,15 @@ A_vertimiento = [
     ("Embalse",           "control_FiltracionesLaja"),
     ("control_Abanico",   "control_Antuco"),
     ("control_Antuco",    "control_Riegzaco"),
+    ("control_Rucue",     "control_Quilleco"),
+    ("control_Quilleco",  "control_Tucapel"),
+    ("control_Laja_I",    "SaltosLaja"),
+    ("control_ElDiuto",   "NodoMar"),
     ("control_Riegzaco",  "control_Clajrucue"),
     ("control_Canrucue",  "control_Tucapel"),
     ("control_Clajrucue", "control_Tucapel"),
-    ("control_Rucue",     "control_Quilleco"),
-    ("control_Quilleco",  "control_Tucapel"),
     ("control_Tucapel",   "control_CanalLaja"),
     ("control_CanalLaja", "control_Laja_I"),
-    ("control_Laja_I",    "SaltosLaja"),
-    ("control_ElDiuto",   "NodoMar"),
 ]
 
 # --- Consolidado de arcos + validaciones ---

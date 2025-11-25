@@ -34,8 +34,7 @@ from kpi import (
     extract_kpis,
     aggregate_kpis,
     print_kpis,
-    export_kpis_to_csv,
-    generate_historical_plots
+    export_kpis_to_csv
 )
 
 
@@ -152,11 +151,19 @@ def run_custom_range(
     results = []
     current_V0 = V0
     total_energy = 0
-    total_toro_usage = 0
+    total_extraccion_embalse = 0
+    v0_by_year = {}  # Rastrear V0 de cada año
 
     for i, year in enumerate(years):
-        print(f"\n📅 Procesando año {year} ({i+1}/{years_count})")
-        print(f"💧 V0: {current_V0:,.1f} Hm³")
+        # Formato dinámico para mantener alineado el índice [i/total]
+        idx_width = len(str(years_count))
+        print(
+            f"\n📅 [{i+1:>{idx_width}d}/{years_count}] "
+            f"Año {year} - V0: {current_V0:,.1f} Hm³"
+        )
+
+        # Guardar V0 usado en este año
+        v0_by_year[year] = current_V0
 
         try:
             model = build_model_func(target_year=year, V0=current_V0)
@@ -165,53 +172,63 @@ def run_custom_range(
             if model.status == 2:  # Óptimo
                 # Detectar tipo por variables de generación
                 is_energy_model = hasattr(model, '_G')
-                obj_val = model.objVal
-                
+                obj_val = model.objVal  # Este es MW, no MWh
+
+                # Calcular energía total correcta en MWh
+                energia_mwh = 0
+                if is_energy_model:
+                    horas_mes = 720  # 30 días × 24h
+                    energia_mwh = sum(
+                        model._G[t].x * horas_mes for t in time_periods
+                    )
+                else:
+                    energia_mwh = obj_val  # Para modelo de déficit
+
                 V_vars = model._V
                 final_month = max(time_periods)
                 v_final = V_vars[final_month].x
 
-                # Calcular uso del Toro (verificar si existe _x o usar _y)
-                toro_usage = 0
+                # Calcular extracción específica Embalse -> ElToro
+                agua_extraida = 0
                 if hasattr(model, '_x'):
                     x_vars = model._x
-                    toro_key = ("Embalse", "ElToro")
-                    if any(k[:2] == toro_key for k in x_vars.keys()):
-                        toro_usage = sum(
-                            x_vars["Embalse", "ElToro", t].x
-                            for t in time_periods
-                        ) * conv_factor
-                elif hasattr(model, '_y'):
-                    y_vars = model._y
-                    toro_key = ("Embalse", "ElToro")
-                    if any(k[:2] == toro_key for k in y_vars.keys()):
-                        toro_usage = sum(
-                            y_vars["Embalse", "ElToro", t].x
-                            for t in time_periods
-                        ) * conv_factor
+                    # Específicamente el flujo Embalse -> ElToro
+                    for t in time_periods:
+                        if ("Embalse", "ElToro", t) in x_vars:
+                            flujo_eltoro = x_vars["Embalse", "ElToro", t].x
+                            agua_extraida += flujo_eltoro * conv_factor
 
-                # Reportar según tipo de modelo
+                # Output compacto con espaciado posterior
                 if is_energy_model:
+                    energy_str = f"{energia_mwh:,.0f} MWh"
+                    vf_str = f"{v_final:,.0f} Hm³"
+                    extr_str = f"{agua_extraida:,.1f} Hm³"
+
                     print(
-                        f"✅ Energía: {obj_val:,.1f} MWh | "
-                        f"V_final: {v_final:,.1f} Hm³ | "
-                        f"Uso Toro: {toro_usage:,.1f} Hm³"
+                        f"   ✅ E: {energy_str:<12} | "
+                        f"V_f: {vf_str:<10} | "
+                        f"Extr. Embalse: {extr_str}"
                     )
                 else:
+                    deficit_str = f"{energia_mwh:,.2f} Hm³"
+                    vf_str = f"{v_final:,.0f} Hm³"
+                    extr_str = f"{agua_extraida:,.1f} Hm³"
+
                     print(
-                        f"✅ Déficit: {obj_val:,.2f} Hm³ | "
-                        f"V_final: {v_final:,.1f} Hm³ | "
-                        f"Uso Toro: {toro_usage:,.1f} Hm³"
+                        f"   ✅ D: {deficit_str:<12} | "
+                        f"V_f: {vf_str:<10} | "
+                        f"Extr. Embalse: {extr_str}"
                     )
 
-                total_energy += obj_val
-                total_toro_usage += toro_usage
-                current_V0 = v_final  # Recursivo
+                total_energy += energia_mwh
+                total_extraccion_embalse += agua_extraida
+                # Limitar V0 siguiente a capacidad máxima física
+                current_V0 = min(v_final, 5582.0)  # V_max del modelo
                 results.append({
                     'year': year,
-                    'obj_value': obj_val,
+                    'obj_value': energia_mwh,  # MWh, no MW del objective
                     'v_final': v_final,
-                    'toro_usage': toro_usage,
+                    'agua_extraida': agua_extraida,
                     'status': 'OK',
                     'is_energy': is_energy_model
                 })
@@ -222,7 +239,7 @@ def run_custom_range(
                     'year': year,
                     'obj_value': 0,
                     'v_final': None,
-                    'toro_usage': 0,
+                    'agua_extraida': 0,
                     'status': 'FAIL',
                     'is_energy': False
                 })
@@ -235,7 +252,7 @@ def run_custom_range(
                 'year': year,
                 'obj_value': 0,
                 'v_final': None,
-                'toro_usage': 0,
+                'agua_extraida': 0,
                 'status': 'ERROR',
                 'is_energy': False
             })
@@ -253,27 +270,26 @@ def run_custom_range(
 
     print(f"🎯 Años procesados: {years_count}")
     print(f"✅ Años exitosos: {len(successful)} ({success_rate:.1f}%)")
-    
-    # Detectar tipo de modelo del primer resultado exitoso
+
     is_energy_model = successful[0]['is_energy'] if successful else False
-    
+
     if is_energy_model:
-        print(f"⚡ Energía total: {total_energy:,.1f} MWh")
+        print(f"\n⚡ Energía total: {total_energy:,.0f} MWh")
     else:
-        print(f"🛑 Déficit total acumulado: {total_energy:,.2f} Hm³")
-    
-    print(f"🌊 Uso total El Toro: {total_toro_usage:,.1f} Hm³")
+        print(f"\n🛑 Déficit total: {total_energy:,.2f} Hm³")
+
+    print(f"🌊 Extracción total: {total_extraccion_embalse:,.1f} Hm³")
 
     if successful:
         avg_value = total_energy / len(successful)
-        avg_toro = total_toro_usage / len(successful)
-        
+        avg_extraccion = total_extraccion_embalse / len(successful)
+
         if is_energy_model:
-            print(f"📊 Energía promedio: {avg_value:,.1f} MWh/año")
+            print(f"📊 Energía promedio: {avg_value:,.0f} MWh/año")
         else:
             print(f"📊 Déficit promedio: {avg_value:,.2f} Hm³/año")
-        
-        print(f"📊 Uso promedio El Toro: {avg_toro:,.1f} Hm³/año")
+
+        print(f"📊 Extracción promedio: {avg_extraccion:,.1f} Hm³/año")
 
         # Balance volumétrico
         v_initial = V0
@@ -292,12 +308,15 @@ def run_custom_range(
         for result in successful:
             year = result['year']
             try:
-                model = build_model_func(target_year=year, V0=V0)
+                # Usar V0 que se usó originalmente para este año
+                year_v0 = v0_by_year.get(year, V0)
+                model = build_model_func(target_year=year, V0=year_v0)
                 model.Params.OutputFlag = 0
                 model.optimize()
 
                 if model.status == 2:
                     kpis = extract_kpis(model)
+                    kpis['V0'] = year_v0  # Agregar V0 usado
                     kpis_list.append(kpis)
 
                     # Mostrar KPIs para primer año
@@ -387,7 +406,13 @@ def run_custom_range(
             # Mostrar KPIs agregados en consola
             print("\n📊 KPIs AGREGADOS:")
             try:
-                kpis_agregados = aggregate_kpis(kpis_list)
+                # Extraer V0 de cada año (si está disponible)
+                v0_list = [kpi.get('V0', 0.0) for kpi in kpis_list]
+                kpis_agregados = aggregate_kpis(
+                    kpis_list,
+                    identifiers=[f"Año {y}" for y in years],
+                    v0_values=v0_list
+                )
                 print_kpis(
                     kpis_agregados,
                     context=f"Rango {years[0]}-{years[-1]}"
@@ -399,14 +424,17 @@ def run_custom_range(
     if years_count > 1:
         print("\n📊 DETALLE POR AÑO:")
         print("━" * 80)
-        
+
         # Header adaptativo según tipo de modelo
         if is_energy_model:
             obj_header = "Energía (MWh)"
         else:
             obj_header = "Déficit (Hm³)"
-        
-        print(f"Año   Estado  {obj_header:>14}  V_final (Hm³)  Uso Toro (Hm³)")
+
+        print(
+            f"Año   Estado  {obj_header:>14}  V_final (Hm³)  "
+            "Extr. Embalse (Hm³)"
+        )
         print("━" * 80)
 
         for r in results:
@@ -415,7 +443,7 @@ def run_custom_range(
                 print(
                     f"{r['year']}   {status_icon}    "
                     f"{r['obj_value']:>12,.1f}  {r['v_final']:>13,.1f}  "
-                    f"{r['toro_usage']:>14,.1f}"
+                    f"{r['agua_extraida']:>16,.1f}"
                 )
             else:
                 print(
@@ -470,7 +498,12 @@ def run_all_years(
     )
 
     print("\n🚀 Iniciando simulación completa...")
-    print("=" * 60)
+    print("="*60)
+    print(f"📅 Periodo: {min_year}-{max_year}")
+    print(f"💧 V0: {V0:.1f} Hm³")
+    print(f"🎯 Años totales: {total_years}")
+    print("="*60)
+    print()
 
     start_time = time.time()
     process = psutil.Process()
@@ -478,84 +511,66 @@ def run_all_years(
     results = []
     current_V0 = V0
     total_energy = 0
-    total_toro_usage = 0
+    total_extraccion_embalse = 0
     failed_years = []  # Rastrear años fallidos
 
     for year in range(min_year, max_year + 1):
         year_num = year - min_year + 1
-        print(f"\n📅 Año {year} ({year_num}/{total_years})")
-        print(f"💧 V0: {current_V0:,.1f} Hm³")
 
         try:
             model = build_model_func(target_year=year, V0=current_V0)
+            model.Params.OutputFlag = 0
+            model.Params.LogToConsole = 0
             model.optimize()
 
             if model.status == 2:  # Óptimo
-                # Detectar tipo por variables de generación
                 is_energy_model = hasattr(model, '_G')
-                obj_val = model.objVal
-                
-                V_vars = model._V
-                final_month = max(time_periods)
-                v_final = V_vars[final_month].x
+                obj_val = model.objVal  # Este es MW, no MWh
 
-                toro_usage = 0
-                # Verificar existencia del arco El Toro (_x o _y)
-                if hasattr(model, '_x'):
-                    x_vars = model._x
-                    toro_key = ("Embalse", "ElToro")
-                    if any(k[:2] == toro_key for k in x_vars.keys()):
-                        toro_usage = sum(
-                            x_vars["Embalse", "ElToro", t].x
-                            for t in time_periods
-                        ) * conv_factor
-                elif hasattr(model, '_y'):
-                    y_vars = model._y
-                    toro_key = ("Embalse", "ElToro")
-                    if any(k[:2] == toro_key for k in y_vars.keys()):
-                        toro_usage = sum(
-                            y_vars["Embalse", "ElToro", t].x
-                            for t in time_periods
-                        ) * conv_factor
-
-                # Reportar según tipo de modelo
+                # Calcular energía total correcta en MWh
+                energia_mwh = 0
                 if is_energy_model:
-                    print(
-                        f"✅ E: {obj_val:,.0f} MWh | "
-                        f"V_f: {v_final:,.0f} | "
-                        f"Toro: {toro_usage:,.0f} Hm³"
+                    horas_mes = 720  # 30 días × 24h
+                    energia_mwh = sum(
+                        model._G[t].x * horas_mes for t in time_periods
                     )
                 else:
-                    # Caso base: calcular vertimiento si existe
-                    vertimiento_total = 0.0
-                    if hasattr(model, '_Vertimiento'):
-                        vert_vars = model._Vertimiento
-                        vertimiento_total = sum(
-                            vert_vars[t].x for t in time_periods
-                        )
-                    
-                    if vertimiento_total > 0.01:  # Mostrar si > 10,000 m³
-                        print(
-                            f"✅ D: {obj_val:,.2f} Hm³ | "
-                            f"V_f: {v_final:,.0f} | "
-                            f"Toro: {toro_usage:,.0f} Hm³ "
-                            f"(Vert: {vertimiento_total:,.1f})"
-                        )
-                    else:
-                        print(
-                            f"✅ D: {obj_val:,.2f} Hm³ | "
-                            f"V_f: {v_final:,.0f} | "
-                            f"Toro: {toro_usage:,.0f} Hm³"
-                        )
+                    energia_mwh = obj_val  # Para modelo de déficit
 
-                total_energy += obj_val
-                total_toro_usage += toro_usage
-                current_V0 = v_final
+                V_vars = model._V
+                final_month = time_periods[-1]
+                v_final = V_vars[final_month].x
+
+                # Calcular extracción específica Embalse -> ElToro
+                agua_extraida = 0
+                if hasattr(model, '_x'):
+                    x_vars = model._x
+                    # Específicamente el flujo Embalse -> ElToro
+                    for t in time_periods:
+                        if ("Embalse", "ElToro", t) in x_vars:
+                            flujo_eltoro = x_vars["Embalse", "ElToro", t].x
+                            agua_extraida += flujo_eltoro * conv_factor
+
+                # Output compacto con espaciado posterior
+                idx_width = len(str(total_years))
+                energy_str = f"{energia_mwh:,.0f} MWh"
+                vf_str = f"{v_final:,.0f} Hm³"
+                extr_str = f"{agua_extraida:,.0f} Hm³"
+
+                print(
+                    f"📅 [{year_num:>{idx_width}d}/{total_years}] "
+                    f"Año {year}... ✅ E: {energy_str:<12} | "
+                    f"V_f: {vf_str:<10} | Extr. Embalse: {extr_str}"
+                )
+
+                total_energy += energia_mwh
+                total_extraccion_embalse += agua_extraida
+                current_V0 = min(v_final, 5582.0)
                 results.append({
                     'year': year,
-                    'obj_value': obj_val,
+                    'obj_value': energia_mwh,  # MWh, no MW del objective
                     'v_final': v_final,
-                    'toro_usage': toro_usage,
+                    'agua_extraida': agua_extraida,
                     'status': 'OK',
                     'is_energy': is_energy_model
                 })
@@ -565,9 +580,10 @@ def run_all_years(
                     4: "INF_OR_UNBD",
                     5: "UNBOUNDED"
                 }.get(model.status, f"STATUS_{model.status}")
+                idx_width = len(str(total_years))
                 print(
-                    f"❌ {status_msg} (V0={current_V0:,.0f}) "
-                    f"- reiniciando a 1400 Hm³"
+                    f"📅 [{year_num:>{idx_width}d}/{total_years}] "
+                    f"Año {year}... ❌ {status_msg}"
                 )
                 failed_years.append((year, status_msg, current_V0))
                 current_V0 = 1400.0
@@ -575,7 +591,7 @@ def run_all_years(
                     'year': year,
                     'obj_value': 0,
                     'v_final': None,
-                    'toro_usage': 0,
+                    'agua_extraida': 0,
                     'status': 'FAIL',
                     'is_energy': False
                 })
@@ -583,13 +599,16 @@ def run_all_years(
             model.dispose()
 
         except Exception as e:
-            print(f"❌ Error: {e}")
+            print(
+                f"📅 [{year_num:2d}/{total_years}] Año {year}... "
+                f"❌ Error: {e}"
+            )
             failed_years.append((year, f"ERROR: {e}", current_V0))
             results.append({
                 'year': year,
                 'obj_value': 0,
                 'v_final': None,
-                'toro_usage': 0,
+                'agua_extraida': 0,
                 'status': 'ERROR',
                 'is_energy': False
             })
@@ -600,31 +619,37 @@ def run_all_years(
     print("=" * 60)
 
     successful = [r for r in results if r['status'] == 'OK']
-    success_rate = len(successful) / total_years * 100
+    success_rate = (
+        len(successful) / total_years * 100
+    ) if total_years > 0 else 0
 
-    print(f"🎯 Años procesados: {total_years}")
-    print(f"✅ Años exitosos: {len(successful)} ({success_rate:.1f}%)")
-    
-    # Detectar tipo de modelo
+    print(
+        f"🎯 Años procesados: {total_years} | "
+        f"✅ Exitosos: {len(successful)} ({success_rate:.1f}%)"
+    )
+
     is_energy_model = successful[0]['is_energy'] if successful else False
-    
+
     if is_energy_model:
-        print(f"⚡ Energía total: {total_energy:,.1f} MWh")
+        print("\n⚡ GENERACIÓN ENERGÉTICA:")
+        print(f"   • Total: {total_energy:,.1f} MWh")
     else:
-        print(f"🛑 Déficit total acumulado: {total_energy:,.2f} Hm³")
-    
-    print(f"🌊 Uso total El Toro: {total_toro_usage:,.1f} Hm³")
+        print("\n🛑 DÉFICIT ACUMULADO:")
+        print(f"   • Total: {total_energy:,.2f} Hm³")
+
+    print("\n🌊 EXTRACCIÓN DEL EMBALSE:")
+    print(f"   • Total: {total_extraccion_embalse:,.1f} Hm³")
 
     if successful:
         avg_value = total_energy / len(successful)
-        avg_toro = total_toro_usage / len(successful)
-        
+        avg_extraccion = total_extraccion_embalse / len(successful)
+
         if is_energy_model:
-            print(f"📊 Energía promedio: {avg_value:,.1f} MWh/año")
+            print(f"   • Promedio anual: {avg_value:,.0f} MWh/año")
         else:
-            print(f"📊 Déficit promedio: {avg_value:,.2f} Hm³/año")
-        
-        print(f"📊 Uso promedio El Toro: {avg_toro:,.1f} Hm³/año")
+            print(f"   • Promedio anual: {avg_value:,.2f} Hm³/año")
+
+        print(f"   • Promedio anual: {avg_extraccion:,.1f} Hm³/año")
 
         # Balance volumétrico histórico
         v_initial = V0
@@ -667,11 +692,13 @@ def run_all_years(
 
                 if model.status == 2:
                     kpis = extract_kpis(model)
+                    kpis['V0'] = current_V0_sample  # Agregar V0 usado
                     kpis_historicos.append(kpis)
                     years_exitosos.append(year)  # Registrar año exitoso
 
                     if hasattr(model, '_V'):
-                        final_month = max(time_periods)
+                        # Último mes del período: Noviembre
+                        final_month = time_periods[-1]
                         current_V0_sample = model._V[final_month].x
 
                 model.dispose()
@@ -679,31 +706,14 @@ def run_all_years(
                 current_V0_sample = 1400.0
 
         if kpis_historicos:
-            kpis_agregados = aggregate_kpis(kpis_historicos)
+            # Extraer V0 de cada KPI
+            v0_list = [kpi.get('V0', 0.0) for kpi in kpis_historicos]
+            kpis_agregados = aggregate_kpis(
+                kpis_historicos,
+                identifiers=[f"Año {y}" for y in years_exitosos],
+                v0_values=v0_list
+            )
             print_kpis(kpis_agregados, "Histórico")
-            
-            # Generar gráficos de evolución histórica
-            try:
-                print("\n📊 Generando gráficos de evolución histórica...")
-                
-                # Nombre del gráfico según tipo de modelo
-                if is_energy_model:
-                    plot_name = "evolucion_historica_lago"
-                else:
-                    plot_name = "evolucion_historica_lago_caso_base"
-                
-                # CORRECCIÓN: Usar solo años exitosos
-                plot_files = generate_historical_plots(
-                    kpis_historicos,
-                    years_exitosos,  # Usar lista filtrada
-                    output_dir="resultados",
-                    plot_name=plot_name
-                )
-                print(f"📊 Gráficos generados: {len(plot_files)} archivos PNG")
-                for file_path in plot_files:
-                    print(f"   ✓ {Path(file_path).name}")
-            except Exception as e:
-                print(f"   ⚠️ Error generando gráficos: {e}")
         else:
             print("\n⚠️ No se pudieron calcular KPIs históricos detallados")
 

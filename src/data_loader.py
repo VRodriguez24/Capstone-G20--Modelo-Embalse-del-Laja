@@ -19,7 +19,8 @@ CENTRAL_TO_GEN_ARC: Dict[str, Tuple[str, str]] = {
     "QUILLECO":    ("control_Quilleco", "Quilleco"),
     "LAJA_I":      ("control_Laja_I", "Laja_I"),
     "EL_DIUTO":    ("control_ElDiuto", "ElDiuto"),
-}# Centrales de CONTROL (rendimiento = 0, arcos en conectividad)
+}
+# Centrales de CONTROL (rendimiento = 0, arcos en conectividad)
 # Mapean a arcos de conectividad donde se aplica límite de capacidad
 # Puede ser un solo arco (tuple) o múltiples arcos (list)
 CENTRAL_TO_CONTROL_ARC: Dict[str, any] = {
@@ -61,11 +62,15 @@ def _norm_central_for_inj(name: str) -> str:
 def load_caudalmax(path_csv: str):
     """
     Lee 'data/CaudalMax_filtrado.csv' y arma:
-    - eta[(i,j)] = rendimiento_mwh_m3s  (solo para A_generacion)
-    - cap_max[(i,j)] = caudal_maximo    (para A_generacion y A_control)
+    - eta[(i,j)] = rendimiento en MW/(m³/s) (potencia específica)
+    - cap_max[(i,j)] = caudal_maximo en m³/s
     Retorna (eta, cap_max, potencia_max) para registro.
 
-    Ahora procesa:
+    IMPORTANTE: rendimiento_mwh_m3s en CSV representa MW/(m³/s), NO MWh/(m³/s)
+    Verificación: rendimiento × caudal_maximo = potencia_maxima
+    Ejemplo: El Toro: 4.8 × 91.1 = 437.27 MW ✓
+
+    Procesa:
     - Centrales generadoras (rendimiento > 0) → A_generacion
     - Centrales de control (rendimiento = 0) → A_conectividad
     """

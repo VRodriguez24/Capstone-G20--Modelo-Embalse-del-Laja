@@ -24,7 +24,9 @@ from typing import Dict, Tuple, List, Optional
 # Importaciones del modelo
 from data_loader import CENTRAL_TO_INJ_ARC
 from embalse import A_inyeccion
-from model import build_model_for_one_year, T, Conv, V_max
+from model import (
+    build_model_for_one_year, T, Conv, V_max
+)
 from kpi import extract_kpis
 
 # Detección automática de rutas de datos
@@ -264,7 +266,22 @@ class HybridSimulator:
             print(f"🧩 Bloques: {block_len} meses")
             print("🎛️  Bootstrap puro - sin ruido estocástico")
             print("=" * 60)
-            print("\n🔄 Procesando escenarios...")
+            print()
+
+            # Crear modelo dummy para forzar warnings de Gurobi ANTES
+            try:
+                dummy_flows = self.sampler.sample_year(block_len)
+                dummy_model = build_model_for_one_year(
+                    target_year=start_year,
+                    V0=V0,
+                    I_arc_override=dummy_flows
+                )
+                dummy_model.Params.OutputFlag = 0
+                dummy_model.dispose()
+            except Exception:
+                pass  # Ignorar errores del modelo dummy
+
+            print("🔄 Procesando escenarios...")
 
         successful_scenarios = []
         failed_scenarios = []
@@ -315,11 +332,16 @@ class HybridSimulator:
                 })
 
             except Exception as e:
-                # Suprimir errores individuales durante simulación
-                pass
+                # Mostrar información detallada del error
+                error_msg = str(e)
+                print(
+                    f"\n   └─ ⚠️ Escenario {scenario_id + 1} falló: "
+                    f"{error_msg}"
+                )
+
                 failed_scenarios.append({
                     "scenario_id": scenario_id + 1,
-                    "error": str(e)
+                    "error": error_msg
                 })
 
         total_scenarios = len(successful_scenarios) + len(failed_scenarios)
@@ -353,7 +375,7 @@ class HybridSimulator:
         Replica la lógica del modelo determinista con caudales Monte Carlo.
         """
         results = []
-        current_V0 = V0
+        current_V0 = V0  # Inicializar con V0 original del escenario
 
         for year in sorted(multiyear_flows.keys()):
             year_flows = multiyear_flows[year]
@@ -384,64 +406,132 @@ class HybridSimulator:
                     if model.status == 3:  # Ahora sabemos que es INFEASIBLE
                         # Computar IIS para diagnóstico
                         model.computeIIS()
+                        print(
+                            f"\n   └─ ⚠️ Año {year}: "
+                            f"V0={current_V0:.1f} Hm³ - Modelo infactible"
+                        )
                         raise Exception(
                             f"Modelo infactible en año {year}. "
                             f"V0={current_V0:.1f} Hm³"
                         )
                     else:
+                        print(
+                            f"\n   └─ ⚠️ Año {year}: "
+                            f"V0={current_V0:.1f} Hm³ - Modelo no acotado"
+                        )
                         raise Exception(
                             f"Modelo no acotado en año {year}. "
-                            f"Status={model.status}"
+                            f"Status={model.status}, V0={current_V0:.1f} Hm³"
                         )
 
                 elif model.status == 3:  # Directamente infactible
+                    print(
+                        f"\n   └─ ⚠️ Año {year}: "
+                        f"V0={current_V0:.1f} Hm³ - Modelo infactible"
+                    )
                     raise Exception(
                         f"Modelo infactible en año {year}. "
                         f"V0={current_V0:.1f} Hm³"
                     )
 
                 elif model.status == 2:  # Óptimo
-                    energy = model.objVal
+                    # CORRECCIÓN: Convertir objective (MW) a energía (MWh)
+                    # como en ui_model.py y kpi.py
+                    energia_mwh = sum(model._G[t].x * 720 for t in T)
+                    energy = energia_mwh  # Ahora en MWh, no MW
                     V_vars = model._V
                     final_month = max(T)  # Noviembre (mes 11)
                     v_final = V_vars[final_month].x
 
-                    # Calcular uso del Toro (agua de déficit)
-                    x_vars = model._x
-                    toro_usage = sum(
-                        x_vars["Embalse", "ElToro", t].x
-                        for t in T
-                    ) * Conv  # Convertir a Hm³
+                    # Calcular extracción total desde El Toro
+                    # (consistente con modelo actual)
+                    eltoro_key_exists = (
+                        hasattr(model, '_x') and
+                        any((i, j) == ("Embalse", "ElToro")
+                            for (i, j, t) in model._x.keys())
+                    )
+                    if eltoro_key_exists:
+                        x_vars = model._x
+                        toro_usage = sum(
+                            x_vars["Embalse", "ElToro", t].x
+                            for t in T
+                        ) * Conv  # Convertir a Hm³
+                    else:
+                        toro_usage = 0.0
+
+                    # Calcular agua para riego (déficits cubiertos)
+                    agua_riego = 0.0
+                    if hasattr(model, '_Def1') and hasattr(model, '_Def2'):
+                        agua_riego = sum(
+                            model._Def1[t].x + model._Def2[t].x
+                            for t in T
+                        )  # Ya en Hm³
+
+                    # Agua para generación (excedente post-riego)
+                    agua_generacion = max(0.0, toro_usage - agua_riego)
 
                     # Extraer KPIs del modelo
                     kpis = extract_kpis(model)
+                    # Agregar V0 usado en este año
+                    kpis['V0'] = current_V0
 
                     results.append({
                         "year": year,
                         "energy": energy,
                         "v_final": v_final,
                         "toro_usage": toro_usage,
+                        "agua_riego": agua_riego,
+                        "agua_generacion": agua_generacion,
                         "kpis": kpis,  # Agregar KPIs
                         "status": "OK"
                     })
 
                     # CONTINUIDAD: V0 del próximo año = V_final de este año
-                    # CORRECCIÓN: Limitar V0 a V_max (capacidad física)
-                    current_V0 = min(v_final, V_max)
+                    # CORRECCIÓN: Limitar V0 a V_max y evitar valores extremos
+                    next_V0 = min(v_final, V_max)
+
+                    # Protección contra volúmenes extremos
+                    if next_V0 < 50.0:  # Embalse prácticamente vacío
+                        print(
+                            f"\n   └─ ⚠️ Año {year}: "
+                            f"Reset emergencia V0={next_V0:.1f} → 100.0 Hm³"
+                        )
+                        next_V0 = 100.0  # Mínimo operativo
+
+                    current_V0 = next_V0
 
                     if verbose:
-                        print(f"      ✅ E: {energy:.1f} MWh, "
-                              f"V_f: {v_final:.1f} Hm³, "
-                              f"Toro: {toro_usage:.1f} Hm³")
+                        # Formato compacto con alineación posterior
+                        energy_str = f"{energy:,.1f} MWh"
+                        vf_str = f"{v_final:,.1f} Hm³"
+                        toro_str = f"{toro_usage:,.1f} Hm³"
+
+                        print(
+                            f"      ✅ E: {energy_str:<12} | "
+                            f"V_f: {vf_str:<10} | "
+                            f"Extr. Embalse: {toro_str}"
+                        )
                 else:
+                    print(
+                        f"\n   └─ ⚠️ Año {year}: "
+                        f"V0={current_V0:.1f} Hm³ - "
+                        f"Status inesperado: {model.status}"
+                    )
                     raise Exception(
-                        f"Modelo con status inesperado: {model.status}"
+                        f"Modelo con status inesperado: {model.status} "
+                        f"en año {year}, V0={current_V0:.1f} Hm³"
                     )
 
                 model.dispose()
 
             except Exception as e:
-                raise Exception(f"Error en año {year}: {e}")
+                print(
+                    f"\n   └─ ⚠️ Año {year}: "
+                    f"V0={current_V0:.1f} Hm³ - {str(e)}"
+                )
+                raise Exception(
+                    f"Error en año {year} (V0={current_V0:.1f}): {e}"
+                )
 
         return results
 

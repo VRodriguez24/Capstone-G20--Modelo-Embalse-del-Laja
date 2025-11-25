@@ -349,11 +349,14 @@ def add_pwl_filtration_constraints(
     }
     seg_ids = list(numeric_segments.keys())
 
-    # Igualar arco de filtración con variable
+    # CAMBIO CRÍTICO: Permitir que el flujo real pueda SUPERAR el PWL base
+    # En modo normal: y >= Filtr (flujo mínimo determinado por PWL)
+    # En emergencia: y puede aumentar libremente (controlado por R3d)
+    # Esto permite vertimientos adicionales cuando V >= 90%
     for t in time_periods:
         model.addConstr(
-            model._y[f_i, f_j, t] == Filtr_vars[t],
-            name=f"R5a_filtr_arc_{t}"
+            model._y[f_i, f_j, t] >= Filtr_vars[t],
+            name=f"R5a_filtr_arc_lb_{t}"
         )
 
     # Variables binarias δ_{k,t} para selección de segmento

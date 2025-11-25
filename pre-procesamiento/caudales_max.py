@@ -77,10 +77,10 @@ def run():
     df_filtered = df[df["rendimiento_mwh_m3s"] != 1].copy()
 
     # Centrales con rendimiento = 1 que queremos incluir
-    # Excluir: RieTucapel (no la queremos)
+    # Excluir: RieTucapel y RieSaltos (no la queremos)
     centrales_incluir = [
         "RIEGZACO", "CANECOL", "CANRUCUE", "CLAJRUCUE",
-        "TUCAPEL", "CANAL_LAJA", "RIESALTOS"
+        "TUCAPEL", "CANAL_LAJA",
     ]
 
     # Filtrar centrales de control (rendimiento = 1)
@@ -88,11 +88,6 @@ def run():
     df_control = df_control[
         df_control["central"].str.upper().isin(centrales_incluir)
     ].copy()
-
-    # Renombrar RieSaltos → SALTOS
-    df_control["central"] = df_control["central"].str.replace(
-        "RieSaltos", "SALTOS", case=False, regex=False
-    )
 
     # Para las centrales de control: rendimiento = 0, potencia = 0
     # Solo conservan su caudal_maximo como límite de capacidad

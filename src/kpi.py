@@ -1,860 +1,997 @@
 """
-Módulo de KPIs para el Embalse del Laja
-=======================================
+KPIs - Embalse del Laja
+========================
 
-Implementa 4 KPIs estratégicos para evaluar la operación del Embalse del Laja.
+Extracción de KPIs usando directamente las variables y lógica del
+modelo de optimización.
 
-📊 KPIs ESTRATÉGICOS:
-
-1. TIEMPO EN COLCHONES OPERATIVOS (%)
-   - Distribución temporal por rangos de volumen
-   - Rangos: Inferior, Transición, Intermedio, Superior
-
-2. USO DE PRESUPUESTOS RIEGO/GENERACIÓN (%)
-   - Eficiencia en asignación de recursos hídricos
-   - (Uso_real / Presupuesto_asignado) x 100
-
-3. DÉFICITS DE RIEGO (Hm³ y %)
-   - Déficit consolidado primeros regantes (min{Tucapel, Abanico})
-   - Déficit segundos regantes
-   - Demanda 1R extraída directamente del modelo (RHS restricciones balance)
-   - Métricas: máximo, promedio, total anual, % demanda
-
-4. FACTOR DE UTILIZACIÓN (%)
-   - Eficiencia hidráulica ponderada por capacidad instalada
-   - Σ(FU_central x Cap_central) / Σ(Cap_central)
-
-📈 FUNCIONES:
-- extract_kpis(model): Extrae KPIs de modelo optimizado
-- aggregate_kpis(kpis_list): Agrega KPIs multi-año/Monte Carlo
-- print_kpis(kpis, context): Formato legible console
-- export_kpis_to_csv(kpis, output_dir, year): Solo muestra en consola
+KPIs Implementados:
+1. Tiempo en colchones operativos (%)
+2. Uso de presupuestos riego/generación (%)
+3. Déficits de riego (Hm³ y %)
+4. Factor de utilización del sistema (%)
 """
 
-from typing import Dict, List, Any, Optional, Tuple
+from typing import Dict, List, Any, Optional
 import numpy as np
 
-# Importar conversión volumen→cota
 from filt_cota import cota_from_volumen
 
 
-# ============================================================================
-# EXTRACCIÓN DE KPIs INDIVIDUALES
-# ============================================================================
+# Constantes del modelo (importadas localmente para evitar imports globales)
+def _get_model_constants():
+    """Importa constantes del modelo de forma controlada."""
+    from model import T, Conv, COLCHONES, C_LABELS, V_max
+    return T, Conv, COLCHONES, C_LABELS, V_max
+
+
+# ===================================================================
+# EXTRACCIÓN PRINCIPAL DE KPIS
+# ===================================================================
 
 def extract_kpis(model, include_detailed: bool = True) -> Dict[str, Any]:
     """
-    Extrae KPIs estratégicos de un modelo optimizado.
+    Extrae KPIs del modelo optimizado usando sus variables directamente.
 
     Args:
-        model: Modelo Gurobi optimizado con variables del embalse
-        include_detailed: Incluir métricas detalladas (compatibilidad)
-
-    Returns:
-        Dict con estructura:
-            - status: Estado optimización (2=óptimo)
-            - obj_MWh: Energía total generada
-            - V_end: Volumen final (Hm³)
-            - tiempo_colchones_%: % tiempo por colchón
-            - uso_presupuestos_%: % uso riego/generación
-            - deficit_max_hm3: Déficit máximo 1R/2R
-            - deficit_prom_hm3: Déficit promedio mensual 1R/2R
-            - deficit_sum_hm3: Déficit total anual 1R/2R
-            - deficit_pct: Déficit como % demanda 1R/2R
-            - factor_utilizacion_%: Factor utilización sistema
-            - cota_mensual: Cotas por mes (msnm)
-            - volumenes_mensuales: Volúmenes por mes (Hm³)
-    """
-    # Validación básica
-    if not hasattr(model, 'status'):
-        return _empty_kpis()
-
-    # KPIs básicos
-    basic_kpis = {
-        'status': model.status,
-        'obj_MWh': model.objVal if hasattr(model, 'objVal') else None,
-        'V_end': None
-    }
-
-    # Extraer volumen final
-    if hasattr(model, '_V'):
-        from model import T
-        final_month = max(T)
-        basic_kpis['V_end'] = model._V[final_month].x
-
-    # Si no es óptimo, retornar solo básicos
-    if model.status != 2:
-        basic_kpis.update(_empty_kpis())
-        return basic_kpis
-
-    # Calcular KPIs estratégicos completos
-    strategic_kpis = _calculate_strategic_kpis(model)
-    basic_kpis.update(strategic_kpis)
-
-    return basic_kpis
-
-
-def _empty_kpis() -> Dict[str, Any]:
-    """Retorna estructura vacía de KPIs para casos no óptimos."""
-    return {
-        'tiempo_colchones_%': {},
-        'uso_presupuestos_%': {'riego': 0.0, 'generacion': 0.0},
-        'deficit_max_hm3': {'1R': 0.0, '2R': 0.0},
-        'deficit_prom_hm3': {'1R': 0.0, '2R': 0.0},
-        'deficit_sum_hm3': {'1R': 0.0, '2R': 0.0},
-        'deficit_pct': {'1R': 0.0, '2R': 0.0},
-        'factor_utilizacion_%': {'sistema': 0.0},
-        'cota_mensual': {},
-        'volumenes_mensuales': {}
-    }
-
-
-def _calculate_strategic_kpis(model) -> Dict[str, Any]:
-    """
-    Calcula los 4 KPIs estratégicos del modelo optimizado.
-
-    KPI 3 - Extracción exacta de demandas desde metadata del modelo:
-    - Demandas almacenadas en model._meta['demandas_mensuales']
-    - Garantiza coincidencia exacta con restricciones del modelo
-    - Demanda total 1R = Demanda_Tucapel + Demanda_Abanico
-    - Def1 = min{DefTu, DefAb} (déficit consolidado que El Toro compensa)
-    - % Déficit = (Def1_total / Demanda_total_1R) × 100
-
-    Args:
-        model: Modelo optimizado (status=2)
+        model: Modelo Gurobi optimizado
+        include_detailed: Incluir series mensuales (compatibilidad)
 
     Returns:
         Dict con KPIs calculados
     """
-    from model import T, Conv, COLCHONES, C_LABELS
+    # Validación básica
+    if not hasattr(model, 'status') or model.status != 2:
+        return _empty_kpis()
 
-    # ========================================================================
-    # PASO 1: Extraer datos base del modelo
-    # ========================================================================
+    T, Conv, COLCHONES, C_LABELS, _ = _get_model_constants()
 
-    volumenes_mensuales = {}
-    cota_mensual = {}
+    # KPIs básicos
+    kpis = {
+        'status': 2,
+        'obj_MWh': model.objVal,
+        'V_end': model._V[11].x  # Volumen final (noviembre)
+    }
 
-    for t in T:
-        volumen_hm3 = model._V[t].x
-        volumenes_mensuales[t] = volumen_hm3
-        cota_mensual[t] = cota_from_volumen(volumen_hm3)
+    # KPI 1: Tiempo en colchones (basado en volúmenes)
+    kpis['tiempo_colchones_%'] = _calc_tiempo_colchones(
+        model, T, COLCHONES, C_LABELS
+    )
 
-    # ========================================================================
-    # KPI 1: TIEMPO EN COLCHONES
-    # ========================================================================
+    # KPI 2: Uso de presupuestos (extrae directamente del modelo)
+    kpis['uso_presupuestos_%'] = _calc_uso_presupuestos(
+        model, T, Conv, C_LABELS, COLCHONES
+    )
 
-    tiempo_colchones = {c: 0 for c in C_LABELS}
+    # KPI 3: Déficits (usa variables Def1 y Def2 del modelo)
+    deficit_kpis = _calc_deficits(model, T, Conv)
+    kpis.update(deficit_kpis)
 
-    for t in T:
-        volumen = volumenes_mensuales[t]
-        for c in C_LABELS:
-            lo = COLCHONES[c]["lo"]
-            hi = COLCHONES[c]["hi"]
-            eps = 1e-3 if c != "Inferior" else 0.0
-            if lo + eps <= volumen <= hi:
+    # KPI 4: Factor de utilización (usa G[t] del modelo, solo si existe)
+    if hasattr(model, '_G'):
+        kpis['factor_utilizacion_%'] = _calc_factor_utilizacion(model, T)
+        # Generación energética total anual (MWh): G[t] en MW → MWh
+        horas_mes = 720  # 30 días × 24h
+        kpis['generacion_total'] = sum(
+            model._G[t].x * horas_mes for t in T
+        )
+    else:
+        kpis['factor_utilizacion_%'] = {'sistema': 0.0}
+        kpis['generacion_total'] = 0.0
+
+    # Agua total extraída por El Toro (Hm³)
+    # Interpretación: Flujo_Total = Riego + Generación_Agua
+    kpis['agua_eltoro_total'] = sum(
+        model._x['Embalse', 'ElToro', t].x * Conv for t in T
+    )
+
+    # Agua del lago usada para RIEGO (cubrir déficits)
+    if hasattr(model, '_Def2'):
+        kpis['agua_riego_hm3'] = (
+            sum(model._Def1[t].x for t in T) +
+            sum(model._Def2[t].x for t in T)
+        )
+    else:
+        kpis['agua_riego_hm3'] = sum(model._Def1[t].x for t in T)
+
+    # Agua EXCEDENTE del lago usada para GENERACIÓN (después de riego)
+    kpis['agua_generacion_hm3'] = (
+        kpis['agua_eltoro_total'] - kpis['agua_riego_hm3']
+    )
+
+    # Series mensuales
+    kpis['volumenes_mensuales'] = {t: model._V[t].x for t in T}
+    kpis['cota_mensual'] = {
+        t: cota_from_volumen(model._V[t].x) for t in T
+    }
+
+    return kpis
+
+
+def _empty_kpis() -> Dict[str, Any]:
+    """KPIs vacíos para modelos no óptimos."""
+    return {
+        'status': -1,
+        'obj_MWh': 0.0,
+        'V_end': 0.0,
+        'tiempo_colchones_%': {},
+        'uso_presupuestos_%': {'riego': '0.0%', 'generacion': '0.0%'},
+        'deficit_sum_hm3': {'1R': 0.0, '2R': 0.0},
+        'deficit_prom_hm3': {'1R': 0.0, '2R': 0.0},
+        'deficit_max_hm3': {'1R': 0.0, '2R': 0.0},
+        'deficit_pct': {'1R': 0.0, '2R': 0.0},
+        'factor_utilizacion_%': {'sistema': 0.0},
+        'volumenes_mensuales': {},
+        'cota_mensual': {}
+    }
+
+
+# ===================================================================
+# KPI 1: TIEMPO EN COLCHONES
+# ===================================================================
+
+def _calc_tiempo_colchones(
+    model,
+    time_periods: List[int],
+    colchones_def: Dict,
+    colchon_labels: List[str]
+) -> Dict[str, float]:
+    """
+    Calcula distribución de tiempo en colchones desde volúmenes.
+
+    Usa directamente V[t] del modelo y rangos de COLCHONES.
+    """
+    if not hasattr(model, '_V') or not colchon_labels:
+        return {c: 0.0 for c in ['Inferior', 'Transicion',
+                                 'Intermedio', 'Superior']}
+
+    tiempo_colchones = {c: 0 for c in colchon_labels}
+
+    for t in time_periods:
+        volumen = model._V[t].x
+        for c in colchon_labels:
+            v_min = colchones_def[c]["lo"]
+            v_max = colchones_def[c]["hi"]
+            if v_min <= volumen < v_max:
                 tiempo_colchones[c] += 1
                 break
 
-    tiempo_colchones_pct = {
-        c: (count / len(T)) * 100.0
+    return {
+        c: (count / len(time_periods)) * 100.0
         for c, count in tiempo_colchones.items()
     }
 
-    # ========================================================================
-    # KPI 2: USO DE PRESUPUESTOS
-    # ========================================================================
-    # CÁLCULO BASADO EN RESTRICCIONES R7e y R7f DEL MODELO:
-    # - Budget: Según colchón activo (R7), valor fijo o % de V_inicial
-    # - Uso riego: Σ(Def1 + Def2) para todo t (cobertura desde El Toro)
-    # - Uso generación: Total El Toro - Uso riego
-    # - Fórmula: (Uso / Budget) × 100
 
-    # 1. Identificar colchón activo y calcular presupuestos
-    budget_riego = 0.0
-    budget_gen = 0.0
-    v_inicial = model.getVarByName("Vinit")
-    v_init_val = v_inicial.x if v_inicial else 1400.0
+# ===================================================================
+# KPI 2: USO DE PRESUPUESTOS
+# ===================================================================
 
-    for c in C_LABELS:
-        z_var = model.getVarByName(f"z[{c}]")
-        if z_var and z_var.x > 0.5:
-            r_share, g_share, _ = COLCHONES[c]["shares"]
-
-            # Budget riego
-            if r_share > 1.0:
-                budget_riego = r_share
-            else:
-                budget_riego = r_share * v_init_val
-
-            # Budget generación (con cap de 1200 Hm³ si Superior)
-            if g_share > 1.0:
-                budget_gen = g_share
-            else:
-                budget_gen = g_share * v_init_val
-
-            if c == "Superior":
-                budget_gen = min(budget_gen, 1200.0)
-
-            break
-
-    # 2. Calcular uso real desde variables del modelo
-    # Uso RIEGO: Σ(Def1 + Def2) - cobertura de déficits desde El Toro
-    uso_riego_hm3 = 0.0
-    for t in T:
-        try:
-            def1 = model.getVarByName(f"Deficit1erosRegantes[{t}]")
-            def2 = model.getVarByName(f"Deficit2dosRegantes[{t}]")
-            if def1 and def2:
-                uso_riego_hm3 += def1.x + def2.x
-        except Exception:
-            pass
-
-    # Uso GENERACIÓN: Total El Toro - Uso riego (compatibilidad _x o _y)
-    uso_toro_total = 0.0
-    if hasattr(model, '_x'):
-        for t in T:
-            x_var = model._x.get(("Embalse", "ElToro", t))
-            if x_var:
-                uso_toro_total += x_var.x * Conv
-    elif hasattr(model, '_y'):
-        for t in T:
-            y_var = model._y.get(("Embalse", "ElToro", t))
-            if y_var:
-                uso_toro_total += y_var.x * Conv
-
-    # CORRECCIÓN: Detectar si es modelo con generación
-    # Solo calcular uso_gen si existe variable _G (modelo con generación)
-    if hasattr(model, '_G'):
-        uso_gen_hm3 = uso_toro_total - uso_riego_hm3
-    else:
-        # Caso base: todo el agua de El Toro va a riego, no hay generación
-        uso_gen_hm3 = 0.0
-        uso_riego_hm3 = uso_toro_total  # Corregir: todo es para riego
-
-    # 3. Calcular porcentajes
-    if budget_riego > 0:
-        uso_riego_pct = (uso_riego_hm3 / budget_riego) * 100.0
-    else:
-        uso_riego_pct = 0.0
-
-    if budget_gen > 0:
-        uso_gen_pct = (uso_gen_hm3 / budget_gen) * 100.0
-    else:
-        uso_gen_pct = 0.0
-
-    uso_presupuestos_pct = {
-        "riego": uso_riego_pct,
-        "generacion": uso_gen_pct
-    }
-
-    # ========================================================================
-    # KPI 3: DÉFICITS DE RIEGO
-    # ========================================================================
-    # CORRECCIÓN CRÍTICA: Usar Def1 (consolidado) en lugar de DefTu + DefAb
-
-    deficit_mensual_1R = {}  # Déficit consolidado primeros regantes
-    deficit_mensual_2R = {}  # Déficit segundos regantes
-    demanda_1R_mensual = {}  # Demanda base primeros (Tucapel como referencia)
-    demanda_2R_mensual = {}  # Demanda segundos
-
-    for t in T:
-        # ====================================================================
-        # EXTRACCIÓN EXACTA DESDE METADATA DEL MODELO
-        # ====================================================================
-        # Las demandas se calculan en model.py y se almacenan en _meta
-        # Esto garantiza que usamos exactamente los mismos valores que
-        # el modelo utilizó en las restricciones de balance
-
-        demandas = model._meta.get('demandas_mensuales', {})
-        dem_tucapel = demandas.get('tucapel', {}).get(t, 0.0)
-        dem_abanico = demandas.get('abanico', {}).get(t, 0.0)
-        dem_2r = demandas.get('segundos', {}).get(t, 0.0)
-
-        # Demanda TOTAL primeros regantes = Tucapel + Abanico
-        # (ambas demandas independientes según restricciones R6.1a y R6.1b)
-        dem_1r = dem_tucapel + dem_abanico
-
-        demanda_1R_mensual[t] = dem_1r
-        demanda_2R_mensual[t] = dem_2r
-
-        # ====================================================================
-        # DÉFICITS: Extraer valores de variables del modelo
-        # ====================================================================
-        def_1r = 0.0
-        def_2r = 0.0
-
-        try:
-            # Def1 = min{DefTu, DefAb} - variable consolidada del modelo
-            v = model.getVarByName(f"Deficit1erosRegantes[{t}]")
-            if v:
-                def_1r = v.x
-        except Exception:
-            pass
-
-        try:
-            # Def2 = déficit segundos regantes - variable directa del modelo
-            v = model.getVarByName(f"Deficit2dosRegantes[{t}]")
-            if v:
-                def_2r = v.x
-        except Exception:
-            pass
-
-        deficit_mensual_1R[t] = def_1r
-        deficit_mensual_2R[t] = def_2r
-
-    # Métricas agregadas
-    def1_values = list(deficit_mensual_1R.values())
-    def2_values = list(deficit_mensual_2R.values())
-
-    def1_sum = float(np.sum(def1_values)) if def1_values else 0.0
-    def2_sum = float(np.sum(def2_values)) if def2_values else 0.0
-    def1_prom = float(np.mean(def1_values)) if def1_values else 0.0
-    def2_prom = float(np.mean(def2_values)) if def2_values else 0.0
-    def1_max = float(np.max(def1_values)) if def1_values else 0.0
-    def2_max = float(np.max(def2_values)) if def2_values else 0.0
-
-    # Demandas totales anuales
-    demanda_1R_tot = float(np.sum(list(demanda_1R_mensual.values())))
-    demanda_2R_tot = float(np.sum(list(demanda_2R_mensual.values())))
-
-    # Porcentajes de déficit respecto demanda
-    if demanda_1R_tot > 0:
-        pct_def1 = def1_sum / demanda_1R_tot * 100.0
-    else:
-        pct_def1 = 0.0
-
-    if demanda_2R_tot > 0:
-        pct_def2 = def2_sum / demanda_2R_tot * 100.0
-    else:
-        pct_def2 = 0.0
-
-    # ========================================================================
-    # KPI 4: FACTOR DE UTILIZACIÓN
-    # ========================================================================
-
-    factor_utilizacion = _calculate_utilization_factor(model, T)
-
-    # ========================================================================
-    # RETORNAR KPIS COMPLETOS
-    # ========================================================================
-
-    return {
-        'tiempo_colchones_%': tiempo_colchones_pct,
-        'uso_presupuestos_%': uso_presupuestos_pct,
-        'deficit_max_hm3': {'1R': def1_max, '2R': def2_max},
-        'deficit_prom_hm3': {'1R': def1_prom, '2R': def2_prom},
-        'deficit_sum_hm3': {'1R': def1_sum, '2R': def2_sum},
-        'deficit_pct': {'1R': pct_def1, '2R': pct_def2},
-        'deficit_mensual_1R': deficit_mensual_1R,
-        'deficit_mensual_2R': deficit_mensual_2R,
-        'demanda_1R_tot': demanda_1R_tot,
-        'demanda_2R_tot': demanda_2R_tot,
-        'factor_utilizacion_%': factor_utilizacion,
-        'cota_mensual': cota_mensual,
-        'volumenes_mensuales': volumenes_mensuales
-    }
-
-
-# ============================================================================
-# FUNCIONES AUXILIARES DE CÁLCULO
-# ============================================================================
-
-def _calculate_water_usage(
-        model, T: List[int], Conv: float) -> Tuple[float, float]:
+def _calc_uso_presupuestos(
+    model,
+    time_periods: List[int],
+    conv_factor: float,
+    colchon_labels: List[str],
+    colchones_def: Dict
+) -> Dict[str, Any]:
     """
-    Calcula uso real de agua para riego y generación (Hm³).
-    
-    CORRECCIÓN: Detecta automáticamente si es modelo con generación.
-    - Modelo con generación (_G): Calcula riego y generación separado
-    - Caso base (sin _G): Todo el agua de El Toro es para riego
-    """
-    uso_riego_hm3 = 0.0
-    uso_gen_hm3 = 0.0
+    Calcula uso de presupuestos como porcentajes y diferencias absolutas.
 
-    # Detectar tipo de modelo
-    is_energy_model = hasattr(model, '_G')
-
-    if is_energy_model:
-        # Modelo con generación: importar A_generacion
-        try:
-            from model import A_generacion
-            
-            # GENERACIÓN: Agua usada en centrales hidroeléctricas
-            if hasattr(model, '_x'):
-                for (i, j) in A_generacion:
-                    try:
-                        for t in T:
-                            if (i, j, t) in model._x:
-                                uso_gen_hm3 += model._x[i, j, t].x * Conv
-                    except Exception:
-                        pass
-            elif hasattr(model, '_y'):
-                for (i, j) in A_generacion:
-                    try:
-                        for t in T:
-                            if (i, j, t) in model._y:
-                                uso_gen_hm3 += model._y[i, j, t].x * Conv
-                    except Exception:
-                        pass
-        except ImportError:
-            pass  # Si no existe A_generacion, no hay generación
-
-        # RIEGO: Extracción total desde El Toro menos generación
-        try:
-            total_toro = 0.0
-            for t in T:
-                toro_key = ("Embalse", "ElToro", t)
-                if hasattr(model, '_x') and toro_key in model._x:
-                    total_toro += model._x[toro_key].x * Conv
-                elif hasattr(model, '_y') and toro_key in model._y:
-                    total_toro += model._y[toro_key].x * Conv
-            
-            uso_riego_hm3 = max(0.0, total_toro - uso_gen_hm3)
-        except Exception:
-            pass
-    else:
-        # Caso base: TODO el agua de El Toro es para riego
-        try:
-            for t in T:
-                toro_key = ("Embalse", "ElToro", t)
-                if hasattr(model, '_y') and toro_key in model._y:
-                    uso_riego_hm3 += model._y[toro_key].x * Conv
-        except Exception:
-            pass
-
-    return uso_riego_hm3, uso_gen_hm3
-
-
-def _calculate_budgets(
-        model, C_LABELS: List[str],
-        COLCHONES: Dict) -> Tuple[float, float]:
-    """Calcula presupuestos de riego y generación según colchón activo."""
-    v_inicial = model.getVarByName("Vinit")
-    v_init_val = v_inicial.x if v_inicial else 1400.0
-
-    presupuesto_riego = 0.0
-    presupuesto_gen = 0.0
-
-    # Identificar colchón activo (z[c]=1)
-    for c in C_LABELS:
-        z_var = model.getVarByName(f"z[{c}]")
-        if z_var and z_var.x > 0.5:
-            r_share, g_share, _ = COLCHONES[c]["shares"]
-            if r_share > 1.0:
-                presupuesto_riego = r_share
-            else:
-                presupuesto_riego = r_share * v_init_val
-
-            if g_share > 1.0:
-                presupuesto_gen = g_share
-            else:
-                presupuesto_gen = g_share * v_init_val
-            break
-
-    return presupuesto_riego, presupuesto_gen
-
-
-def _calculate_utilization_factor(model, T: List[int]) -> Dict[str, float]:
-    """Calcula factor de utilización ponderado por capacidad instalada."""
-    factor_utilizacion = {"sistema": 0.0}
-
-    try:
-        # Obtener cap_max desde model._meta
-        if not hasattr(model, '_meta') or 'cap_max' not in model._meta:
-            return factor_utilizacion
-
-        cap_max = model._meta['cap_max']
-        A_generacion = model._meta.get('A_generacion', [])
-
-        if cap_max and (hasattr(model, '_x') or hasattr(model, '_y')):
-            uso_total_ponderado = 0.0
-            capacidad_total_ponderada = 0.0
-
-            for (i, j) in A_generacion:
-                if (i, j) in cap_max and cap_max[(i, j)] is not None:
-                    capacidad_max = cap_max[(i, j)]
-
-                    # Uso real anual (m³/s)
-                    uso_central = 0.0
-                    if hasattr(model, '_x'):
-                        uso_central = sum(
-                            model._x[i, j, t].x for t in T
-                            if (i, j, t) in model._x
-                        )
-                    elif hasattr(model, '_y'):
-                        uso_central = sum(
-                            model._y[i, j, t].x for t in T
-                            if (i, j, t) in model._y
-                        )
-
-                    # Capacidad disponible anual (m³/s * 12 meses)
-                    capacidad_anual = capacidad_max * len(T)
-
-                    # Factor utilización individual
-                    if capacidad_anual > 0:
-                        fu_central = uso_central / capacidad_anual
-                    else:
-                        fu_central = 0.0
-
-                    # Ponderar por capacidad
-                    peso = capacidad_max
-                    uso_total_ponderado += fu_central * peso
-                    capacidad_total_ponderada += peso
-
-            # Factor del sistema (promedio ponderado)
-            if capacidad_total_ponderada > 0:
-                factor_utilizacion["sistema"] = (
-                    uso_total_ponderado / capacidad_total_ponderada * 100.0
-                )
-    except Exception:
-        pass
-
-    return factor_utilizacion
-
-
-# ============================================================================
-# AGREGACIÓN DE KPIs MULTI-AÑO / MONTE CARLO
-# ============================================================================
-
-def aggregate_kpis(kpis_list: List[Dict[str, Any]]) -> Dict[str, Any]:
-    """
-    Agrega múltiples KPIs para análisis Monte Carlo o histórico.
-
-    Args:
-        kpis_list: Lista de KPIs individuales (uno por simulación/año)
+    Método simplificado: calcula presupuesto disponible y uso real,
+    luego deriva porcentajes y diferencias como parámetros normales.
 
     Returns:
-        Dict con KPIs agregados:
-            - Promedios de KPIs estratégicos
-            - Trayectorias promedio mensuales
-            - Metadata (num_kpis, num_total)
+        Dict con porcentajes, valores absolutos y diferencias
     """
-    if not kpis_list:
-        return {}
+    try:
+        # =====================================================================
+        # 1. CALCULAR PRESUPUESTO DISPONIBLE (según colchón activo)
+        # =====================================================================
 
-    # Filtrar solo KPIs válidos (status=2 óptimo)
-    valid_kpis = [
-        kpi for kpi in kpis_list
-        if kpi.get('status') == 2 and kpi.get('tiempo_colchones_%')
-    ]
+        # Identificar colchón activo
+        colchon_activo = None
+        for c in colchon_labels:
+            z_var = model.getVarByName(f"z[{c}]")
+            if z_var and z_var.x > 0.5:
+                colchon_activo = c
+                break
 
-    if not valid_kpis:
-        return {"error": "No hay KPIs válidos para agregar"}
+        if not colchon_activo:
+            return {'riego': 'N/A', 'generacion': 'N/A'}
 
-    from model import T
+        # V0 real del modelo
+        vinit_var = model.getVarByName("Vinit")
+        v0_real = vinit_var.x if vinit_var else 1400.0
 
-    # KPI 1: Promedio tiempo en colchones
-    colchones_agregados = _aggregate_dict_values(
-        valid_kpis, 'tiempo_colchones_%',
-        ["Inferior", "Transicion", "Intermedio", "Superior"]
+        # Presupuestos según definición del colchón activo
+        shares = colchones_def[colchon_activo]["shares"]
+        r_share, g_share = shares[0], shares[1]
+
+        # Presupuesto RIEGO disponible
+        if r_share > 1.0:  # Valor fijo (ej. 600 Hm³ en Inferior)
+            presupuesto_riego = r_share
+        else:  # Porcentaje de V0 (ej. 40% en Intermedio)
+            presupuesto_riego = r_share * v0_real
+
+        # Presupuesto GENERACIÓN disponible (base)
+        if g_share > 1.0:  # Valor fijo
+            presupuesto_gen_base = g_share
+        else:  # Porcentaje de V0
+            presupuesto_gen_base = g_share * v0_real
+
+        # Aplicar tope 1200 Hm³ SOLO en Superior
+        if colchon_activo == "Superior":
+            presupuesto_gen = min(presupuesto_gen_base, 1200.0)
+        else:
+            presupuesto_gen = presupuesto_gen_base
+
+        # =====================================================================
+        # 2. CALCULAR USO REAL (desde variables del modelo)
+        # =====================================================================
+
+        # Uso RIEGO: agua para déficits (Hm³/año)
+        riego_usado = sum(
+            model._Def1[t].x + model._Def2[t].x
+            for t in time_periods
+        )
+
+        # Uso GENERACIÓN: agua excedente post-riego (Hm³/año)
+        extraccion_total = sum(
+            model._x['Embalse', 'ElToro', t].x * conv_factor
+            for t in time_periods
+        )
+        generacion_usada = extraccion_total - riego_usado
+
+        # =====================================================================
+        # 3. CALCULAR MÉTRICAS FINALES
+        # =====================================================================
+
+        # Porcentajes de utilización
+        pct_riego = (riego_usado / presupuesto_riego * 100.0) \
+            if presupuesto_riego > 0 else 0.0
+        pct_gen = (generacion_usada / presupuesto_gen * 100.0) \
+            if presupuesto_gen > 0 else 0.0
+
+        # Diferencias absolutas (uso - disponible)
+        diff_riego = riego_usado - presupuesto_riego
+        diff_gen = generacion_usada - presupuesto_gen
+
+        # =====================================================================
+        # 4. RETORNO COMPLETO
+        # =====================================================================
+
+        return {
+            # Formato tradicional (compatibilidad)
+            'riego': f"{pct_riego:.1f}%",
+            'generacion': f"{pct_gen:.1f}%",
+
+            # Presupuestos disponibles
+            'presupuesto_riego_hm3': presupuesto_riego,
+            'presupuesto_gen_hm3': presupuesto_gen,
+            'colchon_activo': colchon_activo,
+            'v0_real_hm3': v0_real,
+
+            # Uso real
+            'riego_usado_hm3': riego_usado,
+            'gen_usada_hm3': generacion_usada,
+            'extraccion_total_hm3': extraccion_total,
+
+            # Porcentajes (valores numéricos)
+            'uso_riego_pct': pct_riego,
+            'uso_gen_pct': pct_gen,
+
+            # Diferencias absolutas (+ = exceso, - = subutilización)
+            'diferencia_riego_hm3': diff_riego,
+            'diferencia_gen_hm3': diff_gen,
+
+            # Estado de cumplimiento
+            'cumple_riego': diff_riego <= 0.0,  # True si no excede
+            'cumple_gen': diff_gen <= 0.0,      # True si no excede
+        }
+
+    except (KeyError, AttributeError) as e:
+        print(f"⚠️  Error calculando presupuestos: {e}")
+        return {'riego': 'N/A', 'generacion': 'N/A'}
+
+
+# ===================================================================
+# KPI 3: DÉFICITS DE RIEGO
+# ===================================================================
+
+def _calc_deficits(
+    model,
+    time_periods: List[int],
+    conv_factor: float
+) -> Dict[str, Any]:
+    """
+    Calcula déficits desde variables Def1 y Def2 del modelo.
+
+    Nota: Déficits ya están en Hm³ (no requieren conversión).
+    """
+    # Extraer demandas desde metadata del modelo
+    demandas = model._meta.get('demandas_mensuales', {})
+
+    deficit_1R = []
+    deficit_2R = []
+    demanda_1R_total = 0.0
+    demanda_2R_total = 0.0
+
+    for t in time_periods:
+        # Déficits desde modelo (ya en Hm³)
+        def1_val = model._Def1[t].x if hasattr(model, '_Def1') else 0.0
+        def2_val = model._Def2[t].x if hasattr(model, '_Def2') else 0.0
+
+        deficit_1R.append(def1_val)
+        deficit_2R.append(def2_val)
+
+        # Demandas mensuales
+        dem_tuc = demandas.get('tucapel', {}).get(t, 0.0)
+        dem_ab = demandas.get('abanico', {}).get(t, 0.0)
+        dem_2r = demandas.get('segundos', {}).get(t, 0.0)
+
+        demanda_1R_total += dem_tuc + dem_ab
+        demanda_2R_total += dem_2r
+
+    # Métricas agregadas
+    def1_sum = float(np.sum(deficit_1R))
+    def2_sum = float(np.sum(deficit_2R))
+    def1_prom = float(np.mean(deficit_1R))
+    def2_prom = float(np.mean(deficit_2R))
+    def1_max = float(np.max(deficit_1R))
+    def2_max = float(np.max(deficit_2R)) if deficit_2R else 0.0
+
+    # Porcentajes
+    pct_def1 = (def1_sum / demanda_1R_total * 100.0) \
+        if demanda_1R_total > 0 else 0.0
+    pct_def2 = (def2_sum / demanda_2R_total * 100.0) \
+        if demanda_2R_total > 0 else 0.0
+
+    # Agua total El Toro (para composición)
+    agua_total_eltoro = sum(
+        model._x['Embalse', 'ElToro', t].x * conv_factor
+        for t in time_periods
     )
 
-    # KPI 2: Promedio uso de presupuestos (normalizado por años)
-    uso_presupuestos_agregado = _aggregate_dict_values(
-        valid_kpis, 'uso_presupuestos_%',
-        ["riego", "generacion"]
-    )
-    # Normalizar: el agregado ya promedia correctamente
-    # (cada año calcula su % individual, luego se promedian)
-
-    # KPI 3: Déficits agregados
-    deficit_max_agregado = {
-        '1R': _aggregate_max(valid_kpis, 'deficit_max_hm3', '1R'),
-        '2R': _aggregate_max(valid_kpis, 'deficit_max_hm3', '2R')
-    }
-
-    deficit_prom_agregado = {
-        '1R': _aggregate_mean(valid_kpis, 'deficit_prom_hm3', '1R'),
-        '2R': _aggregate_mean(valid_kpis, 'deficit_prom_hm3', '2R')
-    }
-
-    deficit_sum_agregado = {
-        '1R': _aggregate_sum(valid_kpis, 'deficit_sum_hm3', '1R'),
-        '2R': _aggregate_sum(valid_kpis, 'deficit_sum_hm3', '2R')
-    }
-
-    # Recalcular porcentajes sobre demandas totales
-    total_demand_1R = sum(kpi.get('demanda_1R_tot', 0.0) for kpi in valid_kpis)
-    total_demand_2R = sum(kpi.get('demanda_2R_tot', 0.0) for kpi in valid_kpis)
-
-    deficit_pct_agregado = {
-        '1R': (deficit_sum_agregado['1R'] / total_demand_1R * 100.0
-               if total_demand_1R > 0 else 0.0),
-        '2R': (deficit_sum_agregado['2R'] / total_demand_2R * 100.0
-               if total_demand_2R > 0 else 0.0)
-    }
-
-    # KPI 4: Promedio factor utilización
-    factor_utilizacion_agregado = _aggregate_dict_values(
-        valid_kpis, 'factor_utilizacion_%',
-        ["sistema"]
-    )
-
-    # Trayectorias mensuales
-    cota_mensual_agregada = _aggregate_monthly_values(
-        valid_kpis, 'cota_mensual', T
+    # Composición flujo El Toro
+    composicion = _calc_composicion_eltoro(
+        agua_total_eltoro, def1_sum, def2_sum
     )
 
     return {
-        'tiempo_colchones_%': colchones_agregados,
-        'uso_presupuestos_%': uso_presupuestos_agregado,
-        'deficit_max_hm3': deficit_max_agregado,
-        'deficit_prom_hm3': deficit_prom_agregado,
-        'deficit_sum_hm3': deficit_sum_agregado,
-        'deficit_pct': deficit_pct_agregado,
-        'factor_utilizacion_%': factor_utilizacion_agregado,
-        'cota_mensual': cota_mensual_agregada,
-        'num_kpis': len(valid_kpis),
-        'num_total': len(kpis_list)
+        'deficit_sum_hm3': {'1R': def1_sum, '2R': def2_sum},
+        'deficit_prom_hm3': {'1R': def1_prom, '2R': def2_prom},
+        'deficit_max_hm3': {'1R': def1_max, '2R': def2_max},
+        'deficit_pct': {'1R': pct_def1, '2R': pct_def2},
+        'demanda_1R_tot': demanda_1R_total,
+        'demanda_2R_tot': demanda_2R_total,
+        'agua_eltoro_total': agua_total_eltoro,
+        'agua_eltoro_deficit_1r': def1_sum,
+        'agua_eltoro_deficit_2r': def2_sum,
+        'composicion_eltoro_%': composicion
     }
 
 
-def _aggregate_dict_values(kpis_list: List[Dict], key: str,
-                           subkeys: List[str]) -> Dict[str, float]:
-    """Agrega valores de diccionario anidado promediando."""
-    result = {}
-    for subkey in subkeys:
-        valores = [
-            kpi.get(key, {}).get(subkey, 0.0)
-            for kpi in kpis_list
-        ]
-        result[subkey] = np.mean(valores) if valores else 0.0
-    return result
+def _calc_composicion_eltoro(
+    agua_total: float,
+    def1: float,
+    def2: float
+) -> Dict[str, float]:
+    """Calcula composición porcentual del flujo de El Toro."""
+    if agua_total == 0:
+        return {'deficit_1r': 0.0, 'deficit_2r': 0.0, 'transito': 0.0}
+
+    pct_1r = (def1 / agua_total) * 100.0
+    pct_2r = (def2 / agua_total) * 100.0
+    pct_transito = 100.0 - pct_1r - pct_2r
+
+    return {
+        'deficit_1r': pct_1r,
+        'deficit_2r': pct_2r,
+        'transito': pct_transito
+    }
 
 
-def _aggregate_max(kpis_list: List[Dict], key: str, subkey: str) -> float:
-    """Agrega tomando el máximo."""
-    valores = [kpi.get(key, {}).get(subkey, 0.0) for kpi in kpis_list]
-    return float(np.max(valores)) if valores else 0.0
+# ===================================================================
+# KPI 4: FACTOR DE UTILIZACIÓN
+# ===================================================================
 
-
-def _aggregate_mean(kpis_list: List[Dict], key: str, subkey: str) -> float:
-    """Agrega tomando el promedio."""
-    valores = [kpi.get(key, {}).get(subkey, 0.0) for kpi in kpis_list]
-    return float(np.mean(valores)) if valores else 0.0
-
-
-def _aggregate_sum(kpis_list: List[Dict], key: str, subkey: str) -> float:
-    """Agrega tomando la suma."""
-    return sum(kpi.get(key, {}).get(subkey, 0.0) for kpi in kpis_list)
-
-
-def _aggregate_monthly_values(kpis_list: List[Dict], key: str,
-                              T: List[int]) -> Dict[int, float]:
-    """Agrega valores mensuales promediando por mes."""
-    result = {}
-    for t in T:
-        valores_mes = [
-            kpi.get(key, {}).get(t, 0.0)
-            for kpi in kpis_list if kpi.get(key)
-        ]
-        result[t] = np.mean(valores_mes) if valores_mes else 0.0
-    return result
-
-
-# ============================================================================
-# VISUALIZACIÓN Y EXPORTACIÓN
-# ============================================================================
-
-def print_kpis(kpis: Dict[str, Any], context: str = "",
-               is_caso_base: bool = False) -> None:
+def _calc_factor_utilizacion(
+    model,
+    time_periods: List[int]
+) -> Dict[str, float]:
     """
-    Imprime KPIs en formato legible para análisis operacional.
+    Calcula factor de utilización del sistema usando G[t] del modelo.
+
+    Factor = (Energía Real Total) / (Energía Teórica) × 100%
+
+    Capacidad instalada total: 1,136.22 MW (7 centrales)
+    Energía Teórica = 1,136.22 MW × 8,760 h/año
+    """
+    try:
+        # Capacidades según CaudalMax_filtrado.csv
+        cap_total_mw = (
+            437.2715 +  # ElToro
+            93.0 +      # Abanico
+            320.0 +     # Antuco
+            178.4 +     # Rucue
+            70.0 +      # Quilleco
+            34.30368 +  # Laja_I
+            3.25        # ElDiuto
+        )  # Total: 1,136.22 MW
+
+        # Energía real total (MWh): G[t] en MW → MWh
+        horas_mes = 720  # 30 días × 24h
+        energia_real_total = sum(
+            model._G[t].x * horas_mes for t in time_periods
+        )
+
+        # Energía teórica máxima anual (MWh)
+        horas_año = 8760  # 365 días × 24h
+        energia_teorica = cap_total_mw * horas_año
+
+        # Factor de utilización (%)
+        fu_sistema = (energia_real_total / energia_teorica * 100.0) \
+            if energia_teorica > 0 else 0.0
+
+        return {'sistema': fu_sistema}
+
+    except (KeyError, AttributeError):
+        return {'sistema': 0.0}
+
+
+# ===================================================================
+# AGREGACIÓN MULTI-AÑO
+# ===================================================================
+
+def aggregate_kpis(
+    kpis_list: List[Dict[str, Any]],
+    years: Optional[List[int]] = None,
+    v0_values: Optional[List[float]] = None,
+    identifiers: Optional[List[Any]] = None
+) -> Dict[str, Any]:
+    """
+    Agrega KPIs de múltiples años con estadísticas detalladas.
 
     Args:
-        kpis: Diccionario con KPIs calculados
-        context: Contexto del análisis ("año XXXX", "histórico", etc.)
-        is_caso_base: Si True, oculta KPI 2 y muestra solo 1R en KPI 3
+        kpis_list: Lista de KPIs individuales
+        years: Lista de años correspondientes (DEPRECATED: usar identifiers)
+        v0_values: Lista de valores V0 iniciales
+        identifiers: Lista de identificadores (años, escenarios, etc.)
+
+    Returns:
+        KPIs agregados con totales, promedios, máx/mín
     """
-    if not kpis or 'tiempo_colchones_%' not in kpis:
-        print("⚠️ No hay KPIs válidos para mostrar")
+    # Compatibilidad: usar years si identifiers no está especificado
+    if identifiers is None:
+        identifiers = years
+    if not kpis_list:
+        return _empty_kpis()
+
+    # Filtrar solo óptimos
+    valid_kpis = [k for k in kpis_list if k.get('status') == 2]
+
+    if not valid_kpis:
+        return _empty_kpis()
+
+    T, _, _, _, _ = _get_model_constants()
+
+    # KPI 1: Promedio tiempo en colchones
+    colchones_agg = {
+        c: np.mean([
+            kpi.get('tiempo_colchones_%', {}).get(c, 0.0)
+            for kpi in valid_kpis
+        ])
+        for c in ['Inferior', 'Transicion', 'Intermedio', 'Superior']
+    }
+
+    # KPI 2: Promedio uso presupuestos
+    presup_vals = []
+    gen_vals = []
+
+    for kpi in valid_kpis:
+        presup_data = kpi.get('uso_presupuestos_%', {})
+        riego_val = presup_data.get('riego', 'N/A')
+        gen_val = presup_data.get('generacion', 'N/A')
+
+        # Convertir strings "X.X%" a float
+        if isinstance(riego_val, str) and '%' in riego_val:
+            riego_val = float(riego_val.replace('%', ''))
+        if isinstance(gen_val, str) and '%' in gen_val:
+            gen_val = float(gen_val.replace('%', ''))
+
+        if riego_val != 'N/A':
+            presup_vals.append(riego_val)
+        if gen_val != 'N/A':
+            gen_vals.append(gen_val)
+
+    presup_agg = {
+        'riego': f"{np.mean(presup_vals):.1f}%"
+        if presup_vals else 'N/A',
+        'generacion': f"{np.mean(gen_vals):.1f}%"
+        if gen_vals else 'N/A'
+    }
+
+    # KPI 3: Déficits agregados
+    deficits_1r = [
+        kpi.get('deficit_sum_hm3', {}).get('1R', 0.0)
+        for kpi in valid_kpis
+    ]
+    deficits_2r = [
+        kpi.get('deficit_sum_hm3', {}).get('2R', 0.0)
+        for kpi in valid_kpis
+    ]
+
+    deficit_acum_1r = sum(deficits_1r)
+    deficit_acum_2r = sum(deficits_2r)
+    deficit_prom_1r = np.mean(deficits_1r)
+    deficit_prom_2r = np.mean(deficits_2r)
+    deficit_max_1r = max(deficits_1r) if deficits_1r else 0.0
+    deficit_max_2r = max(deficits_2r) if deficits_2r else 0.0
+    deficit_min_1r = min(deficits_1r) if deficits_1r else 0.0
+    deficit_min_2r = min(deficits_2r) if deficits_2r else 0.0
+    deficit_std_1r = np.std(deficits_1r) if len(deficits_1r) > 1 else 0.0
+    deficit_std_2r = np.std(deficits_2r) if len(deficits_2r) > 1 else 0.0
+
+    # Identificar años/escenarios críticos
+    idx_max_1r = deficits_1r.index(max(deficits_1r)) \
+        if deficits_1r else -1
+    idx_min_1r = deficits_1r.index(min(deficits_1r)) \
+        if deficits_1r else -1
+    idx_max_2r = deficits_2r.index(max(deficits_2r)) \
+        if deficits_2r else -1
+    idx_min_2r = deficits_2r.index(min(deficits_2r)) \
+        if deficits_2r else -1
+
+    id_max_1r = identifiers[idx_max_1r] \
+        if identifiers and idx_max_1r >= 0 else None
+    id_min_1r = identifiers[idx_min_1r] \
+        if identifiers and idx_min_1r >= 0 else None
+    id_max_2r = identifiers[idx_max_2r] \
+        if identifiers and idx_max_2r >= 0 else None
+    id_min_2r = identifiers[idx_min_2r] \
+        if identifiers and idx_min_2r >= 0 else None
+
+    v0_max_1r = v0_values[idx_max_1r] \
+        if v0_values and idx_max_1r >= 0 else None
+    v0_min_1r = v0_values[idx_min_1r] \
+        if v0_values and idx_min_1r >= 0 else None
+    v0_max_2r = v0_values[idx_max_2r] \
+        if v0_values and idx_max_2r >= 0 else None
+    v0_min_2r = v0_values[idx_min_2r] \
+        if v0_values and idx_min_2r >= 0 else None
+
+    # Demandas totales acumuladas
+    demanda_1r_total = sum(
+        kpi.get('demanda_1R_tot', 0.0) for kpi in valid_kpis
+    )
+    demanda_2r_total = sum(
+        kpi.get('demanda_2R_tot', 0.0) for kpi in valid_kpis
+    )
+
+    # Porcentajes acumulados
+    deficit_pct_1r = (deficit_acum_1r / demanda_1r_total * 100.0) \
+        if demanda_1r_total > 0 else 0.0
+    deficit_pct_2r = (deficit_acum_2r / demanda_2r_total * 100.0) \
+        if demanda_2r_total > 0 else 0.0
+
+    # KPI 4: Factor utilización total
+    energia_real_total = sum(
+        kpi.get('generacion_total', 0.0) for kpi in valid_kpis
+    )
+    cap_total_mw = 1136.22
+    horas_año = 8760
+    n_años = len(valid_kpis)
+    energia_teorica_total = cap_total_mw * horas_año * n_años
+
+    fu_sistema = (energia_real_total / energia_teorica_total * 100.0) \
+        if energia_teorica_total > 0 else 0.0
+
+    # Trayectoria mensual promedio (cota)
+    cota_mensual_agg = {
+        t: np.mean([
+            kpi.get('cota_mensual', {}).get(t, 0.0)
+            for kpi in valid_kpis
+        ])
+        for t in T
+    }
+
+    # Agua El Toro para déficits (validación)
+    agua_eltoro_1r = sum(
+        kpi.get('agua_eltoro_deficit_1r', 0.0) for kpi in valid_kpis
+    )
+    agua_eltoro_2r = sum(
+        kpi.get('agua_eltoro_deficit_2r', 0.0) for kpi in valid_kpis
+    )
+
+    return {
+        'status': 2,
+        'tiempo_colchones_%': colchones_agg,
+        'uso_presupuestos_%': presup_agg,
+        'deficit_acumulado_hm3': {
+            '1R': deficit_acum_1r, '2R': deficit_acum_2r
+        },
+        'deficit_promedio_anual_hm3': {
+            '1R': deficit_prom_1r, '2R': deficit_prom_2r
+        },
+        'deficit_max_anual_hm3': {
+            '1R': deficit_max_1r, '2R': deficit_max_2r
+        },
+        'deficit_min_anual_hm3': {
+            '1R': deficit_min_1r, '2R': deficit_min_2r
+        },
+        'deficit_std_hm3': {'1R': deficit_std_1r, '2R': deficit_std_2r},
+        'deficit_pct': {'1R': deficit_pct_1r, '2R': deficit_pct_2r},
+        'demanda_1R_tot': demanda_1r_total,
+        'demanda_2R_tot': demanda_2r_total,
+        'agua_eltoro_deficit_1r': agua_eltoro_1r,
+        'agua_eltoro_deficit_2r': agua_eltoro_2r,
+        'id_max_deficit': {'1R': id_max_1r, '2R': id_max_2r},
+        'id_min_deficit': {'1R': id_min_1r, '2R': id_min_2r},
+        'v0_max_deficit': {'1R': v0_max_1r, '2R': v0_max_2r},
+        'v0_min_deficit': {'1R': v0_min_1r, '2R': v0_min_2r},
+        'factor_utilizacion_%': {'sistema': fu_sistema},
+        'cota_mensual': cota_mensual_agg,
+        'num_kpis': len(valid_kpis),
+        'num_total': len(kpis_list),
+        'is_multi_year': True
+    }
+
+
+# ===================================================================
+# VISUALIZACIÓN
+# ===================================================================
+
+def print_kpis(
+    kpis: Dict[str, Any],
+    context: str = "",
+    years: Optional[List[int]] = None
+) -> None:
+    """
+    Imprime KPIs en formato limpio y profesional.
+
+    Args:
+        kpis: KPIs calculados
+        context: Contexto (año, histórico, etc.)
+        years: Lista de años (para años críticos)
+    """
+    if not kpis or kpis.get('status') != 2:
+        print("\n❌ No hay KPIs válidos para mostrar")
         return
 
-    # Detectar automáticamente si es caso base
-    # (generación = 0% indica modelo sin generación)
-    presupuestos = kpis.get('uso_presupuestos_%', {})
-    gen_pct = presupuestos.get('generacion', 0)
-    if gen_pct == 0.0:
-        is_caso_base = True
+    # Detectar si es multi-año
+    is_multi_year = kpis.get('is_multi_year', False)
 
-    # Título
-    titulo = "📊 KPIs ESTRATÉGICOS"
+    print("=" * 79)
+    print("📊 INDICADORES CLAVE DE DESEMPEÑO (KPIs)")
     if context:
-        titulo += f" - {context}"
+        print(f"   {context}")
+    print("=" * 79)
 
-    num_kpis = kpis.get('num_kpis')
-    if num_kpis:
-        titulo += f" ({num_kpis} casos)"
+    # KPI 1: Colchones
+    print("\n🧭 KPI 1 - TIEMPO EN COLCHONES OPERATIVOS:")
+    colchones = kpis.get('tiempo_colchones_%', {})
+    emojis = {
+        'Inferior': '🔴', 'Transicion': '🟡',
+        'Intermedio': '🟢', 'Superior': '🔵'
+    }
+    for colchon, pct in colchones.items():
+        emoji = emojis.get(colchon, '⚪')
+        print(f"   {emoji} {colchon:12s}: {pct:6.1f}%")
 
-    print("=" * len(titulo))
-    print(f"{titulo}")
-    print("=" * len(titulo))
+    # KPI 2: Presupuestos (con descomposición y diferencias)
+    print("\n💰 KPI 2 - USO DE PRESUPUESTOS (Convenio 2017):")
+    presup = kpis.get('uso_presupuestos_%', {})
+    print(f"   🌾 Riego (déficits):         {presup.get('riego', 'N/A'):>8}")
+    generacion_str = presup.get('generacion', 'N/A')
+    print(f"   ⚡ Generación (excedente):    {generacion_str:>8}")
 
-    # KPI 1: Tiempo en colchones
-    print("\n🏗️  KPI 1 - TIEMPO EN COLCHONES OPERATIVOS:")
-    colchones_data = kpis.get('tiempo_colchones_%', {})
-    for colchon, porcentaje in colchones_data.items():
-        emoji = {"Inferior": "🔴", "Transicion": "🟡",
-                 "Intermedio": "🟢", "Superior": "🔵"}.get(colchon, "⚪")
-        print(f"   {emoji} {colchon:12s}: {porcentaje:6.1f}%")
+    # Mostrar presupuestos disponibles y diferencias
+    presup_riego_abs = presup.get('presupuesto_riego_hm3', 0.0)
+    presup_gen_abs = presup.get('presupuesto_gen_hm3', 0.0)
+    diff_riego = presup.get('diferencia_riego_hm3', 0.0)
+    diff_gen = presup.get('diferencia_gen_hm3', 0.0)
+    cumple_riego = presup.get('cumple_riego', True)
+    cumple_gen = presup.get('cumple_gen', True)
+    colchon_activo = presup.get('colchon_activo', 'N/A')
 
-    # KPI 2: Uso de presupuestos (solo para modelo con generación)
-    if not is_caso_base:
-        print("\n💰 KPI 2 - USO DE PRESUPUESTOS:")
-        print(f"   🌾 Riego:      {presupuestos.get('riego', 0):6.1f}%")
-        print(f"   ⚡ Generación: {gen_pct:6.1f}%")
+    if presup_riego_abs > 0 or presup_gen_abs > 0:
+        print(f"\n   📋 Colchón Activo: {colchon_activo}")
+        print("   💧 Presupuestos vs Uso:")
 
-    # KPI 3: Déficits (solo 1R para caso base)
+        if presup_riego_abs > 0:
+            estado_riego = "✅" if cumple_riego else "❌"
+            signo_riego = "+" if diff_riego > 0 else ""
+            print(f"      • Riego:      {presup_riego_abs:>7.1f} Hm³/año "
+                  f"({signo_riego}{diff_riego:>+6.1f}) {estado_riego}")
+
+        if presup_gen_abs > 0:
+            estado_gen = "✅" if cumple_gen else "❌"
+            signo_gen = "+" if diff_gen > 0 else ""
+            print(f"      • Generación: {presup_gen_abs:>7.1f} Hm³/año "
+                  f"({signo_gen}{diff_gen:>+6.1f}) {estado_gen}")
+
+    # Mostrar descomposición del flujo El Toro si está disponible
+    agua_total = kpis.get('agua_eltoro_total', 0.0)
+    agua_riego = kpis.get('agua_riego_hm3', 0.0)
+    agua_gen = kpis.get('agua_generacion_hm3', 0.0)
+    if agua_total > 0:
+        print("\n   📊 Descomposición Flujo El Toro:")
+        print(f"      • Total:      {agua_total:>8.2f} Hm³/año")
+        pct_riego = agua_riego / agua_total * 100
+        pct_gen = agua_gen / agua_total * 100
+        print(f"      • Riego:      {agua_riego:>8.2f} Hm³ "
+              f"({pct_riego:>5.1f}%)")
+        print(f"      • Generación: {agua_gen:>8.2f} Hm³ "
+              f"({pct_gen:>5.1f}%)")
+
+    # KPI 3: Déficits
     print("\n📉 KPI 3 - DÉFICITS DE RIEGO:")
-    dm = kpis.get('deficit_max_hm3', {})
-    dp = kpis.get('deficit_prom_hm3', {})
-    ds = kpis.get('deficit_sum_hm3', {})
-    pct = kpis.get('deficit_pct', {})
+    if is_multi_year:
+        _print_deficits_multiyear(kpis)
+    else:
+        _print_deficits_single_year(kpis)
 
-    print("📍 Primeros Regantes (1R):")
-    print(f"      • Déficit máximo:  {dm.get('1R', 0.0):7.2f} Hm³")
-    print(f"      • Déficit promedio: {dp.get('1R', 0.0):7.3f} Hm³/mes")
-    print(f"      • Déficit total:    {ds.get('1R', 0.0):7.2f} Hm³ "
-          f"({pct.get('1R', 0.0):5.2f}% demanda)")
-
-    if not is_caso_base:
-        print("📍 Segundos Regantes (2R):")
-        print(f"      • Déficit máximo:  {dm.get('2R', 0.0):7.2f} Hm³")
-        print(f"      • Déficit promedio: {dp.get('2R', 0.0):7.3f} Hm³/mes")
-        print(f"      • Déficit total:    {ds.get('2R', 0.0):7.2f} Hm³ "
-              f"({pct.get('2R', 0.0):5.2f}% demanda)")
-
-    # KPI 4: Factor utilización (solo para modelo con generación)
-    if not is_caso_base:
-        print("\n🏗️  KPI 4 - FACTOR DE UTILIZACIÓN:")
-        fu_data = kpis.get('factor_utilizacion_%', {})
-        print(f"   🏭 Sistema: {fu_data.get('sistema', 0):6.1f}%")
+    # KPI 4: Factor utilización
+    print("\n🏭 KPI 4 - FACTOR DE UTILIZACIÓN:")
+    fu = kpis.get('factor_utilizacion_%', {})
+    print(f"   🏭 Sistema:   {fu.get('sistema', 0.0):6.1f}%")
 
     # Resumen operacional
     print("\n📋 RESUMEN OPERACIONAL:")
     cota_data = kpis.get('cota_mensual', {})
     if cota_data:
-        cota_promedio = sum(cota_data.values()) / len(cota_data)
-        cota_min = min(cota_data.values())
-        cota_max = max(cota_data.values())
-        print(f"   📏 Cota promedio: {cota_promedio:6.1f} msnm")
-        print(f"   📏 Rango: [{cota_min:6.1f}, {cota_max:6.1f}] msnm")
+        cotas = list(cota_data.values())
+        cota_prom = np.mean(cotas)
+        cota_min, cota_max = np.min(cotas), np.max(cotas)
+        print(
+            f"   📏 Cota: {cota_prom:.1f} msnm "
+            f"[{cota_min:.1f}-{cota_max:.1f}]"
+        )
+    print()
 
 
-def export_kpis_to_csv(kpis: Dict[str, Any],
-                       output_dir: str = "resultados/kpis",
-                       year: Optional[int] = None,
-                       scenario: str = "") -> List[str]:
-    """
-    Muestra KPIs en consola (sin generar archivos).
+def _print_deficits_single_year(kpis: Dict[str, Any]) -> None:
+    """Imprime déficits para un año individual."""
+    deficit_sum = kpis.get('deficit_sum_hm3', {})
+    deficit_max = kpis.get('deficit_max_hm3', {})
+    deficit_pct = kpis.get('deficit_pct', {})
+    demanda_1r = kpis.get('demanda_1R_tot', 0.0)
+    demanda_2r = kpis.get('demanda_2R_tot', 0.0)
 
-    NOTA: Función renombrada pero mantiene firma para compatibilidad.
-    Solo imprime KPIs en consola, no genera archivos Excel.
+    def1_total = deficit_sum.get('1R', 0.0)
+    def2_total = deficit_sum.get('2R', 0.0)
 
-    Args:
-        kpis: Diccionario con KPIs calculados
-        output_dir: (Ignorado - compatibilidad)
-        year: Año de análisis (para contexto en consola)
-        scenario: Escenario (para contexto en consola)
+    if def1_total > 0.01 or def2_total > 0.01:
+        if def1_total > 0.01:
+            print("📍 Primeros Regantes (1R):")
+            print(f"   • Déficit total:  {def1_total:7.2f} Hm³/año")
+            print(
+                f"   • Déficit máximo: "
+                f"{deficit_max.get('1R', 0.0):7.2f} Hm³/mes"
+            )
+            print(f"   • Demanda total:  {demanda_1r:7.2f} Hm³/año")
+            print(
+                f"   • % de demanda:   "
+                f"{deficit_pct.get('1R', 0.0):6.2f}%"
+            )
 
-    Returns:
-        Lista vacía (compatibilidad con código existente)
-    """
-    if not kpis or 'tiempo_colchones_%' not in kpis:
-        return []
-
-    # Construir contexto para print_kpis
-    context_parts = []
-    if year:
-        context_parts.append(f"Año {year}")
-    if scenario:
-        context_parts.append(scenario)
-    context = " - ".join(context_parts) if context_parts else ""
-
-    # Mostrar KPIs en consola
-    print_kpis(kpis, context=context)
-
-    # No generar archivos, retornar lista vacía
-    return []
+        if def2_total > 0.01:
+            print("📍 Segundos Regantes (2R):")
+            print(f"   • Déficit total:  {def2_total:7.2f} Hm³/año")
+            print(
+                f"   • Déficit máximo: "
+                f"{deficit_max.get('2R', 0.0):7.2f} Hm³/mes"
+            )
+            print(f"   • Demanda total:  {demanda_2r:7.2f} Hm³/año")
+            print(
+                f"   • % de demanda:   "
+                f"{deficit_pct.get('2R', 0.0):6.2f}%"
+            )
+    else:
+        print("   ✅ Sin déficits registrados")
 
 
-def generate_historical_plots(
+def _print_deficits_multiyear(kpis: Dict[str, Any]) -> None:
+    """Imprime déficits para múltiples años."""
+    deficit_acum = kpis.get('deficit_acumulado_hm3', {})
+    deficit_prom = kpis.get('deficit_promedio_anual_hm3', {})
+    deficit_max = kpis.get('deficit_max_anual_hm3', {})
+    deficit_min = kpis.get('deficit_min_anual_hm3', {})
+    deficit_std = kpis.get('deficit_std_hm3', {})
+    deficit_pct = kpis.get('deficit_pct', {})
+
+    # Usar id_max_deficit (genérico) con fallback a year_max_deficit (legacy)
+    id_max = kpis.get('id_max_deficit', kpis.get('year_max_deficit', {}))
+    id_min = kpis.get('id_min_deficit', kpis.get('year_min_deficit', {}))
+    v0_max = kpis.get('v0_max_deficit', {})
+    v0_min = kpis.get('v0_min_deficit', {})
+
+    num_years = kpis.get('num_kpis', 0)
+
+    def1_acum = deficit_acum.get('1R', 0.0)
+    def2_acum = deficit_acum.get('2R', 0.0)
+
+    if def1_acum > 0.01 or def2_acum > 0.01:
+        if def1_acum > 0.01:
+            print("📍 Primeros Regantes (1R):")
+            print(
+                f"   Déficit: {def1_acum:.2f} Hm³ ({num_years} años) "
+                f"= {deficit_pct.get('1R', 0.0):.1f}% demanda"
+            )
+            print(
+                f"   Promedio: {deficit_prom.get('1R', 0.0):.2f} Hm³/año "
+                f"± {deficit_std.get('1R', 0.0):.2f} (desv. estándar)"
+            )
+
+            # Identificadores críticos (años o escenarios)
+            max_str = f"{deficit_max.get('1R', 0.0):.2f} Hm³"
+            if id_max.get('1R') is not None:
+                max_str += f" ({id_max['1R']}"
+                if v0_max.get('1R'):
+                    max_str += f", V0={v0_max['1R']:.0f} Hm³"
+                max_str += ")"
+
+            min_str = f"{deficit_min.get('1R', 0.0):.2f} Hm³"
+            if id_min.get('1R') is not None:
+                min_str += f" ({id_min['1R']}"
+                if v0_min.get('1R'):
+                    min_str += f", V0={v0_min['1R']:.0f} Hm³"
+                min_str += ")"
+
+            print(f"   Máximo: {max_str}")
+            print(f"   Mínimo: {min_str}")
+
+            # Validación
+            agua_eltoro_1r = kpis.get('agua_eltoro_deficit_1r', 0.0)
+            tol = 0.001 * def1_acum
+            if abs(agua_eltoro_1r - def1_acum) < tol:
+                print("   └─ ✅ Embalse compensó 100% del déficit")
+
+        if def2_acum > 0.01:
+            print("📍 Segundos Regantes (2R):")
+            print(
+                f"   Déficit: {def2_acum:.2f} Hm³ ({num_years} años) "
+                f"= {deficit_pct.get('2R', 0.0):.1f}% demanda"
+            )
+            print(
+                f"   Promedio: {deficit_prom.get('2R', 0.0):.2f} Hm³/año "
+                f"± {deficit_std.get('2R', 0.0):.2f} (desv. estándar)"
+            )
+
+            max_str = f"{deficit_max.get('2R', 0.0):.2f} Hm³"
+            if id_max.get('2R') is not None:
+                max_str += f" ({id_max['2R']}"
+                if v0_max.get('2R'):
+                    max_str += f", V0={v0_max['2R']:.0f} Hm³"
+                max_str += ")"
+
+            min_str = f"{deficit_min.get('2R', 0.0):.2f} Hm³"
+            if id_min.get('2R') is not None:
+                min_str += f" ({id_min['2R']}"
+                if v0_min.get('2R'):
+                    min_str += f", V0={v0_min['2R']:.0f} Hm³"
+                min_str += ")"
+
+            print(f"   Máximo: {max_str}")
+            print(f"   Mínimo: {min_str}")
+
+            # Validación compensación 2R
+            agua_eltoro_2r = kpis.get('agua_eltoro_deficit_2r', 0.0)
+            tol = 0.001 * def2_acum
+            if abs(agua_eltoro_2r - def2_acum) < tol:
+                print("   └─ ✅ Embalse compensó 100% del déficit")
+    else:
+        print("   ✅ Sin déficits naturales")
+
+
+def export_kpis_to_csv(
     kpis_historicos: List[Dict[str, Any]],
     years: List[int],
-    output_dir: str = "resultados",
-    plot_name: str = "evolucion_historica_lago"
-) -> List[str]:
+    output_file: str = "resultados/kpis_historicos.csv"
+) -> None:
     """
-    Genera gráficos de evolución histórica para análisis visual.
-    
+    Exporta KPIs históricos a CSV para análisis posterior.
+
     Args:
-        kpis_historicos: Lista de KPIs calculados por año
+        kpis_historicos: Lista de diccionarios de KPIs por año
         years: Lista de años correspondientes
-        output_dir: Directorio donde guardar los gráficos
-        plot_name: Nombre del archivo PNG (sin extensión)
-        
-    Returns:
-        List[str]: Lista de rutas de archivos PNG generados
+        output_file: Ruta del archivo CSV de salida
     """
+    import csv
     from pathlib import Path
-    import matplotlib.pyplot as plt
-    
-    output_path = Path(output_dir)
-    output_path.mkdir(exist_ok=True)
-    files_created = []
 
     if not kpis_historicos or not years:
-        return files_created
+        print("⚠️ No hay KPIs para exportar")
+        return
 
-    # Configurar matplotlib
-    plt.rcParams['font.size'] = 10
-    plt.rcParams['figure.figsize'] = (12, 8)
+    # Crear directorio de salida si no existe
+    output_path = Path(output_file)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
 
-    # Crear figura con 2 subplots
-    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(14, 10))
+    # Definir columnas del CSV
+    fieldnames = [
+        'year',
+        'v0_hm3',
+        'v_final_hm3',
+        'colchon',
+        'generacion_mwh',
+        'agua_eltoro_hm3',
+        'deficit_1r_hm3',
+        'deficit_2r_hm3',
+        'presupuesto_riego_hm3',
+        'presupuesto_gen_hm3',
+        'presupuesto_lago_hm3',
+        'uso_riego_pct',
+        'uso_gen_pct',
+        'cumple_lago',
+        'tiempo_inferior_meses',
+        'tiempo_transicion_meses',
+        'tiempo_intermedio_meses',
+        'tiempo_superior_meses',
+        'factor_utilizacion_pct',
+        'energia_teorica_mwh',
+        'cota_promedio_msnm',
+        'cota_max_msnm',
+        'cota_min_msnm'
+    ]
 
-    # Extraer datos anuales
-    cotas_anuales = []
-    dependencias_anuales = []
+    # Escribir CSV
+    with open(output_file, 'w', newline='', encoding='utf-8') as csvfile:
+        writer = csv.DictWriter(csvfile, fieldnames=fieldnames)
+        writer.writeheader()
 
-    for kpis in kpis_historicos:
-        cota_data = kpis.get('cota_mensual', {})
-        cota_promedio = (
-            sum(cota_data.values()) / len(cota_data)
-            if cota_data else 0.0
-        )
-        cotas_anuales.append(cota_promedio)
+        for year, kpi in zip(years, kpis_historicos):
+            # Extraer valores con manejo de None/missing
+            tiempo_colchones = kpi.get('tiempo_colchones', {})
+            uso_presupuestos = kpi.get('uso_presupuestos', {})
+            factor_util = kpi.get('factor_utilizacion', {})
+            cota_mensual = kpi.get('cota_mensual', {})
 
-        dependencia_data = kpis.get('dependencia_lago_m3s', {})
-        dependencia_total = (
-            sum(dependencia_data.values())
-            if dependencia_data else 0.0
-        )
-        dependencias_anuales.append(dependencia_total)
+            # Construir fila
+            row = {
+                'year': year,
+                'v0_hm3': kpi.get('V0', 0.0),
+                'v_final_hm3': kpi.get('V_end', 0.0),
+                'colchon': kpi.get('colchon', 'N/A'),
+                'generacion_mwh': kpi.get('generacion_total', 0.0),
+                'agua_eltoro_hm3': kpi.get('agua_eltoro_total', 0.0),
+                'deficit_1r_hm3': kpi.get('deficit_1r_hm3', 0.0),
+                'deficit_2r_hm3': kpi.get('deficit_2r_hm3', 0.0),
+                'presupuesto_riego_hm3': uso_presupuestos.get(
+                    'presupuesto_riego', 0.0
+                ),
+                'presupuesto_gen_hm3': uso_presupuestos.get(
+                    'presupuesto_gen', 0.0
+                ),
+                'presupuesto_lago_hm3': uso_presupuestos.get(
+                    'presupuesto_lago', 0.0
+                ),
+                'uso_riego_pct': uso_presupuestos.get('uso_riego_pct', 0.0),
+                'uso_gen_pct': uso_presupuestos.get('uso_gen_pct', 0.0),
+                'cumple_lago': uso_presupuestos.get('cumple_lago', False),
+                'tiempo_inferior_meses': tiempo_colchones.get('Inferior', 0),
+                'tiempo_transicion_meses': tiempo_colchones.get(
+                    'Transicion', 0
+                ),
+                'tiempo_intermedio_meses': tiempo_colchones.get(
+                    'Intermedio', 0
+                ),
+                'tiempo_superior_meses': tiempo_colchones.get('Superior', 0),
+                'factor_utilizacion_pct': factor_util.get(
+                    'factor_utilizacion_pct', 0.0
+                ),
+                'energia_teorica_mwh': factor_util.get(
+                    'energia_teorica_total', 0.0
+                ),
+                'cota_promedio_msnm': (
+                    sum(cota_mensual.values()) / len(cota_mensual)
+                    if cota_mensual else 0.0
+                ),
+                'cota_max_msnm': max(cota_mensual.values())
+                if cota_mensual else 0.0,
+                'cota_min_msnm': min(cota_mensual.values())
+                if cota_mensual else 0.0
+            }
 
-    # Subplot 1: Evolución de cota
-    ax1.plot(years, cotas_anuales, 'b-o', linewidth=2, markersize=4)
-    ax1.set_title('Evolución Histórica del Nivel del Lago',
-                  fontweight='bold')
-    ax1.set_xlabel('Año')
-    ax1.set_ylabel('Cota promedio [msnm]')
-    ax1.grid(True, alpha=0.3)
+            writer.writerow(row)
 
-    # Subplot 2: Dependencia del lago
-    ax2.bar(years, dependencias_anuales, alpha=0.7, color='coral')
-    ax2.set_title('Dependencia Anual del Embalse para Cubrir Déficits',
-                  fontweight='bold')
-    ax2.set_xlabel('Año')
-    ax2.set_ylabel('Déficit total anual [m³/s]')
-    ax2.grid(True, alpha=0.3)
-
-    plt.tight_layout()
-
-    # Guardar gráfico
-    plot_file = output_path / f"{plot_name}.png"
-    plt.savefig(plot_file, dpi=300, bbox_inches='tight')
-    plt.close()
-    files_created.append(str(plot_file))
-
-    return files_created
+    print(f"✅ KPIs exportados a: {output_file}")
