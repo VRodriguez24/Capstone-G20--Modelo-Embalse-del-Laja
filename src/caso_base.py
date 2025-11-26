@@ -165,7 +165,12 @@ def build_casobase_model_for_one_year(
     # ========================================================================
     # Flujos hídricos básicos
     y = m.addVars(ARCS, T, lb=0.0, name="y")  # Conectividad/inyección
-    x = m.addVars([("Embalse", "ElToro")], T, lb=0.0, name="x")  # El Toro
+    # Flujos a través de arcos generadores (incluye El Toro y otros
+    # arcos de "generación" aunque en este caso no se modela la
+    # generación energética). Necesitamos crear `x` para TODOS los
+    # arcos en A_generacion para poder referenciarlos en restricciones
+    # (p. ej. activación `beta` y límites de capacidad).
+    x = m.addVars(A_generacion, T, lb=0.0, name="x")  # Flujos en arcos generacion
     V = m.addVars(T, lb=V_min, ub=V_max, name="V")  # Volumen embalse
     Filtr = m.addVars(T, lb=0.0, name="Filtr")  # Filtraciones
 

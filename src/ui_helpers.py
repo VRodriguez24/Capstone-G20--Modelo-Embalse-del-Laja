@@ -129,6 +129,27 @@ def get_performance_stats(
     }
 
 
+def format_time(seconds: float) -> str:
+    """
+    Formatea segundos a una cadena legible compacta.
+
+    Args:
+        seconds: número de segundos
+
+    Returns:
+        Cadena como '1m 23.5s' o '12.3s' o '1h 2m'
+    """
+    if seconds < 60:
+        return f"{seconds:.1f}s"
+    if seconds < 3600:
+        minutes = int(seconds // 60)
+        secs = seconds % 60
+        return f"{minutes}m {secs:.1f}s"
+    hours = int(seconds // 3600)
+    minutes = int((seconds % 3600) // 60)
+    return f"{hours}h {minutes}m"
+
+
 def print_performance_stats(
     stats: Dict[str, Union[float, str]],
     context: str = ""

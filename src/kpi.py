@@ -684,44 +684,44 @@ def print_kpis(
     generacion_str = presup.get('generacion', 'N/A')
     print(f"   ⚡ Generación (excedente):    {generacion_str:>8}")
 
-    # Mostrar presupuestos disponibles y diferencias
-    presup_riego_abs = presup.get('presupuesto_riego_hm3', 0.0)
-    presup_gen_abs = presup.get('presupuesto_gen_hm3', 0.0)
-    diff_riego = presup.get('diferencia_riego_hm3', 0.0)
-    diff_gen = presup.get('diferencia_gen_hm3', 0.0)
-    cumple_riego = presup.get('cumple_riego', True)
-    cumple_gen = presup.get('cumple_gen', True)
-    colchon_activo = presup.get('colchon_activo', 'N/A')
+    # # Mostrar presupuestos disponibles y diferencias
+    # presup_riego_abs = presup.get('presupuesto_riego_hm3', 0.0)
+    # presup_gen_abs = presup.get('presupuesto_gen_hm3', 0.0)
+    # diff_riego = presup.get('diferencia_riego_hm3', 0.0)
+    # diff_gen = presup.get('diferencia_gen_hm3', 0.0)
+    # cumple_riego = presup.get('cumple_riego', True)
+    # cumple_gen = presup.get('cumple_gen', True)
+    # colchon_activo = presup.get('colchon_activo', 'N/A')
 
-    if presup_riego_abs > 0 or presup_gen_abs > 0:
-        print(f"\n   📋 Colchón Activo: {colchon_activo}")
-        print("   💧 Presupuestos vs Uso:")
+    # if presup_riego_abs > 0 or presup_gen_abs > 0:
+    #     print(f"\n   📋 Colchón Activo: {colchon_activo}")
+    #     print("   💧 Presupuestos vs Uso:")
 
-        if presup_riego_abs > 0:
-            estado_riego = "✅" if cumple_riego else "❌"
-            signo_riego = "+" if diff_riego > 0 else ""
-            print(f"      • Riego:      {presup_riego_abs:>7.1f} Hm³/año "
-                  f"({signo_riego}{diff_riego:>+6.1f}) {estado_riego}")
+    #     if presup_riego_abs > 0:
+    #         estado_riego = "✅" if cumple_riego else "❌"
+    #         signo_riego = "+" if diff_riego > 0 else ""
+    #         print(f"      • Riego:      {presup_riego_abs:>7.1f} Hm³/año "
+    #               f"({signo_riego}{diff_riego:>+6.1f}) {estado_riego}")
 
-        if presup_gen_abs > 0:
-            estado_gen = "✅" if cumple_gen else "❌"
-            signo_gen = "+" if diff_gen > 0 else ""
-            print(f"      • Generación: {presup_gen_abs:>7.1f} Hm³/año "
-                  f"({signo_gen}{diff_gen:>+6.1f}) {estado_gen}")
+    #     if presup_gen_abs > 0:
+    #         estado_gen = "✅" if cumple_gen else "❌"
+    #         signo_gen = "+" if diff_gen > 0 else ""
+    #         print(f"      • Generación: {presup_gen_abs:>7.1f} Hm³/año "
+    #               f"({signo_gen}{diff_gen:>+6.1f}) {estado_gen}")
 
-    # Mostrar descomposición del flujo El Toro si está disponible
-    agua_total = kpis.get('agua_eltoro_total', 0.0)
-    agua_riego = kpis.get('agua_riego_hm3', 0.0)
-    agua_gen = kpis.get('agua_generacion_hm3', 0.0)
-    if agua_total > 0:
-        print("\n   📊 Descomposición Flujo El Toro:")
-        print(f"      • Total:      {agua_total:>8.2f} Hm³/año")
-        pct_riego = agua_riego / agua_total * 100
-        pct_gen = agua_gen / agua_total * 100
-        print(f"      • Riego:      {agua_riego:>8.2f} Hm³ "
-              f"({pct_riego:>5.1f}%)")
-        print(f"      • Generación: {agua_gen:>8.2f} Hm³ "
-              f"({pct_gen:>5.1f}%)")
+    # # Mostrar descomposición del flujo El Toro si está disponible
+    # agua_total = kpis.get('agua_eltoro_total', 0.0)
+    # agua_riego = kpis.get('agua_riego_hm3', 0.0)
+    # agua_gen = kpis.get('agua_generacion_hm3', 0.0)
+    # if agua_total > 0:
+    #     print("\n   📊 Descomposición Flujo El Toro:")
+    #     print(f"      • Total:      {agua_total:>8.2f} Hm³/año")
+    #     pct_riego = agua_riego / agua_total * 100
+    #     pct_gen = agua_gen / agua_total * 100
+    #     print(f"      • Riego:      {agua_riego:>8.2f} Hm³ "
+    #           f"({pct_riego:>5.1f}%)")
+    #     print(f"      • Generación: {agua_gen:>8.2f} Hm³ "
+    #           f"({pct_gen:>5.1f}%)")
 
     # KPI 3: Déficits
     print("\n📉 KPI 3 - DÉFICITS DE RIEGO:")

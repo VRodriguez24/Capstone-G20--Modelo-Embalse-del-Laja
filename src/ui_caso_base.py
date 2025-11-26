@@ -90,7 +90,9 @@ def print_kpis_caso_base(
     if not kpis or kpis.get('status', -1) != 2:
         print("⚠️ No hay KPIs disponibles para mostrar")
         return
-    print_kpis(kpis, context, is_caso_base=True, years=years)
+    # print_kpis signature in kpi.py is (kpis, context='', years=None)
+    # do not pass unsupported keyword 'is_caso_base'
+    print_kpis(kpis, context, years=years)
 
 
 def generate_caso_base_plots(
@@ -700,6 +702,146 @@ def run_all_years(
         kpis_agregados = aggregate_kpis(
             kpis_historicos, years=years_exitosos, v0_values=v0_list
         )
+        # -- FALLBACK: si el modelo 'caso base' no contiene variables de
+        # presupuesto (z[*]) la función en kpi.py devuelve 'N/A' para uso
+        # de presupuestos. Aquí generamos una estimación razonable usando
+        # los colchones definidos en `model.py` y los déficits calculados
+        # para mostrar porcentajes informativos en la UI (riego != N/A).
+        try:
+            from model import COLCHONES
+
+            uso_pres = kpis_agregados.get('uso_presupuestos_%', {})
+            need_fix = (
+                (isinstance(uso_pres.get('riego'), str) and 'N/A' in uso_pres.get('riego'))
+                or (isinstance(uso_pres.get('generacion'), str) and 'N/A' in uso_pres.get('generacion'))
+            )
+
+            if need_fix:
+                # Elegir colchón activo por mayor tiempo en colchones
+                tiempo = kpis_agregados.get('tiempo_colchones_%', {})
+                if tiempo:
+                    colchon_activo = max(tiempo.items(), key=lambda x: x[1])[0]
+                else:
+                    colchon_activo = list(COLCHONES.keys())[0]
+
+                shares = COLCHONES.get(colchon_activo, {}).get('shares', (0.0, 0.0, 0.0))
+                r_share, g_share = shares[0], shares[1]
+
+                # Presupuesto riego total para el horizonte (Hm3).
+                # Debemos sumar el presupuesto por año, ya que estamos en modo
+                # multi-año. Para cada año usamos el V0 correspondiente en
+                # `v0_list` (si share>1 se interpreta como Hm3 fijo).
+                presupuesto_riego_total = 0.0
+                presupuesto_gen_total = 0.0
+                for idx in range(len(v0_list)):
+                    v0_y = v0_list[idx] if idx < len(v0_list) else default_v0
+                    if r_share > 1.0:
+                        presupuesto_riego_total += r_share
+                    else:
+                        presupuesto_riego_total += r_share * v0_y
+
+                    if g_share > 1.0:
+                        presupuesto_gen_total += g_share
+                    else:
+                        presupuesto_gen_total += g_share * v0_y
+
+                # Aplicar tope anual de 1200 Hm3 sólo cuando corresponda
+                if colchon_activo == 'Superior':
+                    # tope anual -> multiplicar por número de años
+                    presupuesto_gen_total = min(presupuesto_gen_total, 1200.0 * len(v0_list))
+
+                # Calculamos el porcentaje por AÑO y luego promediamos
+                # Esto refleja mejor "agua que suelta sea un % del presupuesto
+                # establecido antes" (presupuesto fijado cada año según V0).
+                pct_years = []
+                presupuestos_per_year = []
+                deficits_per_year = []
+                extraccion_eltoro_per_year = []
+
+                n_periods = min(len(kpis_historicos), len(v0_list)) if kpis_historicos and v0_list else 0
+                if n_periods == 0:
+                    # Fallback: usar agregados si no hay detalle por año
+                    def_acum_1r = kpis_agregados.get('deficit_acumulado_hm3', {}).get('1R', 0.0)
+                    avg_presupuesto_riego = presupuesto_riego_total / (len(v0_list) or 1)
+                    pct_riego = (def_acum_1r / (presupuesto_riego_total or 1.0)) * 100.0 if presupuesto_riego_total > 0 else 0.0
+                    pct_gen = 0.0
+                    uso_pres_calc = {
+                        'riego': f"{pct_riego:.1f}%",
+                        'generacion': f"{pct_gen:.1f}%",
+                        'presupuesto_riego_hm3': avg_presupuesto_riego,
+                        'presupuesto_gen_hm3': presupuesto_gen_total / (len(v0_list) or 1),
+                        'colchon_activo': colchon_activo,
+                        'v0_real_hm3': sum(v0_list) / (len(v0_list) or 1),
+                        'riego_usado_hm3': def_acum_1r / (len(v0_list) or 1),
+                        'gen_usada_hm3': 0.0,
+                        'extraccion_total_hm3': kpis_agregados.get('agua_eltoro_deficit_1r', 0.0) or def_acum_1r,
+                        'uso_riego_pct': pct_riego,
+                        'uso_gen_pct': pct_gen,
+                        'diferencia_riego_hm3': (def_acum_1r / (len(v0_list) or 1)) - avg_presupuesto_riego,
+                        'diferencia_gen_hm3': - (presupuesto_gen_total / (len(v0_list) or 1)),
+                        'cumple_riego': (def_acum_1r / (len(v0_list) or 1)) <= avg_presupuesto_riego,
+                        'cumple_gen': True,
+                    }
+                else:
+                    for idx in range(n_periods):
+                        kpi_year = kpis_historicos[idx]
+                        v0_y = v0_list[idx] if idx < len(v0_list) else default_v0
+
+                        def1_y = kpi_year.get('deficit_sum_hm3', {}).get('1R', 0.0)
+                        deficits_per_year.append(def1_y)
+
+                        # presupuesto por año según share
+                        if r_share > 1.0:
+                            pres_r_y = r_share
+                        else:
+                            pres_r_y = r_share * v0_y
+                        presupuestos_per_year.append(pres_r_y)
+
+                        # extraccion El Toro para riego (si se guarda en kpi por año)
+                        agua_eltoro_y = kpi_year.get('agua_eltoro_total', None)
+                        if agua_eltoro_y is None:
+                            agua_eltoro_y = def1_y
+                        extraccion_eltoro_per_year.append(agua_eltoro_y)
+
+                        pct_i = (def1_y / pres_r_y * 100.0) if pres_r_y > 0 else 0.0
+                        pct_years.append(pct_i)
+
+                    # Estadísticas anuales
+                    import numpy as _np
+                    mean_pct = float(_np.mean(pct_years)) if pct_years else 0.0
+                    avg_presupuesto_riego = float(_np.mean(presupuestos_per_year))
+                    avg_presupuesto_gen = float(_np.mean([ (g_share if g_share>1.0 else g_share * (v0_list[i] if i<len(v0_list) else default_v0)) for i in range(n_periods) ]))
+                    avg_deficit_annual = float(_np.mean(deficits_per_year))
+                    avg_agua_eltoro_annual = float(_np.mean(extraccion_eltoro_per_year))
+
+                    pct_riego = mean_pct
+                    pct_gen = 0.0
+
+                    uso_pres_calc = {
+                        'riego': f"{pct_riego:.1f}%",
+                        'generacion': f"{pct_gen:.1f}%",
+                        'presupuesto_riego_hm3': avg_presupuesto_riego,
+                        'presupuesto_gen_hm3': avg_presupuesto_gen,
+                        'colchon_activo': colchon_activo,
+                        'v0_real_hm3': sum(v0_list) / n_periods,
+                        'riego_usado_hm3': avg_deficit_annual,
+                        'gen_usada_hm3': 0.0,
+                        'extraccion_total_hm3': avg_agua_eltoro_annual,
+                        'uso_riego_pct': pct_years,
+                        'uso_gen_pct': pct_gen,
+                        'diferencia_riego_hm3': avg_deficit_annual - avg_presupuesto_riego,
+                        'diferencia_gen_hm3': 0.0 - avg_presupuesto_gen,
+                        'cumple_riego': avg_deficit_annual <= avg_presupuesto_riego,
+                        'cumple_gen': True,
+                        'uso_riego_pct_mean': pct_riego,
+                        'uso_riego_pct_years': pct_years,
+                    }
+
+                # Sobrescribir sólo si era N/A
+                kpis_agregados['uso_presupuestos_%'] = uso_pres_calc
+        except Exception:
+            # No bloquear si algo falla: dejamos los valores como están
+            pass
         context = f"Histórico ({len(kpis_historicos)} casos)"
         years_list = all_years[:len(kpis_historicos)]
         print_kpis_caso_base(kpis_agregados, context, years=years_list)

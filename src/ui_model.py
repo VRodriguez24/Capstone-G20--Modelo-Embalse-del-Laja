@@ -632,23 +632,20 @@ def run_all_years(
 
     if is_energy_model:
         print("\n⚡ GENERACIÓN ENERGÉTICA:")
-        print(f"   • Total: {total_energy:,.1f} MWh")
+        avg_value = total_energy / len(successful) if len(successful) > 0 else 0
+        print(f"   • Total promedio: {total_energy:,.1f} MWh")
+        print(f"   • Promedio anual: {avg_value:,.1f} MWh/año")
     else:
         print("\n🛑 DÉFICIT ACUMULADO:")
+        avg_value = total_energy / len(successful) if len(successful) > 0 else 0
         print(f"   • Total: {total_energy:,.2f} Hm³")
+        print(f"   • Promedio anual: {avg_value:,.2f} Hm³/año")
 
     print("\n🌊 EXTRACCIÓN DEL EMBALSE:")
     print(f"   • Total: {total_extraccion_embalse:,.1f} Hm³")
 
     if successful:
-        avg_value = total_energy / len(successful)
         avg_extraccion = total_extraccion_embalse / len(successful)
-
-        if is_energy_model:
-            print(f"   • Promedio anual: {avg_value:,.0f} MWh/año")
-        else:
-            print(f"   • Promedio anual: {avg_value:,.2f} Hm³/año")
-
         print(f"   • Promedio anual: {avg_extraccion:,.1f} Hm³/año")
 
         # Balance volumétrico histórico
@@ -656,11 +653,16 @@ def run_all_years(
         v_final_last = successful[-1]['v_final'] if successful else V0
         volume_change = v_final_last - v_initial
         change_sign = "📈" if volume_change >= 0 else "📉"
+        # Calcular tasa de cambio anual
+        tasa_cambio = 0.0
+        if len(successful) > 0:
+            tasa_cambio = volume_change / len(successful)
 
         print("\n💧 BALANCE VOLUMÉTRICO HISTÓRICO:")
-        print(f"   Inicial (Dic'59): {v_initial:,.1f} Hm³")
-        print(f"   Final (Nov'23): {v_final_last:,.1f} Hm³")
-        print(f"   {change_sign} Cambio neto: {volume_change:+,.1f} Hm³")
+        print(f"   • Inicial (Dic'59): {v_initial:,.1f} Hm³")
+        print(f"   • Final (Nov'23): {v_final_last:,.1f} Hm³")
+        print(f"   • {change_sign} Cambio neto: {volume_change:+,.1f} Hm³")
+        print(f"   • Tasa de cambio: {tasa_cambio:+.1f} Hm³/año")
 
         # Mostrar años fallidos si existen
         if failed_years:
