@@ -632,12 +632,18 @@ def run_all_years(
 
     if is_energy_model:
         print("\n⚡ GENERACIÓN ENERGÉTICA:")
-        avg_value = total_energy / len(successful) if len(successful) > 0 else 0
+        avg_value = (
+            total_energy / len(successful)
+            if len(successful) > 0 else 0
+        )
         print(f"   • Total promedio: {total_energy:,.1f} MWh")
         print(f"   • Promedio anual: {avg_value:,.1f} MWh/año")
     else:
         print("\n🛑 DÉFICIT ACUMULADO:")
-        avg_value = total_energy / len(successful) if len(successful) > 0 else 0
+        avg_value = (
+            total_energy / len(successful)
+            if len(successful) > 0 else 0
+        )
         print(f"   • Total: {total_energy:,.2f} Hm³")
         print(f"   • Promedio anual: {avg_value:,.2f} Hm³/año")
 

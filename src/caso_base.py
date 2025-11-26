@@ -165,12 +165,6 @@ def build_casobase_model_for_one_year(
     # ========================================================================
     # Flujos hídricos básicos
     y = m.addVars(ARCS, T, lb=0.0, name="y")  # Conectividad/inyección
-    # Flujos a través de arcos generadores (incluye El Toro y otros
-    # arcos de "generación" aunque en este caso no se modela la
-    # generación energética). Necesitamos crear `x` para TODOS los
-    # arcos en A_generacion para poder referenciarlos en restricciones
-    # (p. ej. activación `beta` y límites de capacidad).
-    x = m.addVars(A_generacion, T, lb=0.0, name="x")  # Flujos en arcos generacion
     V = m.addVars(T, lb=V_min, ub=V_max, name="V")  # Volumen embalse
     Filtr = m.addVars(T, lb=0.0, name="Filtr")  # Filtraciones
 
@@ -244,24 +238,17 @@ def build_casobase_model_for_one_year(
     # Prioridad: usar El Toro primero, vertir solo si necesario
     #   - Vertir si arcos útiles saturados O embalse >= 90% V_max
 
-    # R3a: Arcos de generación usan solo x (no y: y=0)
-    for (i, j) in A_generacion:
-        for t in T:
-            m.addConstr(y[i, j, t] == 0.0, name=f"R3a_gen_y0_{i}{j}{t}")
-
     # R3b: Capacidad máxima en arcos de generación
     # beta[i,j,t] = 1 si arco alcanza capacidad (permite vertimiento)
     for (i, j) in A_generacion:
-        if (i, j) in A_inyeccion:
-            continue
         cap = cap_max.get((i, j))
         if cap is not None:
             for t in T:
                 # Capacidad máxima
-                m.addConstr(x[i, j, t] <= cap,
+                m.addConstr(y[i, j, t] <= cap,
                             name=f"R3b_cap_gen_{i}{j}{t}")
-                # Activar beta solo si flujo ≥ capacidad (indicador)
-                m.addConstr(x[i, j, t] >= cap * beta[i, j, t])
+                # Activar beta solo si flujo >= capacidad (indicador)
+                m.addConstr(y[i, j, t] >= cap * beta[i, j, t])
 
     # R3c: Capacidad máxima en arcos de conectividad
     # gamma[i,j,t] = 1 si arco alcanza capacidad (permite vertimiento)
@@ -272,8 +259,7 @@ def build_casobase_model_for_one_year(
                 # Capacidad máxima
                 m.addConstr(y[i, j, t] <= cap,
                             name=f"R3c_cap_con_{i}{j}{t}")
-
-                # Activar gamma solo si flujo ≥ capacidad (indicador)
+                # Activar gamma solo si flujo >= capacidad (indicador)
                 m.addConstr(y[i, j, t] >= cap * gamma[i, j, t])
 
     # R3d: Emergencia cuando V >= 90% V_max
@@ -415,26 +401,22 @@ def build_casobase_model_for_one_year(
         #   - Si cubre déficits → "agua para riego"
         #   - Si excede déficits → "agua para generación"
         m.addConstr(
-            x["Embalse", "ElToro", t] * Conv >= Def1[t],
+            y["Embalse", "ElToro", t] * Conv >= Def1[t],
             name=f"R6_4a_cobertura_ElToro_{t}"
         )
-
-    # (R7) Déficit máximo
-    for t in T:
-        m.addConstr(MaxDef >= Def1[t], name=f"R7_maxdef_{t}")
 
     # ========================================================================
     # FUNCIÓN OBJETIVO
     # ========================================================================
-    # Minimizar déficit máximo (prioridad) + extracción total (desempate)
-    extraccion_total = gp.quicksum(x["Embalse", "ElToro", t] * Conv for t in T)
-    m.setObjective(1000 * MaxDef + extraccion_total, GRB.MINIMIZE)
+    # Minimizar extracción total del Toro (costo por déficit)
+    extraccion_total = gp.quicksum(y["Embalse", "ElToro", t] * Conv for t in T)
+    m.setObjective(extraccion_total, GRB.MINIMIZE)
 
     # ========================================================================
     # METADATA
     # ========================================================================
     m._y = y
-    m._x = x
+    m._x = m._y  # Alias para compatibilidad con análisis y KPIs
     m._V = V
     m._Filtr = Filtr
     m._Def1 = Def1
