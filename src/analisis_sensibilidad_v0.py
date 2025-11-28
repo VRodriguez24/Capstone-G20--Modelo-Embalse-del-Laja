@@ -20,6 +20,8 @@ import psutil
 import warnings
 import numpy as np
 import pandas as pd
+import ast
+import re
 import matplotlib
 import matplotlib.pyplot as plt
 from pathlib import Path
@@ -327,6 +329,85 @@ class SensitivityAnalyzer:
 
         return output_path
 
+    def load_results_from_csv(
+        self,
+        input_path: str = "resultados/sensibilidad_v0.csv"
+    ) -> List[SensitivityResult]:
+        """
+        Carga resultados previamente exportados desde un CSV y los convierte
+        en objetos SensitivityResult saneando campos que puedan haber sido
+        serializados con wrappers como `np.float64(...)` u otros formatos.
+
+        Esto facilita regenerar los gráficos directamente desde el CSV sin
+        ejecutar Monte Carlo.
+        """
+
+        p = Path(input_path)
+        if not p.exists():
+            raise FileNotFoundError(f"CSV no encontrado: {input_path}")
+
+        df = pd.read_csv(p)
+
+        def _try_parse(val):
+            # Passthrough for NaN
+            if pd.isna(val):
+                return {}
+            # If it's already a dict/list/number, return it
+            if isinstance(val, (dict, list, int, float)):
+                return val
+            s = str(val)
+            # Replace common numpy wrappers: np.float64(x) -> x
+            s = re.sub(r'np\.float64\(([^)]+)\)', r'\1', s)
+            # Replace array([...]) patterns -> [...]
+            s = re.sub(r'array\(', '', s)
+            s = re.sub(r'\)\Z', '', s)
+            # Replace Python-style nan/NaN tokens
+            s = s.replace('nan', 'None').replace('NaN', 'None')
+
+            try:
+                return ast.literal_eval(s)
+            except Exception:
+                # Last resort: return original string
+                return val
+
+        results: List[SensitivityResult] = []
+
+        for _, row in df.iterrows():
+            kpis = {}
+            for col in ['tiempo_colchones_%', 'uso_presupuestos_%',
+                        'deficit_prom_hm3', 'deficit_pct',
+                        'factor_utilizacion_%', 'cota_mensual']:
+                if col in row:
+                    parsed = _try_parse(row[col])
+                    kpis[col] = parsed
+
+            # Parse numeric summary fields (if present)
+            def _get_float(field, default=0.0):
+                if field in row:
+                    try:
+                        return float(row[field])
+                    except Exception:
+                        return default
+                return default
+
+            sr = SensitivityResult(
+                V0=_get_float('V0', 0.0),
+                success_rate=_get_float('success_rate', 0.0),
+                avg_total_energy=_get_float('avg_total_energy', 0.0),
+                avg_annual_energy=_get_float('avg_annual_energy', 0.0),
+                avg_toro_usage=_get_float('avg_toro_usage', 0.0),
+                avg_final_volume=_get_float('avg_final_volume', 0.0),
+                std_final_volume=_get_float('std_final_volume', 0.0),
+                kpis_agregados=kpis,
+                scenarios_data=[]
+            )
+
+            results.append(sr)
+
+        # Replace internal results
+        self.results = results
+        return results
+
     def generate_sensitivity_plots(
         self,
         output_dir: str = "resultados/analisis_sensibilidad"
@@ -377,6 +458,7 @@ class SensitivityAnalyzer:
         deficits_1r = []  # Primeros regantes
         deficits_2r = []  # Segundos regantes
         deficit_pct_1r = []  # Porcentaje de demanda 1R
+        deficit_pct_2r = []  # Porcentaje de demanda 2R
 
         # KPI 4: Factor de utilización
         factor_utilizacion = []
@@ -421,6 +503,7 @@ class SensitivityAnalyzer:
 
             deficit_pct = kpis.get("deficit_pct", {})
             deficit_pct_1r.append(deficit_pct.get("1R", 0))
+            deficit_pct_2r.append(deficit_pct.get("2R", 0))
 
             # KPI 4: Factor de utilización
             fu = kpis.get("factor_utilizacion_%", {})
@@ -444,6 +527,7 @@ class SensitivityAnalyzer:
         deficits_1r = np.array(deficits_1r)
         deficits_2r = np.array(deficits_2r)
         deficit_pct_1r = np.array(deficit_pct_1r)
+        deficit_pct_2r = np.array(deficit_pct_2r)
         factor_utilizacion = np.array(factor_utilizacion)
         cotas_prom = np.array(cotas_prom)
 
@@ -518,7 +602,8 @@ class SensitivityAnalyzer:
         files_created.append(str(plot1_file))
 
         # ================================================================
-        # GRÁFICO 2: V0 VS APORTE DE EL TORO A RIEGO
+        # GRÁFICO 2: V0 VS APORTE DE EL TORO A RIEGO (mejor visibilidad)
+        # Añadimos eje secundario con cambio relativo para enfatizar variación
         # ================================================================
         fig2, ax2 = plt.subplots(figsize=(12, 7))
 
@@ -526,43 +611,64 @@ class SensitivityAnalyzer:
         # (déficit consolidado Def1 + Def2) como % de demanda total
         aporte_riego_pct = deficit_pct_1r  # Ya calculado arriba (% demanda)
 
-        # Línea principal con marcadores
+        # Línea principal con marcadores (valor absoluto %)
         ax2.plot(V0_values, aporte_riego_pct, 'o-',
                  color='#7b2cbf', linewidth=2.5, markersize=8,
-                 label='Dependencia de riego', zorder=3)
-
-        # Área sombreada bajo la curva
+                 label='Dependencia de riego (%)', zorder=3)
         ax2.fill_between(V0_values, 0, aporte_riego_pct,
                          alpha=0.2, color='#7b2cbf')
 
+        # Ajustar límites y formato vertical para ver cambios
+        if aporte_riego_pct.size:
+            min_ap = float(np.nanmin(aporte_riego_pct))
+            max_ap = float(np.nanmax(aporte_riego_pct))
+            # Si min_ap es muy cercano a 0, usar un padding absoluto
+            if min_ap <= 0.0:
+                ymin = 0.0
+                ymax = max(max_ap * 1.2, 1.0)
+            else:
+                pad = (max_ap - min_ap) * 0.15
+                ymin = max(0.0, min_ap - pad)
+                ymax = max_ap + pad
+            ax2.set_ylim(ymin, ymax)
+        else:
+            ax2.set_ylim(0, 1.0)
+
+        # Eje secundario: cambio relativo normalizado (0..100%) para enfatizar variación
+        ax2b = ax2.twinx()
+        if aporte_riego_pct.size and (max_ap - min_ap) > 0:
+            rel_change = (aporte_riego_pct - min_ap) / (max_ap - min_ap) * 100.0
+        else:
+            rel_change = np.zeros_like(aporte_riego_pct)
+
+        ax2b.plot(V0_values, rel_change, '--', color=colors['primary'],
+                  linewidth=1.8, label='Cambio relativo (%)', zorder=4)
+        ax2b.set_ylim(0, 100)
+        ax2b.set_ylabel('Cambio relativo (%)', color=colors['primary'])
+        ax2b.tick_params(axis='y', colors=colors['primary'])
+
         # Marcar valor óptimo (mínima dependencia = mejor)
-        min_dep_idx = np.argmin(aporte_riego_pct)
-        ax2.plot(V0_values[min_dep_idx], aporte_riego_pct[min_dep_idx], '*',
-                 color=colors['warning'], markersize=20,
-                 markeredgecolor='black', markeredgewidth=1.5,
-                 label=f'Óptimo: {V0_values[min_dep_idx]:.0f} Hm³',
-                 zorder=5)
+        if aporte_riego_pct.size:
+            min_dep_idx = int(np.argmin(aporte_riego_pct))
+            ax2.plot(V0_values[min_dep_idx], aporte_riego_pct[min_dep_idx], '*',
+                     color=colors['warning'], markersize=20,
+                     markeredgecolor='black', markeredgewidth=1.5,
+                     label=f'Óptimo: {V0_values[min_dep_idx]:.0f} Hm³',
+                     zorder=5)
 
-        # Configuración de ejes
-        ax2.set_xlabel(
-            'Volumen Inicial (V0) [Hm³]',
-            fontweight='bold', color='black'
-        )
-        ax2.set_ylabel(
-            'Aporte de El Toro a Riego [% de demanda total]',
-            fontweight='bold', color='black'
-        )
-        ax2.set_title(
-            'Sensibilidad: V0 vs Dependencia de Riego del Embalse',
-            fontweight='bold', pad=25, color='black'
-        )
+        # Configuración de ejes y leyendas
+        ax2.set_xlabel('Volumen Inicial (V0) [Hm³]', fontweight='bold', color='black')
+        ax2.set_ylabel('Aporte de El Toro a Riego [% de demanda]', fontweight='bold', color='black')
+        ax2.set_title('Sensibilidad: V0 vs Dependencia de Riego del Embalse', fontweight='bold', pad=25, color='black')
         ax2.grid(True, alpha=0.3, linestyle='--')
-        ax2.legend(loc='best', framealpha=0.95)
 
-        # Formato de porcentajes en eje Y
-        ax2.yaxis.set_major_formatter(
-            plt.FuncFormatter(lambda x, p: f'{x:.1f}%')
-        )
+        # Combinar leyendas (primaria + secundaria)
+        handles1, labels1 = ax2.get_legend_handles_labels()
+        handles2, labels2 = ax2b.get_legend_handles_labels()
+        ax2.legend(handles1 + handles2, labels1 + labels2, loc='best', framealpha=0.95)
+
+        # Formato de porcentajes en eje Y con 1 decimal
+        ax2.yaxis.set_major_formatter(plt.FuncFormatter(lambda x, p: f'{x:.1f}%'))
 
         plt.tight_layout()
         plot2_file = output_path / "sensibilidad_aporte_riego.png"
@@ -688,22 +794,51 @@ class SensitivityAnalyzer:
         ax42.set_ylim(0, max(uso_presupuesto_riego.max(),
                              uso_presupuesto_gen.max()) * 1.15)
 
+        # Eje secundario para mostrar cambio relativo en uso de presupuesto riego
+        ax42b = ax42.twinx()
+        if uso_presupuesto_riego.size:
+            min_ur = float(np.nanmin(uso_presupuesto_riego))
+            max_ur = float(np.nanmax(uso_presupuesto_riego))
+            if max_ur - min_ur > 1e-6:
+                rel_ur = (uso_presupuesto_riego - min_ur) / (max_ur - min_ur) * 100.0
+            else:
+                rel_ur = np.zeros_like(uso_presupuesto_riego)
+        else:
+            rel_ur = np.array([])
+
+        if rel_ur.size:
+            ax42b.plot(x_pos, rel_ur, '-s', color=colors['primary'],
+                       label='Cambio relativo Riego (%)', linewidth=1.6)
+            ax42b.set_ylabel('Cambio relativo Riego (%)', color=colors['primary'])
+            ax42b.set_ylim(0, 100)
+            ax42b.tick_params(axis='y', colors=colors['primary'])
+            # añadir leyenda combinada
+            h1, l1 = ax42.get_legend_handles_labels()
+            h2, l2 = ax42b.get_legend_handles_labels()
+            ax42.legend(h1 + h2, l1 + l2, loc='upper right', fontsize=9, framealpha=0.95)
+
         # Subplot 2.2: KPI 3 - Déficit de Riego Consolidado (columnas 3-5)
         ax43 = fig4.add_subplot(gs[1, 3:6])
 
-        # Graficar déficit de primeros y segundos regantes
-        ax43.plot(V0_values, deficits_1r, linewidth=2.5,
-                  color='#dc2626', label='Déficit 1R (Primeros)',
-                  alpha=0.9)
-        ax43.plot(V0_values, deficits_2r, linewidth=2.5,
-                  color='#f97316', label='Déficit 2R (Segundos)',
-                  alpha=0.9)
+        # Graficar déficit (en % de demanda) - 1R y 2R
+        if deficit_pct_1r.size:
+            ax43.plot(V0_values, deficit_pct_1r, linewidth=2.5,
+                      color='#dc2626', label='Déficit 1R (Primeros)',
+                      alpha=0.9, marker='o', markersize=4)
 
-        # Área sombreada para déficit total
-        deficit_total = deficits_1r + deficits_2r
-        ax43.fill_between(V0_values, 0, deficit_total,
-                          color='#fecaca', alpha=0.3,
-                          label='Déficit Total')
+        if deficit_pct_2r.size:
+            ax43.plot(V0_values, deficit_pct_2r, linewidth=2.5,
+                      color='#f97316', label='Déficit 2R (Segundos)',
+                      alpha=0.9, marker='o', markersize=4)
+
+        # Relleno banda total (suma porcentual 1R + 2R)
+        try:
+            deficit_total_pct = deficit_pct_1r + deficit_pct_2r
+            ax43.fill_between(V0_values, 0, deficit_total_pct,
+                              color='#fecaca', alpha=0.3,
+                              label='Déficit Total')
+        except Exception:
+            pass
 
         ax43.set_title('KPI 3: Déficit de Riego (1R + 2R)',
                        fontweight='bold', color='black', fontsize=11)
@@ -712,9 +847,24 @@ class SensitivityAnalyzer:
         ax43.set_xlabel('V0 [Hm³]', fontsize=9, color='black')
         ax43.grid(True, alpha=0.3)
         ax43.legend(fontsize=8, loc='best', framealpha=0.9)
-        ax43.yaxis.set_major_formatter(
-            plt.FuncFormatter(lambda x, p: f'{x:.1f}%')
-        )
+
+        # Ajustar límites Y para mejorar visibilidad de pequeñas variaciones
+        max_pct = 0.0
+        if deficit_pct_1r.size:
+            max_pct = max(max_pct, float(np.nanmax(deficit_pct_1r)))
+        if deficit_pct_2r.size:
+            max_pct = max(max_pct, float(np.nanmax(deficit_pct_2r)))
+        # Si ambos son muy pequeños, forzamos al menos 1% de rango
+        ymax = max(max_pct * 1.25, 1.0)
+        ax43.set_ylim(0.0, ymax)
+
+        # Anotar valores de 1R y 2R en cada punto para visibilidad
+        for xv, yv in zip(V0_values, deficit_pct_1r):
+            ax43.annotate(f'{yv:.2f}%', (xv, yv), textcoords="offset points",
+                          xytext=(0, 4), ha='center', fontsize=7)
+        for xv, yv in zip(V0_values, deficit_pct_2r):
+            ax43.annotate(f'{yv:.2f}%', (xv, yv), textcoords="offset points",
+                          xytext=(0, -10), ha='center', fontsize=7, color='#f97316')
 
         # =================================================================
         # FILA 3: KPI 4 Y MÉTRICAS COMPLEMENTARIAS (CENTRADOS)
@@ -852,6 +1002,63 @@ class SensitivityAnalyzer:
             f"   • Uso El Toro: {min(uso_toro):.0f} - "
             f"{max(uso_toro):.0f} Hm³ (acumulado)"
         )
+
+        # ---------- Resumen de KPIs agregados (promedios sobre puntos V0) ----------
+        # Recolectar KPIs disponibles en los resultados
+        tiempo_inferior = []
+        tiempo_transicion = []
+        tiempo_intermedio = []
+        tiempo_superior = []
+        uso_riego_pct = []
+        uso_gen_pct = []
+        deficit_1r_pct = []
+        deficit_2r_pct = []
+        deficit_1r_hm3 = []
+        deficit_2r_hm3 = []
+        fu_sistema = []
+
+        for r in self.results:
+            k = r.kpis_agregados or {}
+            tc = k.get('tiempo_colchones_%', {})
+            tiempo_inferior.append(tc.get('Inferior', 0))
+            tiempo_transicion.append(tc.get('Transicion', 0))
+            tiempo_intermedio.append(tc.get('Intermedio', 0))
+            tiempo_superior.append(tc.get('Superior', 0))
+
+            up = k.get('uso_presupuestos_%', {})
+            # uso_presupuestos_% puede venir en strings 'X.X%'
+            r_val = up.get('riego', 0)
+            g_val = up.get('generacion', 0)
+            try:
+                if isinstance(r_val, str):
+                    r_val = float(str(r_val).replace('%',''))
+                if isinstance(g_val, str):
+                    g_val = float(str(g_val).replace('%',''))
+            except Exception:
+                r_val = 0.0; g_val = 0.0
+            uso_riego_pct.append(float(r_val))
+            uso_gen_pct.append(float(g_val))
+
+            dp = k.get('deficit_pct', {})
+            deficit_1r_pct.append(dp.get('1R', 0))
+            deficit_2r_pct.append(dp.get('2R', 0))
+
+            dp_h = k.get('deficit_prom_hm3', {})
+            deficit_1r_hm3.append(dp_h.get('1R', 0))
+            deficit_2r_hm3.append(dp_h.get('2R', 0))
+
+            fu = k.get('factor_utilizacion_%', {})
+            fu_sistema.append(fu.get('sistema', 0))
+
+        # Impresión resumida solo si tenemos alguna entrada
+        if any(uso_riego_pct) or any(deficit_1r_hm3) or any(fu_sistema):
+            print("\n📋 KPIs Agregados (promedio por punto V0):")
+            print(f"   • Tiempo en colchones (Superior prom): {np.mean(tiempo_superior):.1f}%")
+            print(f"   • Tiempo Intermedio (prom): {np.mean(tiempo_intermedio):.1f}%")
+            print(f"   • Uso presupuesto riego (prom %): {np.mean(uso_riego_pct):.2f}%")
+            print(f"   • Déficit riego 1R (prom Hm³): {np.mean(deficit_1r_hm3):.2f}")
+            print(f"   • Déficit riego 2R (prom Hm³): {np.mean(deficit_2r_hm3):.2f}")
+            print(f"   • Factor utilización sistema (prom %): {np.mean(fu_sistema):.1f}%")
 
         # Evaluación de sensibilidad
         print("\n🔍 Evaluación de Sensibilidad:")
